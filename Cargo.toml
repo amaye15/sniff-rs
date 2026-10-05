@@ -47,7 +47,7 @@ default = ["full"]
 parquet = []
 xlsx = []
 avro = []
-full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "xport", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "ipynb", "pdf", "delta", "iceberg", "cjk", "simd"]
+full = ["parquet", "xlsx", "avro", "sqlite", "msgpack", "toml", "yaml", "cbor", "ini", "xml", "zstd", "npy", "weblog", "syslog", "dbase", "stata", "sas7bdat", "xport", "rdata", "html", "markdown", "spss", "orc", "bson", "plist", "json5", "har", "geojson", "mbox", "vcard", "icalendar", "ipynb", "pdf", "delta", "iceberg", "cjk", "simd"]
 sqlite = []
 msgpack = []
 toml = []
@@ -68,6 +68,11 @@ stata = []
 sas7bdat = []
 # SAS Transport (.xpt) - hand-rolled, no dependency (xport_support in src/lib.rs).
 xport = []
+# R serialized data (.rds, .RData/.rda) - hand-rolled, no dependency (rdata_support in src/lib.rs).
+rdata = []
+# HTML <table>s and Markdown pipe tables - hand-rolled, no dependency (doctable_support in src/lib.rs).
+html = []
+markdown = []
 spss = []
 orc = []
 # Hand-rolled, no dep - see src/lib.rs's bson_support for the writeup and

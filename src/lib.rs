@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, R data (.rds/.RData), the tables in an HTML or Markdown document, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, rdata, html, markdown, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -5086,7 +5086,8 @@ struct ColumnProfile {
     feature = "stata",
     feature = "sas7bdat",
     feature = "spss",
-    feature = "xport"
+    feature = "xport",
+    feature = "rdata"
 ))]
 const MAX_VALUE_LABELS_NOTED: usize = 20;
 /// A single value label is cut to this many characters in the notes.
@@ -5094,7 +5095,8 @@ const MAX_VALUE_LABELS_NOTED: usize = 20;
     feature = "stata",
     feature = "sas7bdat",
     feature = "spss",
-    feature = "xport"
+    feature = "xport",
+    feature = "rdata"
 ))]
 const MAX_VALUE_LABEL_CHARS: usize = 60;
 
@@ -5109,7 +5111,8 @@ const MAX_VALUE_LABEL_CHARS: usize = 60;
     feature = "stata",
     feature = "sas7bdat",
     feature = "spss",
-    feature = "xport"
+    feature = "xport",
+    feature = "rdata"
 ))]
 fn apply_variable_labels(
     profile: &mut ColumnProfile,
@@ -8076,6 +8079,26 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
+/// The share of values that are missing, as a percentage rounded to one
+/// decimal - except that a column with *any* missing value never reports
+/// 0.0. Four missing values in 26,115 rows is 0.015%, which one decimal
+/// rounds to zero, and `0.0` is what the rest of the tool reads as "nothing
+/// is ever missing": it drops the "has missing values" note and declares the
+/// column `NOT NULL` in SQL, which the first NULL then violates. Below 0.05%
+/// the value keeps three decimals (never less than 0.001).
+fn missing_percent(missing: usize, total: usize) -> f64 {
+    if total == 0 || missing == 0 {
+        return 0.0;
+    }
+    let raw = missing as f64 / total as f64 * 100.0;
+    let rounded = round1(raw);
+    if rounded > 0.0 {
+        rounded
+    } else {
+        ((raw * 1000.0).round() / 1000.0).max(0.001)
+    }
+}
+
 // --- CSV / TSV reader ---
 
 /// No longer called by CSV, fixed-width text, or any of the four
@@ -9078,11 +9101,7 @@ impl ColumnAccumulatorState {
             sketch,
         } = self;
         let missing = total.saturating_sub(total_non_null);
-        let missing_pct = round1(if total > 0 {
-            missing as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        });
+        let missing_pct = missing_percent(missing, total);
         let (ideal_type, mut notes, temporal_format) = if total_non_null == 0 {
             (
                 "String".to_string(),
@@ -17096,6 +17115,3288 @@ fn render_sql_inline_flat_xport(
     )
 }
 
+// --- R serialized data (`.rds`, `.RData`/`.rda`) ---
+//
+// `saveRDS()` writes one R object; `save()` writes a named set of them (a
+// pairlist, behind a five-byte `RDX2`/`RDX3` magic). Both are R's own
+// serialization format (src/main/serialize.c): a stream of items, each an
+// `int` of flags - the SEXP type in the low byte, and bits for "has
+// attributes", "has a tag" and the character encoding - followed by that
+// type's payload. Numbers are big-endian XDR (the default), native binary,
+// or decimal text (`ascii = TRUE`). Whatever the writer, the stream is
+// normally gzip-, bzip2- or xz-compressed, which the container layer peels
+// off before this reader runs.
+//
+// What becomes a table: a data frame (any subclass - tibble, data.table -
+// with its row names when they aren't just 1..n), a matrix or 1-D table
+// (with its dimnames), a plain atomic vector, and a list (a table if its
+// elements are equal-length vectors, else one row). Factors read as their
+// labels, Dates and POSIXct as dates and datetimes (UTC), `integer64` as
+// integers, and the `label`/`labels` attributes haven and Hmisc attach become
+// the column's description and value labels, exactly as for Stata/SPSS. A list
+// column keeps its elements as JSON text. Anything that isn't data (a
+// function, an environment, an S4 object) is a disclosed placeholder, never a
+// guess.
+//
+// R can't be read incrementally - a vector's attributes (a factor's levels,
+// a frame's names) come after its data - so an object is read whole and then
+// folded column by column; memory is about the size of the decompressed
+// object.
+#[cfg(feature = "rdata")]
+mod rdata_support {
+    use super::*;
+    use std::io::{BufRead, Read};
+
+    const NA_INT: i32 = i32::MIN;
+    /// How deeply objects may nest before the file is refused (a hostile
+    /// stream could otherwise recurse until the stack runs out).
+    const MAX_DEPTH: usize = 200;
+    /// Elements read per `read_exact`, and the most a vector pre-allocates
+    /// from a length the file merely claims.
+    const CHUNK: usize = 1 << 14;
+
+    // Pseudo-SEXP types (serialize.c).
+    const REFSXP: i32 = 255;
+    const NILVALUE_SXP: i32 = 254;
+    const GLOBALENV_SXP: i32 = 253;
+    const UNBOUNDVALUE_SXP: i32 = 252;
+    const MISSINGARG_SXP: i32 = 251;
+    const BASENAMESPACE_SXP: i32 = 250;
+    const NAMESPACESXP: i32 = 249;
+    const PACKAGESXP: i32 = 248;
+    const PERSISTSXP: i32 = 247;
+    const EMPTYENV_SXP: i32 = 242;
+    const BASEENV_SXP: i32 = 241;
+    const ATTRLANGSXP: i32 = 240;
+    const ATTRLISTSXP: i32 = 239;
+    const ALTREP_SXP: i32 = 238;
+    const BCREPDEF: i32 = 244;
+    const BCREPREF: i32 = 243;
+    // Real SEXP types.
+    const SYMSXP: i32 = 1;
+    const LISTSXP: i32 = 2;
+    const CLOSXP: i32 = 3;
+    const ENVSXP: i32 = 4;
+    const PROMSXP: i32 = 5;
+    const LANGSXP: i32 = 6;
+    const SPECIALSXP: i32 = 7;
+    const BUILTINSXP: i32 = 8;
+    const CHARSXP: i32 = 9;
+    const LGLSXP: i32 = 10;
+    const INTSXP: i32 = 13;
+    const REALSXP: i32 = 14;
+    const CPLXSXP: i32 = 15;
+    const STRSXP: i32 = 16;
+    const DOTSXP: i32 = 17;
+    const VECSXP: i32 = 19;
+    const EXPRSXP: i32 = 20;
+    const BCODESXP: i32 = 21;
+    const EXTPTRSXP: i32 = 22;
+    const WEAKREFSXP: i32 = 23;
+    const RAWSXP: i32 = 24;
+    const S4SXP: i32 = 25;
+
+    // CHARSXP encoding bits (the `levels` part of the flags).
+    const BYTES_MASK: i32 = 1 << 1;
+    const LATIN1_MASK: i32 = 1 << 2;
+    const UTF8_MASK: i32 = 1 << 3;
+    const ASCII_MASK: i32 = 1 << 6;
+
+    pub(super) type Attrs = Vec<(String, RObj)>;
+
+    /// An R object, reduced to what a table needs. A function, an
+    /// environment and the like are `Other`: they're read (the stream has no
+    /// way to skip one) and then dropped.
+    #[derive(Clone)]
+    pub(super) enum RObj {
+        Null,
+        Sym(String),
+        Pairlist(Vec<(Option<String>, RObj)>),
+        Lgl(Vec<i32>, Attrs),
+        Int(Vec<i32>, Attrs),
+        Real(Vec<f64>, Attrs),
+        Cplx(Vec<(f64, f64)>, Attrs),
+        Str(Vec<Option<String>>, Attrs),
+        Raw(Vec<u8>, Attrs),
+        List(Vec<RObj>, Attrs),
+        Other(&'static str, Attrs),
+    }
+
+    impl RObj {
+        fn attrs(&self) -> &[(String, RObj)] {
+            match self {
+                RObj::Lgl(_, a)
+                | RObj::Int(_, a)
+                | RObj::Real(_, a)
+                | RObj::Cplx(_, a)
+                | RObj::Str(_, a)
+                | RObj::Raw(_, a)
+                | RObj::List(_, a)
+                | RObj::Other(_, a) => a,
+                _ => &[],
+            }
+        }
+
+        fn attrs_mut(&mut self) -> Option<&mut Attrs> {
+            match self {
+                RObj::Lgl(_, a)
+                | RObj::Int(_, a)
+                | RObj::Real(_, a)
+                | RObj::Cplx(_, a)
+                | RObj::Str(_, a)
+                | RObj::Raw(_, a)
+                | RObj::List(_, a)
+                | RObj::Other(_, a) => Some(a),
+                _ => None,
+            }
+        }
+
+        fn attr(&self, name: &str) -> Option<&RObj> {
+            self.attrs().iter().find(|(k, _)| k == name).map(|(_, v)| v)
+        }
+
+        fn inherits(&self, class: &str) -> bool {
+            matches!(self.attr("class"), Some(RObj::Str(v, _)) if v.iter().flatten().any(|c| c == class))
+        }
+
+        fn len(&self) -> usize {
+            match self {
+                RObj::Lgl(v, _) | RObj::Int(v, _) => v.len(),
+                RObj::Real(v, _) => v.len(),
+                RObj::Cplx(v, _) => v.len(),
+                RObj::Str(v, _) => v.len(),
+                RObj::Raw(v, _) => v.len(),
+                RObj::List(v, _) => v.len(),
+                RObj::Null | RObj::Sym(_) | RObj::Pairlist(_) | RObj::Other(..) => 0,
+            }
+        }
+
+        fn is_atomic(&self) -> bool {
+            matches!(
+                self,
+                RObj::Lgl(..)
+                    | RObj::Int(..)
+                    | RObj::Real(..)
+                    | RObj::Cplx(..)
+                    | RObj::Str(..)
+                    | RObj::Raw(..)
+            )
+        }
+
+        fn type_name(&self) -> &'static str {
+            match self {
+                RObj::Null => "NULL",
+                RObj::Sym(_) => "symbol",
+                RObj::Pairlist(_) => "pairlist",
+                RObj::Lgl(..) => "logical vector",
+                RObj::Int(..) => "integer vector",
+                RObj::Real(..) => "double vector",
+                RObj::Cplx(..) => "complex vector",
+                RObj::Str(..) => "character vector",
+                RObj::Raw(..) => "raw vector",
+                RObj::List(..) => "list",
+                RObj::Other(label, _) => *label,
+            }
+        }
+
+        fn strings(&self) -> Option<&[Option<String>]> {
+            match self {
+                RObj::Str(v, _) => Some(v),
+                _ => None,
+            }
+        }
+    }
+
+    enum Wire {
+        /// Big-endian XDR, what `save`/`saveRDS` write by default.
+        Xdr,
+        /// Native binary (`'B'`); written in the host's byte order, read
+        /// here as little-endian, which every current host is.
+        Little,
+        /// Decimal text (`ascii = TRUE`).
+        Ascii,
+    }
+
+    struct Parser<R: BufRead> {
+        r: R,
+        wire: Wire,
+        /// Symbols, environments and the like that later items refer back
+        /// to by index.
+        refs: Vec<RObj>,
+        /// The code page of unmarked strings, from a version-3 header.
+        native: Option<&'static [u16; 256]>,
+    }
+
+    fn short<T>(r: std::io::Result<T>) -> Result<T> {
+        r.context("the R data ends early or is damaged")
+    }
+
+    fn is_na_real(x: f64) -> bool {
+        x.is_nan() && (x.to_bits() & 0xFFFF_FFFF) == 1954
+    }
+
+    impl<R: BufRead> Parser<R> {
+        // ---- primitives ----
+
+        fn byte(&mut self) -> Result<Option<u8>> {
+            let buf = short(self.r.fill_buf())?;
+            let b = buf.first().copied();
+            if b.is_some() {
+                self.r.consume(1);
+            }
+            Ok(b)
+        }
+
+        /// The next whitespace-delimited word (decimal text format only).
+        fn word(&mut self) -> Result<String> {
+            let mut out = Vec::new();
+            loop {
+                match self.byte()? {
+                    None => break,
+                    Some(b) if b.is_ascii_whitespace() => {
+                        if !out.is_empty() {
+                            break;
+                        }
+                    }
+                    Some(b) => out.push(b),
+                }
+            }
+            if out.is_empty() {
+                bail!("the R data ends early or is damaged");
+            }
+            String::from_utf8(out).context("a number in the R text data isn't ASCII")
+        }
+
+        fn int(&mut self) -> Result<i32> {
+            match self.wire {
+                Wire::Ascii => {
+                    let w = self.word()?;
+                    if w == "NA" {
+                        Ok(NA_INT)
+                    } else {
+                        w.parse().with_context(|| format!("{w:?} isn't an integer"))
+                    }
+                }
+                Wire::Xdr | Wire::Little => {
+                    let mut b = [0u8; 4];
+                    short(self.r.read_exact(&mut b))?;
+                    Ok(if matches!(self.wire, Wire::Xdr) {
+                        i32::from_be_bytes(b)
+                    } else {
+                        i32::from_le_bytes(b)
+                    })
+                }
+            }
+        }
+
+        fn real(&mut self) -> Result<f64> {
+            match self.wire {
+                Wire::Ascii => {
+                    let w = self.word()?;
+                    Ok(match w.as_str() {
+                        "NA" => f64::from_bits(0x7FF0_0000_0000_07A2),
+                        "NaN" => f64::NAN,
+                        "Inf" => f64::INFINITY,
+                        "-Inf" => f64::NEG_INFINITY,
+                        _ => w.parse().with_context(|| format!("{w:?} isn't a number"))?,
+                    })
+                }
+                Wire::Xdr | Wire::Little => {
+                    let mut b = [0u8; 8];
+                    short(self.r.read_exact(&mut b))?;
+                    Ok(if matches!(self.wire, Wire::Xdr) {
+                        f64::from_be_bytes(b)
+                    } else {
+                        f64::from_le_bytes(b)
+                    })
+                }
+            }
+        }
+
+        /// A vector length; `-1` announces a long vector (two more ints).
+        fn length(&mut self) -> Result<usize> {
+            let n = self.int()?;
+            if n == -1 {
+                let hi = u64::from(self.int()? as u32);
+                let lo = u64::from(self.int()? as u32);
+                usize::try_from((hi << 32) | lo).context("an R vector is too long for this machine")
+            } else if n < 0 {
+                bail!("an R vector claims a negative length");
+            } else {
+                Ok(n as usize)
+            }
+        }
+
+        fn int_vec(&mut self, n: usize) -> Result<Vec<i32>> {
+            let mut out = Vec::with_capacity(n.min(CHUNK));
+            if matches!(self.wire, Wire::Ascii) {
+                for _ in 0..n {
+                    out.push(self.int()?);
+                }
+                return Ok(out);
+            }
+            let big = matches!(self.wire, Wire::Xdr);
+            let mut buf = vec![0u8; 4 * n.min(CHUNK)];
+            let mut left = n;
+            while left > 0 {
+                let k = left.min(CHUNK);
+                short(self.r.read_exact(&mut buf[..4 * k]))?;
+                for j in 0..k {
+                    let b = [buf[4 * j], buf[4 * j + 1], buf[4 * j + 2], buf[4 * j + 3]];
+                    out.push(if big {
+                        i32::from_be_bytes(b)
+                    } else {
+                        i32::from_le_bytes(b)
+                    });
+                }
+                left -= k;
+            }
+            Ok(out)
+        }
+
+        fn real_vec(&mut self, n: usize) -> Result<Vec<f64>> {
+            let mut out = Vec::with_capacity(n.min(CHUNK));
+            if matches!(self.wire, Wire::Ascii) {
+                for _ in 0..n {
+                    out.push(self.real()?);
+                }
+                return Ok(out);
+            }
+            let big = matches!(self.wire, Wire::Xdr);
+            let mut buf = vec![0u8; 8 * n.min(CHUNK)];
+            let mut left = n;
+            while left > 0 {
+                let k = left.min(CHUNK);
+                short(self.r.read_exact(&mut buf[..8 * k]))?;
+                for j in 0..k {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&buf[8 * j..8 * j + 8]);
+                    out.push(if big {
+                        f64::from_be_bytes(b)
+                    } else {
+                        f64::from_le_bytes(b)
+                    });
+                }
+                left -= k;
+            }
+            Ok(out)
+        }
+
+        /// `n` raw bytes of a string or raw vector (text format: with its
+        /// backslash escapes, or two hex digits per byte for a raw vector).
+        fn bytes(&mut self, n: usize, hex: bool) -> Result<Vec<u8>> {
+            if matches!(self.wire, Wire::Ascii) {
+                let mut out = Vec::with_capacity(n.min(CHUNK));
+                if hex {
+                    for _ in 0..n {
+                        let w = self.word()?;
+                        out.push(
+                            u8::from_str_radix(&w, 16)
+                                .with_context(|| format!("{w:?} isn't a hex byte"))?,
+                        );
+                    }
+                    return Ok(out);
+                }
+                if n == 0 {
+                    return Ok(out);
+                }
+                // The text format skips whitespace before a string, then
+                // reads exactly `n` (escaped) characters.
+                let mut next = loop {
+                    match self.byte()? {
+                        Some(b) if b.is_ascii_whitespace() => {}
+                        Some(b) => break b,
+                        None => bail!("the R data ends early or is damaged"),
+                    }
+                };
+                while out.len() < n {
+                    if next == b'\\' {
+                        let c = self
+                            .byte()?
+                            .context("the R data ends early or is damaged")?;
+                        match c {
+                            b'n' => out.push(b'\n'),
+                            b't' => out.push(b'\t'),
+                            b'v' => out.push(0x0B),
+                            b'b' => out.push(0x08),
+                            b'r' => out.push(b'\r'),
+                            b'f' => out.push(0x0C),
+                            b'a' => out.push(0x07),
+                            b'0'..=b'7' => {
+                                let mut d = u32::from(c - b'0');
+                                let mut digits = 1;
+                                while digits < 3 {
+                                    let buf = short(self.r.fill_buf())?;
+                                    match buf.first() {
+                                        Some(&o) if (b'0'..=b'7').contains(&o) => {
+                                            d = d * 8 + u32::from(o - b'0');
+                                            self.r.consume(1);
+                                            digits += 1;
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                                out.push(d as u8);
+                            }
+                            other => out.push(other),
+                        }
+                    } else {
+                        out.push(next);
+                    }
+                    if out.len() < n {
+                        next = self
+                            .byte()?
+                            .context("the R data ends early or is damaged")?;
+                    }
+                }
+                return Ok(out);
+            }
+            let mut out = Vec::with_capacity(n.min(CHUNK));
+            let got = short((&mut self.r).take(n as u64).read_to_end(&mut out))?;
+            if got != n {
+                bail!("the R data ends early or is damaged");
+            }
+            Ok(out)
+        }
+
+        /// A CHARSXP's text: `None` is `NA_character_`.
+        fn charsxp(&mut self, flags: i32) -> Result<Option<String>> {
+            let n = self.int()?;
+            if n == -1 {
+                return Ok(None);
+            }
+            if n < 0 {
+                bail!("an R string claims a negative length");
+            }
+            let bytes = self.bytes(n as usize, false)?;
+            let levels = flags >> 12;
+            let from_table = |bytes: &[u8], table: &[u16; 256]| -> String {
+                bytes
+                    .iter()
+                    .map(|&b| char::from_u32(u32::from(table[b as usize])).unwrap_or('\u{FFFD}'))
+                    .collect()
+            };
+            Ok(Some(if levels & (UTF8_MASK | ASCII_MASK) != 0 {
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else if levels & LATIN1_MASK != 0 {
+                match codepage_support::table("windows-1252") {
+                    Some(t) => from_table(&bytes, t),
+                    None => String::from_utf8_lossy(&bytes).into_owned(),
+                }
+            } else if levels & BYTES_MASK != 0 {
+                String::from_utf8_lossy(&bytes).into_owned()
+            } else {
+                // Unmarked: the writer's native encoding, which is UTF-8
+                // almost everywhere; fall back to what the header named.
+                match String::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let bytes = e.into_bytes();
+                        match self.native {
+                            Some(t) => from_table(&bytes, t),
+                            None => String::from_utf8_lossy(&bytes).into_owned(),
+                        }
+                    }
+                }
+            }))
+        }
+
+        /// One STRSXP element or symbol name: an item that must be a CHARSXP.
+        fn string_elt(&mut self) -> Result<Option<String>> {
+            let flags = self.int()?;
+            if flags & 0xFF != CHARSXP {
+                bail!("an R character vector holds something that isn't a string");
+            }
+            self.charsxp(flags)
+        }
+
+        // ---- items ----
+
+        fn item(&mut self, depth: usize) -> Result<RObj> {
+            let flags = self.int()?;
+            self.item_with(flags, depth)
+        }
+
+        fn attrs(&mut self, has_attr: bool, depth: usize) -> Result<Attrs> {
+            if !has_attr {
+                return Ok(Vec::new());
+            }
+            Ok(match self.item(depth + 1)? {
+                RObj::Pairlist(cells) => cells
+                    .into_iter()
+                    .filter_map(|(tag, value)| tag.map(|t| (t, value)))
+                    .collect(),
+                _ => Vec::new(),
+            })
+        }
+
+        fn item_with(&mut self, flags: i32, depth: usize) -> Result<RObj> {
+            if depth > MAX_DEPTH {
+                bail!("the R data nests objects more than {MAX_DEPTH} levels deep");
+            }
+            let ty = flags & 0xFF;
+            let has_attr = flags & (1 << 9) != 0;
+            let has_tag = flags & (1 << 10) != 0;
+            match ty {
+                NILVALUE_SXP => Ok(RObj::Null),
+                EMPTYENV_SXP | BASEENV_SXP | GLOBALENV_SXP | BASENAMESPACE_SXP => {
+                    Ok(RObj::Other("environment", Vec::new()))
+                }
+                UNBOUNDVALUE_SXP | MISSINGARG_SXP => Ok(RObj::Other("marker", Vec::new())),
+                REFSXP => {
+                    let mut index = (flags >> 8) as usize;
+                    if index == 0 {
+                        index = self.int()? as usize;
+                    }
+                    self.refs
+                        .get(index.wrapping_sub(1))
+                        .cloned()
+                        .context("an R reference points at an object that was never read")
+                }
+                NAMESPACESXP | PACKAGESXP | PERSISTSXP => {
+                    if self.int()? != 0 {
+                        bail!("an R namespace reference is malformed");
+                    }
+                    let n = self.int()?;
+                    for _ in 0..n.max(0) {
+                        self.string_elt()?;
+                    }
+                    let obj = RObj::Other("environment", Vec::new());
+                    self.refs.push(obj.clone());
+                    Ok(obj)
+                }
+                SYMSXP => {
+                    let name = self.string_elt()?.unwrap_or_default();
+                    let obj = RObj::Sym(name);
+                    self.refs.push(obj.clone());
+                    Ok(obj)
+                }
+                ENVSXP => {
+                    let _locked = self.int()?;
+                    self.refs.push(RObj::Other("environment", Vec::new()));
+                    // enclosure, frame, hash table, attributes
+                    for _ in 0..4 {
+                        self.item(depth + 1)?;
+                    }
+                    Ok(RObj::Other("environment", Vec::new()))
+                }
+                LISTSXP | LANGSXP => {
+                    let mut cells: Vec<(Option<String>, RObj)> = Vec::new();
+                    let mut current = flags;
+                    loop {
+                        if current & (1 << 9) != 0 {
+                            self.item(depth + 1)?; // the cell's own attributes
+                        }
+                        let tag = if current & (1 << 10) != 0 {
+                            match self.item(depth + 1)? {
+                                RObj::Sym(s) => Some(s),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let car = self.item(depth + 1)?;
+                        cells.push((tag, car));
+                        let next = self.int()?;
+                        match next & 0xFF {
+                            NILVALUE_SXP => break,
+                            LISTSXP => current = next,
+                            _ => {
+                                // A dotted tail: read it, keep nothing.
+                                self.item_with(next, depth + 1)?;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(if ty == LISTSXP {
+                        RObj::Pairlist(cells)
+                    } else {
+                        RObj::Other("language object", Vec::new())
+                    })
+                }
+                CLOSXP | PROMSXP | DOTSXP => {
+                    if has_attr {
+                        self.item(depth + 1)?;
+                    }
+                    if has_tag {
+                        self.item(depth + 1)?;
+                    }
+                    self.item(depth + 1)?; // formals / value / car
+                    self.item(depth + 1)?; // body / expression / cdr
+                    Ok(RObj::Other(
+                        if ty == CLOSXP { "function" } else { "promise" },
+                        Vec::new(),
+                    ))
+                }
+                SPECIALSXP | BUILTINSXP => {
+                    let n = self.int()?;
+                    self.bytes(n.max(0) as usize, false)?;
+                    Ok(RObj::Other("function", Vec::new()))
+                }
+                CHARSXP => Ok(RObj::Str(vec![self.charsxp(flags)?], Vec::new())),
+                LGLSXP | INTSXP => {
+                    let n = self.length()?;
+                    let v = self.int_vec(n)?;
+                    let attrs = self.attrs(has_attr, depth)?;
+                    Ok(if ty == LGLSXP {
+                        RObj::Lgl(v, attrs)
+                    } else {
+                        RObj::Int(v, attrs)
+                    })
+                }
+                REALSXP => {
+                    let n = self.length()?;
+                    let v = self.real_vec(n)?;
+                    Ok(RObj::Real(v, self.attrs(has_attr, depth)?))
+                }
+                CPLXSXP => {
+                    let n = self.length()?;
+                    let flat =
+                        self.real_vec(n.checked_mul(2).context("a complex vector is too long")?)?;
+                    let v = flat.chunks(2).map(|c| (c[0], c[1])).collect();
+                    Ok(RObj::Cplx(v, self.attrs(has_attr, depth)?))
+                }
+                STRSXP => {
+                    let n = self.length()?;
+                    let mut v = Vec::with_capacity(n.min(CHUNK));
+                    for _ in 0..n {
+                        v.push(self.string_elt()?);
+                    }
+                    Ok(RObj::Str(v, self.attrs(has_attr, depth)?))
+                }
+                VECSXP | EXPRSXP => {
+                    let n = self.length()?;
+                    let mut v = Vec::with_capacity(n.min(CHUNK));
+                    for _ in 0..n {
+                        v.push(self.item(depth + 1)?);
+                    }
+                    let attrs = self.attrs(has_attr, depth)?;
+                    Ok(if ty == VECSXP {
+                        RObj::List(v, attrs)
+                    } else {
+                        RObj::Other("expression", attrs)
+                    })
+                }
+                RAWSXP => {
+                    let n = self.length()?;
+                    let v = self.bytes(n, true)?;
+                    Ok(RObj::Raw(v, self.attrs(has_attr, depth)?))
+                }
+                BCODESXP => {
+                    let _reps = self.int()?;
+                    self.bytecode(depth)?;
+                    self.attrs(has_attr, depth)?;
+                    Ok(RObj::Other("function", Vec::new()))
+                }
+                EXTPTRSXP => {
+                    self.refs.push(RObj::Other("external pointer", Vec::new()));
+                    self.item(depth + 1)?; // protected value
+                    self.item(depth + 1)?; // tag
+                    self.attrs(has_attr, depth)?;
+                    Ok(RObj::Other("external pointer", Vec::new()))
+                }
+                WEAKREFSXP => {
+                    self.refs.push(RObj::Other("weak reference", Vec::new()));
+                    self.attrs(has_attr, depth)?;
+                    Ok(RObj::Other("weak reference", Vec::new()))
+                }
+                S4SXP => {
+                    let attrs = self.attrs(has_attr, depth)?;
+                    Ok(RObj::Other("S4 object", attrs))
+                }
+                ALTREP_SXP => {
+                    let info = self.item(depth + 1)?;
+                    let state = self.item(depth + 1)?;
+                    let attr = self.item(depth + 1)?;
+                    altrep(info, state, attr)
+                }
+                other => bail!("the R data holds an object of type {other}, which isn't supported"),
+            }
+        }
+
+        // ---- byte code (read only to get past it) ----
+
+        fn bytecode(&mut self, depth: usize) -> Result<()> {
+            if depth > MAX_DEPTH {
+                bail!("the R data nests objects more than {MAX_DEPTH} levels deep");
+            }
+            self.item(depth + 1)?; // the code vector
+            let n = self.int()?;
+            for _ in 0..n.max(0) {
+                let t = self.int()?;
+                match t {
+                    BCODESXP => self.bytecode(depth + 1)?,
+                    LANGSXP | LISTSXP | BCREPDEF | BCREPREF | ATTRLANGSXP | ATTRLISTSXP => {
+                        self.bc_lang(t, depth + 1)?
+                    }
+                    _ => {
+                        self.item(depth + 1)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn bc_lang(&mut self, t: i32, depth: usize) -> Result<()> {
+            if depth > MAX_DEPTH * 8 {
+                bail!("the R data nests byte code more deeply than this reader follows");
+            }
+            match t {
+                BCREPREF => {
+                    self.int()?;
+                }
+                BCREPDEF | LANGSXP | LISTSXP | ATTRLANGSXP | ATTRLISTSXP => {
+                    let mut ty = t;
+                    if ty == BCREPDEF {
+                        self.int()?; // its slot in the repeat table
+                        ty = self.int()?;
+                    }
+                    if ty == ATTRLANGSXP || ty == ATTRLISTSXP {
+                        self.item(depth + 1)?;
+                    }
+                    self.item(depth + 1)?; // tag
+                    let car = self.int()?;
+                    self.bc_lang(car, depth + 1)?;
+                    let cdr = self.int()?;
+                    self.bc_lang(cdr, depth + 1)?;
+                }
+                _ => {
+                    self.item(depth + 1)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// `as.character()` of a double the way R spells it: up to 15
+    /// significant digits with trailing zeros dropped, in fixed notation
+    /// unless scientific is narrower (`100000` is `1e+05`, `123456` is not).
+    /// `None` is NA.
+    fn r_double_string(x: f64) -> Option<String> {
+        if is_na_real(x) {
+            return None;
+        }
+        if x.is_nan() {
+            return Some("NaN".to_string());
+        }
+        if x.is_infinite() {
+            return Some(if x > 0.0 { "Inf" } else { "-Inf" }.to_string());
+        }
+        if x == 0.0 {
+            return Some("0".to_string());
+        }
+        let sci = format!("{:.14e}", x.abs());
+        let (mantissa, exp) = sci.split_once('e')?;
+        let exp: i32 = exp.parse().ok()?;
+        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        let digits = digits.trim_end_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        let nsig = digits.len() as i32;
+        let fixed_width = if exp >= 0 {
+            (exp + 1) + if nsig > exp + 1 { nsig - exp } else { 0 }
+        } else {
+            2 + (nsig - exp - 1)
+        };
+        let sci_width = nsig + i32::from(nsig > 1) + if exp.abs() >= 100 { 5 } else { 4 };
+        let sign = if x < 0.0 { "-" } else { "" };
+        let body = if fixed_width <= sci_width {
+            if exp >= 0 {
+                let int_len = (exp + 1) as usize;
+                let padded = format!("{digits:0<int_len$}");
+                let (int_part, frac) = padded.split_at(int_len);
+                if frac.is_empty() {
+                    int_part.to_string()
+                } else {
+                    format!("{int_part}.{frac}")
+                }
+            } else {
+                format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+            }
+        } else {
+            let (first, rest) = digits.split_at(1);
+            let m = if rest.is_empty() {
+                first.to_string()
+            } else {
+                format!("{first}.{rest}")
+            };
+            format!("{m}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+        };
+        Some(format!("{sign}{body}"))
+    }
+
+    /// An ALTREP object (R 3.5+): a compact integer sequence, a deferred
+    /// `as.character`, or a wrapper that only adds metadata. Anything else
+    /// (a memory-mapped vector) can't be rebuilt from its state.
+    fn altrep(info: RObj, state: RObj, attr: RObj) -> Result<RObj> {
+        let class = match &info {
+            RObj::Pairlist(cells) => match cells.first() {
+                Some((_, RObj::Sym(s))) => s.clone(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        let mut obj = match class.as_str() {
+            "compact_intseq" | "compact_realseq" => {
+                let RObj::Real(p, _) = &state else {
+                    bail!("a compact R sequence has no (length, start, step) state");
+                };
+                if p.len() != 3 || !p.iter().all(|x| x.is_finite()) || p[0] < 0.0 {
+                    bail!("a compact R sequence has a malformed state");
+                }
+                let n = p[0] as usize;
+                if class == "compact_intseq" {
+                    RObj::Int(
+                        (0..n).map(|i| (p[1] + p[2] * i as f64) as i32).collect(),
+                        Vec::new(),
+                    )
+                } else {
+                    RObj::Real((0..n).map(|i| p[1] + p[2] * i as f64).collect(), Vec::new())
+                }
+            }
+            "deferred_string" => {
+                let arg = match &state {
+                    RObj::Pairlist(cells) => cells.first().map(|(_, v)| v),
+                    other => Some(other),
+                };
+                match arg {
+                    Some(RObj::Int(v, _)) => RObj::Str(
+                        v.iter()
+                            .map(|&x| (x != NA_INT).then(|| x.to_string()))
+                            .collect(),
+                        Vec::new(),
+                    ),
+                    Some(RObj::Real(v, _)) => {
+                        RObj::Str(v.iter().map(|&x| r_double_string(x)).collect(), Vec::new())
+                    }
+                    _ => bail!(
+                        "an R deferred string of something other than numbers can't be rebuilt"
+                    ),
+                }
+            }
+            c if c.starts_with("wrap_") => match state {
+                // R serializes a wrapper's state as the pair (vector, metadata).
+                RObj::Pairlist(mut cells) if !cells.is_empty() => cells.swap_remove(0).1,
+                RObj::List(mut parts, _) if !parts.is_empty() => parts.swap_remove(0),
+                _ => bail!("an R wrapper object has no wrapped vector"),
+            },
+            other => {
+                bail!("the R data holds an ALTREP object of class {other:?}, which can't be read")
+            }
+        };
+        if let (RObj::Pairlist(cells), Some(target)) = (attr, obj.attrs_mut()) {
+            for (tag, value) in cells {
+                if let Some(tag) = tag {
+                    target.retain(|(k, _)| *k != tag);
+                    target.push((tag, value));
+                }
+            }
+        }
+        Ok(obj)
+    }
+
+    /// Everything a file holds: `(name, object)` pairs, and whether it was a
+    /// `save()` file (several named objects) rather than one `saveRDS()` one.
+    pub(super) struct Loaded {
+        pub(super) is_rdata: bool,
+        pub(super) objects: Vec<(String, RObj)>,
+    }
+
+    pub(super) fn load(path: &Path) -> Result<Loaded> {
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let mut r = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut is_rdata = false;
+        {
+            let head = short(r.fill_buf())?;
+            for magic in [
+                b"RDX2\n", b"RDX3\n", b"RDA2\n", b"RDA3\n", b"RDB2\n", b"RDB3\n",
+            ] {
+                if head.starts_with(magic) {
+                    is_rdata = true;
+                    break;
+                }
+            }
+        }
+        if is_rdata {
+            r.consume(5);
+        }
+        let mut tag = [0u8; 2];
+        short(r.read_exact(&mut tag))?;
+        let wire = match &tag {
+            b"X\n" => Wire::Xdr,
+            b"B\n" => Wire::Little,
+            b"A\n" => Wire::Ascii,
+            _ => bail!("{path:?} isn't R serialized data (no RDS or RData header)"),
+        };
+        let mut p = Parser {
+            r,
+            wire,
+            refs: Vec::new(),
+            native: None,
+        };
+        let version = p.int()?;
+        let _writer = p.int()?;
+        let _min_reader = p.int()?;
+        match version {
+            2 => {}
+            3 => {
+                let n = p.int()?;
+                let name = p.bytes(n.max(0) as usize, false)?;
+                let name = String::from_utf8_lossy(&name).to_ascii_uppercase();
+                if !name.contains("UTF") {
+                    p.native = codepage_support::table(&name)
+                        .or_else(|| codepage_support::table(&name.replace("ISO8859", "ISO-8859")))
+                        .or_else(|| codepage_support::table(&name.replace("LATIN", "ISO-8859-")));
+                }
+            }
+            other => bail!(
+                "{path:?} is R serialization version {other}; only versions 2 and 3 are supported"
+            ),
+        }
+        let root = p
+            .item(0)
+            .with_context(|| format!("failed reading R data from {path:?}"))?;
+        let objects = if is_rdata {
+            match root {
+                RObj::Pairlist(cells) => cells
+                    .into_iter()
+                    .map(|(tag, value)| (tag.unwrap_or_default(), value))
+                    .collect(),
+                RObj::Null => Vec::new(),
+                _ => bail!("{path:?} is an RData file whose contents aren't a list of objects"),
+            }
+        } else {
+            vec![(String::new(), root)]
+        };
+        Ok(Loaded { is_rdata, objects })
+    }
+
+    // ---- objects as tables ----
+
+    enum Data<'a> {
+        Obj(&'a RObj),
+        /// Row names, built here rather than found in the file.
+        Names(Vec<Option<String>>),
+    }
+
+    #[derive(Clone)]
+    enum Mode<'a> {
+        Plain,
+        Factor(&'a [Option<String>]),
+        Date,
+        DateTime(u32),
+        Int64,
+        /// A list column: each element as JSON text.
+        Json,
+        /// The whole object as one JSON cell (a list that isn't a table).
+        Whole,
+    }
+
+    pub(super) struct Col<'a> {
+        name: String,
+        data: Data<'a>,
+        /// Where the column starts in `data` (a matrix column is a slice).
+        offset: usize,
+        mode: Mode<'a>,
+        current_type: &'static str,
+        description: String,
+        value_labels: Vec<(String, String)>,
+        notes: Vec<String>,
+    }
+
+    pub(super) struct Table<'a> {
+        nrows: usize,
+        cols: Vec<Col<'a>>,
+    }
+
+    pub(super) enum Tab<'a> {
+        Table(Table<'a>),
+        /// An object that isn't data, and why.
+        Skipped(String),
+    }
+
+    /// Fraction digits a POSIXct column needs: none when every value is a
+    /// whole second, else milliseconds or microseconds. One format for the
+    /// whole column keeps its date-format detection from splitting.
+    fn datetime_digits(o: &RObj) -> u32 {
+        let mut digits = 0;
+        if let RObj::Real(v, _) = o {
+            for &x in v {
+                if !x.is_finite() {
+                    continue;
+                }
+                let micros = ((x - x.floor()) * 1e6).round() as i64 % 1_000_000;
+                if micros != 0 {
+                    digits = digits.max(if micros % 1000 == 0 { 3 } else { 6 });
+                }
+            }
+        }
+        digits
+    }
+
+    fn real_text(x: f64, out: &mut String) -> bool {
+        use std::fmt::Write;
+        if is_na_real(x) {
+            return false;
+        }
+        if x.is_nan() {
+            out.push_str("NaN");
+        } else if x.is_infinite() {
+            out.push_str(if x > 0.0 { "Inf" } else { "-Inf" });
+        } else if x == 0.0 || (1e-5..1e15).contains(&x.abs()) {
+            let _ = write!(out, "{x}");
+        } else {
+            let _ = write!(out, "{x:e}");
+        }
+        true
+    }
+
+    fn date_text(days: f64, out: &mut String) -> bool {
+        use std::fmt::Write;
+        if !days.is_finite() {
+            return false;
+        }
+        match EpochDate::from_days(days.floor() as i64) {
+            Some(d) => out.push_str(&d.format_ymd()),
+            None => {
+                let _ = write!(out, "{days}");
+            }
+        }
+        true
+    }
+
+    fn datetime_text(secs: f64, digits: u32, out: &mut String) -> bool {
+        use std::fmt::Write;
+        if !secs.is_finite() {
+            return false;
+        }
+        let mut whole = secs.floor();
+        let mut micros = ((secs - whole) * 1e6).round() as i64;
+        if micros >= 1_000_000 {
+            whole += 1.0;
+            micros -= 1_000_000;
+        }
+        match EpochDateTime::from_unix_seconds(whole as i64, (micros * 1000) as u32) {
+            Some(dt) => {
+                if digits == 0 {
+                    out.push_str(&dt.format_space());
+                } else {
+                    let _ = write!(
+                        out,
+                        "{} {}",
+                        dt.date.format_ymd(),
+                        dt.time.format_hms_frac(digits)
+                    );
+                }
+            }
+            None => {
+                let _ = write!(out, "{secs}");
+            }
+        }
+        true
+    }
+
+    impl Col<'_> {
+        /// Writes row `i` into `out`; `false` means the value is missing.
+        fn write(&self, i: usize, out: &mut String) -> bool {
+            use std::fmt::Write;
+            let o = match &self.data {
+                Data::Names(v) => {
+                    return match v.get(i) {
+                        Some(Some(s)) => {
+                            out.push_str(s);
+                            true
+                        }
+                        _ => false,
+                    };
+                }
+                Data::Obj(o) => *o,
+            };
+            let k = self.offset + i;
+            match (o, &self.mode) {
+                (RObj::List(elems, _), Mode::Json) => match elems.get(k) {
+                    None | Some(RObj::Null) => false,
+                    Some(e) => {
+                        json_value(e, out, 0);
+                        true
+                    }
+                },
+                (_, Mode::Whole) => {
+                    json_value(o, out, 0);
+                    true
+                }
+                (RObj::Lgl(v, _), _) => match v.get(k) {
+                    None | Some(&NA_INT) => false,
+                    Some(0) => {
+                        out.push_str("FALSE");
+                        true
+                    }
+                    Some(_) => {
+                        out.push_str("TRUE");
+                        true
+                    }
+                },
+                (RObj::Int(v, _), mode) => {
+                    let Some(&x) = v.get(k) else {
+                        return false;
+                    };
+                    if x == NA_INT {
+                        return false;
+                    }
+                    match mode {
+                        Mode::Factor(levels) => match levels.get((x as usize).wrapping_sub(1)) {
+                            Some(Some(s)) => {
+                                out.push_str(s);
+                                true
+                            }
+                            _ => false,
+                        },
+                        Mode::Date => date_text(f64::from(x), out),
+                        Mode::DateTime(d) => datetime_text(f64::from(x), *d, out),
+                        _ => {
+                            let _ = write!(out, "{x}");
+                            true
+                        }
+                    }
+                }
+                (RObj::Real(v, _), mode) => {
+                    let Some(&x) = v.get(k) else {
+                        return false;
+                    };
+                    match mode {
+                        Mode::Int64 => {
+                            let b = x.to_bits() as i64;
+                            if b == i64::MIN {
+                                return false;
+                            }
+                            let _ = write!(out, "{b}");
+                            true
+                        }
+                        Mode::Date => date_text(x, out),
+                        Mode::DateTime(d) => datetime_text(x, *d, out),
+                        _ => real_text(x, out),
+                    }
+                }
+                (RObj::Cplx(v, _), _) => {
+                    let Some(&(re, im)) = v.get(k) else {
+                        return false;
+                    };
+                    if is_na_real(re) || is_na_real(im) {
+                        return false;
+                    }
+                    real_text(re, out);
+                    if im.is_sign_negative() && !im.is_nan() {
+                        out.push('-');
+                        real_text(-im, out);
+                    } else {
+                        out.push('+');
+                        real_text(im, out);
+                    }
+                    out.push('i');
+                    true
+                }
+                (RObj::Str(v, _), _) => match v.get(k) {
+                    Some(Some(s)) => {
+                        out.push_str(s);
+                        true
+                    }
+                    _ => false,
+                },
+                (RObj::Raw(v, _), _) => match v.get(k) {
+                    Some(b) => {
+                        let _ = write!(out, "{b:02x}");
+                        true
+                    }
+                    None => false,
+                },
+                _ => false,
+            }
+        }
+    }
+
+    fn is_number_cell(o: &RObj, mode: &Mode) -> bool {
+        matches!(
+            (o, mode),
+            (RObj::Int(..), Mode::Plain)
+                | (RObj::Real(..), Mode::Plain)
+                | (RObj::Real(..), Mode::Int64)
+        )
+    }
+
+    fn json_str(s: &str, out: &mut String) {
+        use std::fmt::Write;
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    /// An R value as JSON: a list or vector is an object when it has names,
+    /// an array otherwise - even a vector of one, so a list column's cells
+    /// all have the same shape.
+    fn json_value(o: &RObj, out: &mut String, depth: usize) {
+        if depth > 64 {
+            out.push_str("null");
+            return;
+        }
+        match o {
+            RObj::Null => out.push_str("null"),
+            RObj::Sym(s) => json_str(s, out),
+            RObj::Pairlist(cells) => {
+                out.push('{');
+                for (i, (tag, v)) in cells.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    json_str(tag.as_deref().unwrap_or(""), out);
+                    out.push(':');
+                    json_value(v, out, depth + 1);
+                }
+                out.push('}');
+            }
+            RObj::Other(label, _) => json_str(&format!("<{label}>"), out),
+            RObj::List(elems, _) => {
+                let names = o.attr("names").and_then(RObj::strings);
+                out.push(if names.is_some() { '{' } else { '[' });
+                for (i, e) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if let Some(names) = names {
+                        json_str(names.get(i).and_then(|n| n.as_deref()).unwrap_or(""), out);
+                        out.push(':');
+                    }
+                    json_value(e, out, depth + 1);
+                }
+                out.push(if names.is_some() { '}' } else { ']' });
+            }
+            _ => {
+                // An atomic vector, read through the same rules as a column.
+                let col = vector_col(String::new(), o, 0);
+                let names = o.attr("names").and_then(RObj::strings);
+                let n = o.len();
+                out.push(if names.is_some() { '{' } else { '[' });
+                let number = is_number_cell(o, &col.mode);
+                let mut cell = String::new();
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    if let Some(names) = names {
+                        json_str(names.get(i).and_then(|n| n.as_deref()).unwrap_or(""), out);
+                        out.push(':');
+                    }
+                    cell.clear();
+                    if !col.write(i, &mut cell) {
+                        out.push_str("null");
+                    } else if let RObj::Lgl(..) = o {
+                        out.push_str(if cell == "TRUE" { "true" } else { "false" });
+                    } else if number && !cell.contains(['N', 'I', 'n', 'i']) {
+                        out.push_str(&cell);
+                    } else {
+                        json_str(&cell, out);
+                    }
+                }
+                out.push(if names.is_some() { '}' } else { ']' });
+            }
+        }
+    }
+
+    fn label_text(o: &RObj, i: usize) -> String {
+        let mut s = String::new();
+        match o {
+            RObj::Int(v, _) | RObj::Lgl(v, _) => s = v[i].to_string(),
+            RObj::Real(v, _) => {
+                real_text(v[i], &mut s);
+            }
+            RObj::Str(v, _) => s = v[i].clone().unwrap_or_default(),
+            _ => {}
+        }
+        s
+    }
+
+    /// A column over `o` (a vector), starting at `offset`.
+    fn vector_col<'a>(name: String, o: &'a RObj, offset: usize) -> Col<'a> {
+        let mut notes = Vec::new();
+        let (mode, current_type) = match o {
+            RObj::Int(..) | RObj::Real(..) if o.inherits("Date") => (Mode::Date, "Date"),
+            RObj::Int(..) | RObj::Real(..) if o.inherits("POSIXct") => {
+                match o
+                    .attr("tzone")
+                    .and_then(RObj::strings)
+                    .and_then(|t| t.first())
+                {
+                    Some(Some(tz)) if !tz.is_empty() => notes.push(format!(
+                        "POSIXct instants are shown in UTC; the column's time zone is {tz}"
+                    )),
+                    _ => {}
+                }
+                (Mode::DateTime(datetime_digits(o)), "POSIXct")
+            }
+            RObj::Real(..) if o.inherits("integer64") => (Mode::Int64, "integer64"),
+            RObj::Real(..) if o.inherits("difftime") => {
+                if let Some(Some(u)) = o
+                    .attr("units")
+                    .and_then(RObj::strings)
+                    .and_then(|u| u.first())
+                {
+                    notes.push(format!("difftime units: {u}"));
+                }
+                (Mode::Plain, "difftime")
+            }
+            RObj::Int(..) if o.inherits("factor") => match o.attr("levels") {
+                Some(RObj::Str(levels, _)) => {
+                    if o.inherits("ordered") {
+                        notes.push("ordered factor".to_string());
+                    }
+                    (Mode::Factor(levels), "factor")
+                }
+                _ => (Mode::Plain, "integer"),
+            },
+            RObj::Lgl(..) => (Mode::Plain, "logical"),
+            RObj::Int(..) => (Mode::Plain, "integer"),
+            RObj::Real(..) => (Mode::Plain, "double"),
+            RObj::Cplx(..) => (Mode::Plain, "complex"),
+            RObj::Str(..) => (Mode::Plain, "character"),
+            RObj::Raw(..) => (Mode::Plain, "raw"),
+            RObj::List(..) => (Mode::Json, "list"),
+            _ => (Mode::Whole, "object"),
+        };
+        // The author's own words, as in haven and Hmisc: a `label` is the
+        // variable's description and `labels` its value labels.
+        let description = match o.attr("label") {
+            Some(RObj::Str(v, _)) => v.first().cloned().flatten().unwrap_or_default(),
+            _ => String::new(),
+        };
+        let mut value_labels = Vec::new();
+        if let Some(labels) = o.attr("labels")
+            && let Some(names) = labels.attr("names").and_then(RObj::strings)
+            && labels.is_atomic()
+        {
+            for (i, name) in names.iter().enumerate().take(labels.len()) {
+                value_labels.push((label_text(labels, i), name.clone().unwrap_or_default()));
+            }
+        }
+        Col {
+            name,
+            data: Data::Obj(o),
+            offset,
+            mode,
+            current_type,
+            description,
+            value_labels,
+            notes,
+        }
+    }
+
+    fn names_col(name: &str, names: Vec<Option<String>>) -> Col<'static> {
+        Col {
+            name: name.to_string(),
+            data: Data::Names(names),
+            offset: 0,
+            mode: Mode::Plain,
+            current_type: "character",
+            description: String::new(),
+            value_labels: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// An array's `dim`, when it's consistent with the data: a vector that
+    /// holds fewer values than its dimensions claim is damaged, and reading
+    /// it would run past the end.
+    fn dims(o: &RObj) -> Option<Vec<usize>> {
+        match o.attr("dim") {
+            Some(RObj::Int(v, _)) if v.iter().all(|&d| d >= 0) => {
+                let d: Vec<usize> = v.iter().map(|&d| d as usize).collect();
+                let cells = d.iter().try_fold(1usize, |a, &x| a.checked_mul(x))?;
+                (cells == o.len()).then_some(d)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `i`-th dimnames vector, when the array has one.
+    fn dimnames(o: &RObj, i: usize) -> Option<&[Option<String>]> {
+        match o.attr("dimnames") {
+            Some(RObj::List(v, _)) => v.get(i).and_then(RObj::strings),
+            _ => None,
+        }
+    }
+
+    fn column_name(names: Option<&[Option<String>]>, i: usize) -> String {
+        match names.and_then(|n| n.get(i)) {
+            Some(Some(n)) if !n.is_empty() => n.clone(),
+            _ => format!("V{}", i + 1),
+        }
+    }
+
+    /// A data frame's row names, unless they're the automatic 1..n.
+    fn frame_row_names(o: &RObj) -> (Option<usize>, Option<Vec<Option<String>>>) {
+        match o.attr("row.names") {
+            Some(RObj::Int(v, _)) if v.len() == 2 && v[0] == NA_INT => {
+                (Some(v[1].unsigned_abs() as usize), None)
+            }
+            Some(RObj::Int(v, _)) => {
+                let automatic = v.iter().enumerate().all(|(i, &x)| x == i as i32 + 1);
+                (
+                    Some(v.len()),
+                    (!automatic).then(|| v.iter().map(|x| Some(x.to_string())).collect()),
+                )
+            }
+            Some(RObj::Str(v, _)) => (Some(v.len()), Some(v.clone())),
+            Some(RObj::Real(v, _)) => (
+                Some(v.len()),
+                Some(
+                    v.iter()
+                        .map(|&x| {
+                            let mut s = String::new();
+                            real_text(x, &mut s).then_some(s)
+                        })
+                        .collect(),
+                ),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    fn push_frame_column<'a>(
+        cols: &mut Vec<Col<'a>>,
+        name: String,
+        e: &'a RObj,
+        nrows: usize,
+    ) -> Result<()> {
+        if let RObj::List(sub, _) = e
+            && e.inherits("data.frame")
+        {
+            let names = e.attr("names").and_then(RObj::strings);
+            for (j, s) in sub.iter().enumerate() {
+                let inner = column_name(names, j);
+                push_frame_column(cols, format!("{name}.{inner}"), s, nrows)?;
+            }
+            return Ok(());
+        }
+        if e.is_atomic()
+            && let Some(d) = dims(e)
+            && d.len() == 2
+        {
+            if d[0] != nrows {
+                bail!(
+                    "matrix column {name:?} has {} rows but the data frame has {nrows}",
+                    d[0]
+                );
+            }
+            let names = dimnames(e, 1);
+            for j in 0..d[1] {
+                let inner = match names.and_then(|n| n.get(j)) {
+                    Some(Some(n)) if !n.is_empty() => n.clone(),
+                    _ => (j + 1).to_string(),
+                };
+                cols.push(vector_col(format!("{name}.{inner}"), e, j * nrows));
+            }
+            return Ok(());
+        }
+        if !(e.is_atomic() || matches!(e, RObj::List(..))) {
+            bail!("column {name:?} is an R {}, not data", e.type_name());
+        }
+        if e.len() != nrows {
+            bail!(
+                "column {name:?} has {} values but the data frame has {nrows} rows",
+                e.len()
+            );
+        }
+        cols.push(vector_col(name, e, 0));
+        Ok(())
+    }
+
+    fn frame_table<'a>(o: &'a RObj, elems: &'a [RObj]) -> Result<Table<'a>> {
+        let names = o.attr("names").and_then(RObj::strings);
+        let (rows, row_names) = frame_row_names(o);
+        let nrows = rows.or_else(|| elems.first().map(RObj::len)).unwrap_or(0);
+        let mut cols = Vec::new();
+        if let Some(rn) = row_names
+            && rn.len() == nrows
+        {
+            cols.push(names_col("row_names", rn));
+        }
+        for (i, e) in elems.iter().enumerate() {
+            push_frame_column(&mut cols, column_name(names, i), e, nrows)?;
+        }
+        Ok(Table { nrows, cols })
+    }
+
+    fn list_table<'a>(o: &'a RObj, elems: &'a [RObj]) -> Result<Table<'a>> {
+        if elems.is_empty() {
+            bail!("an empty list");
+        }
+        let names = o.attr("names").and_then(RObj::strings);
+        let plain = |e: &RObj| e.is_atomic() && dims(e).is_none();
+        let n = elems[0].len();
+        if elems.iter().all(|e| plain(e) && e.len() == n) && n > 1 {
+            let cols = elems
+                .iter()
+                .enumerate()
+                .map(|(i, e)| vector_col(column_name(names, i), e, 0))
+                .collect();
+            return Ok(Table { nrows: n, cols });
+        }
+        // Otherwise a list is one row: a value of one stays a value, anything
+        // longer or nested becomes JSON text.
+        let cols = elems
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let name = column_name(names, i);
+                if plain(e) && e.len() == 1 {
+                    vector_col(name, e, 0)
+                } else {
+                    let mut c = vector_col(name, e, 0);
+                    c.mode = Mode::Whole;
+                    c.current_type = "list";
+                    c
+                }
+            })
+            .collect();
+        Ok(Table { nrows: 1, cols })
+    }
+
+    fn atomic_table(o: &RObj) -> Result<Table<'_>> {
+        match dims(o) {
+            None => {
+                let mut cols = Vec::new();
+                if let Some(n) = o.attr("names").and_then(RObj::strings) {
+                    cols.push(names_col("name", n.to_vec()));
+                }
+                cols.push(vector_col("value".to_string(), o, 0));
+                Ok(Table {
+                    nrows: o.len(),
+                    cols,
+                })
+            }
+            Some(d) if d.len() == 1 => {
+                let mut cols = Vec::new();
+                if let Some(n) = dimnames(o, 0) {
+                    cols.push(names_col("row_names", n.to_vec()));
+                }
+                cols.push(vector_col("value".to_string(), o, 0));
+                Ok(Table { nrows: d[0], cols })
+            }
+            Some(d) if d.len() == 2 => {
+                let mut cols = Vec::new();
+                if let Some(n) = dimnames(o, 0) {
+                    cols.push(names_col("row_names", n.to_vec()));
+                }
+                let names = dimnames(o, 1);
+                for j in 0..d[1] {
+                    cols.push(vector_col(column_name(names, j), o, j * d[0]));
+                }
+                Ok(Table { nrows: d[0], cols })
+            }
+            Some(d) => bail!("an array with {} dimensions", d.len()),
+        }
+    }
+
+    pub(super) fn tab_for(o: &RObj) -> Tab<'_> {
+        let built = match o {
+            RObj::List(elems, _) if o.inherits("data.frame") => frame_table(o, elems),
+            RObj::List(elems, _) => list_table(o, elems),
+            _ if o.is_atomic() => atomic_table(o),
+            RObj::Null => Err(anyhow!("NULL")),
+            other => Err(anyhow!("an R {} isn't data", other.type_name())),
+        };
+        match built {
+            Ok(t) => Tab::Table(t),
+            Err(e) => Tab::Skipped(e.message),
+        }
+    }
+
+    /// The tables a file holds, named: a `saveRDS` file's one object takes
+    /// `stem`; a `save` file's objects keep their variable names.
+    pub(super) fn tables<'a>(loaded: &'a Loaded, stem: &str) -> Vec<(String, Tab<'a>)> {
+        loaded
+            .objects
+            .iter()
+            .map(|(name, o)| {
+                let name = if loaded.is_rdata {
+                    name.clone()
+                } else {
+                    stem.to_string()
+                };
+                (name, tab_for(o))
+            })
+            .collect()
+    }
+
+    pub(crate) fn columns_from_rdata(
+        path: &Path,
+        stem: &str,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let loaded = load(path)?;
+        if loaded.objects.is_empty() {
+            bail!("{path:?} is an RData file with no objects in it");
+        }
+        let mut out = Vec::new();
+        for (name, tab) in tables(&loaded, stem) {
+            let profiles = match tab {
+                Tab::Table(t) => {
+                    let total = nrows.map_or(t.nrows, |n| n.min(t.nrows));
+                    let mut cell = String::new();
+                    t.cols
+                        .iter()
+                        .map(|col| {
+                            let mut state = ColumnAccumulatorState::new();
+                            for i in 0..total {
+                                cell.clear();
+                                if col.write(i, &mut cell) {
+                                    state.push(cell.clone(), n_samples);
+                                }
+                            }
+                            let mut profile = state.into_profile_with_declared_type(
+                                col.name.clone(),
+                                total,
+                                col.current_type.to_string(),
+                            );
+                            apply_variable_labels(
+                                &mut profile,
+                                &col.description,
+                                &col.value_labels,
+                            );
+                            if !col.notes.is_empty() {
+                                let extra = col.notes.join("; ");
+                                profile.notes = if profile.notes.is_empty() {
+                                    extra
+                                } else {
+                                    format!("{}; {extra}", profile.notes)
+                                };
+                            }
+                            profile
+                        })
+                        .collect()
+                }
+                Tab::Skipped(why) => vec![ColumnProfile {
+                    name: "value".to_string(),
+                    current_type: "unknown".to_string(),
+                    ideal_type: "String".to_string(),
+                    description: String::new(),
+                    missing_pct: 0.0,
+                    sample_values: Vec::new(),
+                    notes: format!("R object '{name}' isn't tabular: {why}"),
+                    row_count: 0,
+                    numeric_stats: None,
+                    content: None,
+                    references: Vec::new(),
+                    value_sketch: None,
+                    temporal_format: None,
+                }],
+            };
+            out.push((name, profiles));
+        }
+        Ok(out)
+    }
+
+    /// The `--sql-mode inline` second pass for one table.
+    pub(crate) fn stream_rdata_rows_for_sql(
+        path: &Path,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let loaded = load(path)?;
+        for (name, tab) in tables(&loaded, table_name) {
+            if name != table_name {
+                continue;
+            }
+            let t = match tab {
+                Tab::Table(t) => t,
+                Tab::Skipped(why) => bail!("can't emit data for R object '{name}': {why}"),
+            };
+            let total = nrows.map_or(t.nrows, |n| n.min(t.nrows));
+            let mut cell = String::new();
+            for i in 0..total {
+                if sink.done {
+                    break;
+                }
+                let row = t
+                    .cols
+                    .iter()
+                    .map(|col| {
+                        cell.clear();
+                        col.write(i, &mut cell).then(|| cell.clone())
+                    })
+                    .collect();
+                sink.accept(row)?;
+            }
+            return Ok(());
+        }
+        bail!("{path:?} has no R object named {table_name:?}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A tiny XDR stream builder.
+        struct W(Vec<u8>);
+        impl W {
+            fn int(&mut self, v: i32) -> &mut Self {
+                self.0.extend_from_slice(&v.to_be_bytes());
+                self
+            }
+            fn real(&mut self, v: f64) -> &mut Self {
+                self.0.extend_from_slice(&v.to_be_bytes());
+                self
+            }
+            fn charsxp(&mut self, s: &str) -> &mut Self {
+                self.int(CHARSXP | (UTF8_MASK << 12)).int(s.len() as i32);
+                self.0.extend_from_slice(s.as_bytes());
+                self
+            }
+            fn sym(&mut self, s: &str) -> &mut Self {
+                self.int(SYMSXP);
+                self.charsxp(s)
+            }
+        }
+
+        fn parse(bytes: Vec<u8>, wire: Wire) -> Result<RObj> {
+            let mut p = Parser {
+                r: std::io::Cursor::new(bytes),
+                wire,
+                refs: Vec::new(),
+                native: None,
+            };
+            p.item(0)
+        }
+
+        #[test]
+        fn reads_a_factor_with_its_attributes() {
+            // factor(c("b", "a", NA), levels = c("a", "b"))
+            let mut w = W(Vec::new());
+            w.int(INTSXP | (1 << 9) | (1 << 8))
+                .int(3)
+                .int(2)
+                .int(1)
+                .int(NA_INT);
+            // attributes: levels = c("a","b"), class = "factor"
+            w.int(LISTSXP | (1 << 10));
+            w.sym("levels");
+            w.int(STRSXP).int(2);
+            w.charsxp("a").charsxp("b");
+            w.int(LISTSXP | (1 << 10));
+            w.int(SYMSXP).charsxp("class");
+            w.int(STRSXP).int(1);
+            w.charsxp("factor");
+            w.int(NILVALUE_SXP);
+            let obj = parse(w.0, Wire::Xdr).unwrap();
+            let col = vector_col("f".to_string(), &obj, 0);
+            let mut s = String::new();
+            assert!(col.write(0, &mut s));
+            assert_eq!(s, "b");
+            s.clear();
+            assert!(col.write(1, &mut s));
+            assert_eq!(s, "a");
+            assert!(!col.write(2, &mut String::new()));
+            assert_eq!(col.current_type, "factor");
+        }
+
+        #[test]
+        fn a_symbol_is_remembered_for_later_references() {
+            // A list of two pairlists tagged with the same symbol, the
+            // second by reference (REFSXP index 1).
+            let mut w = W(Vec::new());
+            w.int(LISTSXP | (1 << 10));
+            w.sym("x");
+            w.int(INTSXP).int(1).int(7);
+            w.int(LISTSXP | (1 << 10));
+            w.int((1 << 8) | REFSXP); // the symbol "x" again
+            w.int(INTSXP).int(1).int(8);
+            w.int(NILVALUE_SXP);
+            match parse(w.0, Wire::Xdr).unwrap() {
+                RObj::Pairlist(cells) => {
+                    assert_eq!(cells.len(), 2);
+                    assert_eq!(cells[0].0.as_deref(), Some("x"));
+                    assert_eq!(cells[1].0.as_deref(), Some("x"));
+                }
+                _ => panic!("not a pairlist"),
+            }
+        }
+
+        #[test]
+        fn text_format_reads_numbers_strings_and_escapes() {
+            let text = b"14\n3\n1.5\nNA\nInf\n".to_vec();
+            match parse(text, Wire::Ascii).unwrap() {
+                RObj::Real(v, _) => {
+                    assert_eq!(v[0], 1.5);
+                    assert!(is_na_real(v[1]));
+                    assert!(v[2].is_infinite());
+                }
+                _ => panic!("not a double vector"),
+            }
+            // A STRSXP of one CHARSXP whose text has an escaped newline.
+            let text = b"16\n1\n9\n3\na\\nb\n".to_vec();
+            match parse(text, Wire::Ascii).unwrap() {
+                RObj::Str(v, _) => assert_eq!(v[0].as_deref(), Some("a\nb")),
+                _ => panic!("not a character vector"),
+            }
+        }
+
+        #[test]
+        fn doubles_spell_like_as_character() {
+            let cases = [
+                (14901.0, "14901"),
+                (100000.0, "1e+05"),
+                (123456.0, "123456"),
+                (0.1, "0.1"),
+                (0.0001, "1e-04"),
+                (0.001, "0.001"),
+                (1.5, "1.5"),
+                (-2.25, "-2.25"),
+                (1e15, "1e+15"),
+                (1234567.125, "1234567.125"),
+                (1.0 / 3.0, "0.333333333333333"),
+                (1e-20, "1e-20"),
+                (1.5e300, "1.5e+300"),
+                (3e5, "3e+05"),
+                (250000.0, "250000"),
+            ];
+            for (x, want) in cases {
+                assert_eq!(r_double_string(x).as_deref(), Some(want), "{x}");
+            }
+            assert_eq!(r_double_string(f64::from_bits(0x7FF0_0000_0000_07A2)), None);
+        }
+
+        #[test]
+        fn a_hostile_length_fails_cleanly_instead_of_allocating() {
+            let mut w = W(Vec::new());
+            w.int(REALSXP).int(i32::MAX);
+            w.real(1.0);
+            assert!(parse(w.0, Wire::Xdr).is_err());
+        }
+
+        #[test]
+        fn nesting_deeper_than_the_limit_is_refused() {
+            let mut w = W(Vec::new());
+            for _ in 0..(MAX_DEPTH + 5) {
+                w.int(VECSXP).int(1);
+            }
+            assert!(parse(w.0, Wire::Xdr).is_err());
+        }
+
+        #[test]
+        fn json_cells_for_lists_and_vectors() {
+            let obj = RObj::List(
+                vec![
+                    RObj::Int(vec![1, NA_INT], Vec::new()),
+                    RObj::Str(vec![Some("q\"".into())], Vec::new()),
+                ],
+                vec![(
+                    "names".to_string(),
+                    RObj::Str(vec![Some("a".into()), Some("b".into())], Vec::new()),
+                )],
+            );
+            let mut s = String::new();
+            json_value(&obj, &mut s, 0);
+            assert_eq!(s, r#"{"a":[1,null],"b":["q\""]}"#);
+        }
+    }
+}
+
+#[cfg(feature = "rdata")]
+fn columns_from_rdata(
+    path: &Path,
+    stem: &str,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    rdata_support::columns_from_rdata(path, stem, nrows, n_samples)
+}
+
+#[cfg(not(feature = "rdata"))]
+fn columns_from_rdata(
+    _path: &Path,
+    _stem: &str,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "R data (.rds/.RData) support isn't compiled in - rebuild with `cargo build --release --features rdata` (or --features full)"
+    )
+}
+
+#[cfg(feature = "rdata")]
+fn render_sql_inline_flat_rdata(
+    read_path: &Path,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    rdata_support::stream_rdata_rows_for_sql(read_path, table_name, nrows, sink)
+}
+
+#[cfg(not(feature = "rdata"))]
+fn render_sql_inline_flat_rdata(
+    _read_path: &Path,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "R data (.rds/.RData) support isn't compiled in - rebuild with `cargo build --release --features rdata` (or --features full)"
+    )
+}
+
+// --- Tables inside documents: HTML `<table>` and Markdown pipe tables ---
+//
+// A web page or a README is a table's most common hiding place. Each table in
+// the document becomes a table of its own - named for its `<caption>` or
+// `id` (HTML) or the heading above it (Markdown), else `table_N`; a document
+// with exactly one table takes the file's name. Cells are text with no native
+// null, so an empty cell or a missing-value placeholder (`N/A`, `-`, ...) reads as
+// missing exactly as it does in a CSV, and a column's type is inferred from
+// its values the same way.
+//
+// HTML (a forgiving tokenizer, not a validating parser; `html` feature): the
+// header is what the page itself marks up - the `<thead>` rows, else the leading rows made
+// only of `<th>` cells, several header rows joined as `top / bottom`; a table with
+// neither gets `column_1`, `column_2`, ... and keeps every row as data, because
+// guessing that a first row "looks like" a header is exactly what this tool
+// doesn't do. `colspan` and `rowspan` are expanded into the grid the way a
+// browser lays it out, so a cell spanning two columns appears in both. Entities
+// (the HTML 4 set and numeric references) are decoded, tags inside a cell dropped,
+// whitespace collapsed. A table that contains another table is taken to be page
+// layout and skipped - its inner tables are the data. `<script>`, `<style>` and
+// comments are ignored. The page's `<meta charset>` is honoured.
+//
+// Markdown (GitHub-flavoured pipe tables; `markdown` feature): a header row,
+// a delimiter row of `---`/`:--:` cells of the same width, then body rows to
+// the first blank line or other block. `\|` is a literal pipe; a row with too
+// few cells is padded, one with too many is cut, as GFM says. Fenced code
+// blocks are skipped, so a table in a code sample isn't read. Cell text is
+// kept as written (`**bold**` stays `**bold**`) - removing markup would be a
+// guess.
+#[cfg(any(feature = "html", feature = "markdown"))]
+mod doctable_support {
+    use super::*;
+
+    /// How many columns or table cells one document may claim; a hostile
+    /// `colspan`/`rowspan` can otherwise ask for billions of cells.
+    const MAX_COLUMNS: usize = 4096;
+    const MAX_SPAN: usize = 1000;
+    /// Cells a document's `colspan`/`rowspan` may add beyond one per source
+    /// cell, and how deep tables may nest: bounds that stop a few kilobytes of
+    /// markup from claiming gigabytes.
+    const SPAN_BUDGET: usize = 4_000_000;
+    const MAX_TABLE_DEPTH: usize = 256;
+    /// Names longer than this are cut.
+    const MAX_NAME_CHARS: usize = 60;
+
+    /// One table as it appears in the document, before naming.
+    pub(super) struct RawTable {
+        /// What names it: a caption, an id or a heading.
+        title: Option<String>,
+        header: Vec<String>,
+        rows: Vec<Vec<String>>,
+    }
+
+    pub(super) struct ParsedTable {
+        pub(super) name: String,
+        pub(super) header: Vec<String>,
+        pub(super) rows: Vec<Vec<String>>,
+    }
+
+    /// Collapses runs of whitespace (a no-break space counts) to one space.
+    fn push_text(out: &mut String, text: &str) {
+        for c in text.chars() {
+            if c.is_whitespace() || c == '\u{a0}' {
+                if !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            } else {
+                out.push(c);
+            }
+        }
+    }
+
+    fn clean(s: &str) -> String {
+        s.trim_matches(|c: char| c.is_whitespace() || c == '\u{a0}')
+            .to_string()
+    }
+
+    /// Names the tables of a document: one table takes `stem`; several take
+    /// their title (shortened) or `table_N`, made unique.
+    pub(super) fn name_tables(tables: Vec<RawTable>, stem: &str) -> Vec<ParsedTable> {
+        let single = tables.len() == 1;
+        let mut used: Vec<String> = Vec::new();
+        tables
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let base = if single {
+                    stem.to_string()
+                } else {
+                    let title: String = t
+                        .title
+                        .as_deref()
+                        .map(|s| s.chars().take(MAX_NAME_CHARS).collect())
+                        .unwrap_or_default();
+                    if title.trim().is_empty() {
+                        format!("table_{}", i + 1)
+                    } else {
+                        title.trim().to_string()
+                    }
+                };
+                let mut name = base.clone();
+                let mut n = 2;
+                while used.iter().any(|u| u.eq_ignore_ascii_case(&name)) {
+                    name = format!("{base}_{n}");
+                    n += 1;
+                }
+                used.push(name.clone());
+                ParsedTable {
+                    name,
+                    header: t.header,
+                    rows: t.rows,
+                }
+            })
+            .collect()
+    }
+
+    // ---- HTML ----
+
+    /// HTML 4.01's 252 named character references plus `apos`, sorted for binary search.
+    const ENTITIES: &[(&str, u32)] = &[
+        ("AElig", 198),
+        ("Aacute", 193),
+        ("Acirc", 194),
+        ("Agrave", 192),
+        ("Alpha", 913),
+        ("Aring", 197),
+        ("Atilde", 195),
+        ("Auml", 196),
+        ("Beta", 914),
+        ("Ccedil", 199),
+        ("Chi", 935),
+        ("Dagger", 8225),
+        ("Delta", 916),
+        ("ETH", 208),
+        ("Eacute", 201),
+        ("Ecirc", 202),
+        ("Egrave", 200),
+        ("Epsilon", 917),
+        ("Eta", 919),
+        ("Euml", 203),
+        ("Gamma", 915),
+        ("Iacute", 205),
+        ("Icirc", 206),
+        ("Igrave", 204),
+        ("Iota", 921),
+        ("Iuml", 207),
+        ("Kappa", 922),
+        ("Lambda", 923),
+        ("Mu", 924),
+        ("Ntilde", 209),
+        ("Nu", 925),
+        ("OElig", 338),
+        ("Oacute", 211),
+        ("Ocirc", 212),
+        ("Ograve", 210),
+        ("Omega", 937),
+        ("Omicron", 927),
+        ("Oslash", 216),
+        ("Otilde", 213),
+        ("Ouml", 214),
+        ("Phi", 934),
+        ("Pi", 928),
+        ("Prime", 8243),
+        ("Psi", 936),
+        ("Rho", 929),
+        ("Scaron", 352),
+        ("Sigma", 931),
+        ("THORN", 222),
+        ("Tau", 932),
+        ("Theta", 920),
+        ("Uacute", 218),
+        ("Ucirc", 219),
+        ("Ugrave", 217),
+        ("Upsilon", 933),
+        ("Uuml", 220),
+        ("Xi", 926),
+        ("Yacute", 221),
+        ("Yuml", 376),
+        ("Zeta", 918),
+        ("aacute", 225),
+        ("acirc", 226),
+        ("acute", 180),
+        ("aelig", 230),
+        ("agrave", 224),
+        ("alefsym", 8501),
+        ("alpha", 945),
+        ("amp", 38),
+        ("and", 8743),
+        ("ang", 8736),
+        ("apos", 39),
+        ("aring", 229),
+        ("asymp", 8776),
+        ("atilde", 227),
+        ("auml", 228),
+        ("bdquo", 8222),
+        ("beta", 946),
+        ("brvbar", 166),
+        ("bull", 8226),
+        ("cap", 8745),
+        ("ccedil", 231),
+        ("cedil", 184),
+        ("cent", 162),
+        ("chi", 967),
+        ("circ", 710),
+        ("clubs", 9827),
+        ("cong", 8773),
+        ("copy", 169),
+        ("crarr", 8629),
+        ("cup", 8746),
+        ("curren", 164),
+        ("dArr", 8659),
+        ("dagger", 8224),
+        ("darr", 8595),
+        ("deg", 176),
+        ("delta", 948),
+        ("diams", 9830),
+        ("divide", 247),
+        ("eacute", 233),
+        ("ecirc", 234),
+        ("egrave", 232),
+        ("empty", 8709),
+        ("emsp", 8195),
+        ("ensp", 8194),
+        ("epsilon", 949),
+        ("equiv", 8801),
+        ("eta", 951),
+        ("eth", 240),
+        ("euml", 235),
+        ("euro", 8364),
+        ("exist", 8707),
+        ("fnof", 402),
+        ("forall", 8704),
+        ("frac12", 189),
+        ("frac14", 188),
+        ("frac34", 190),
+        ("frasl", 8260),
+        ("gamma", 947),
+        ("ge", 8805),
+        ("gt", 62),
+        ("hArr", 8660),
+        ("harr", 8596),
+        ("hearts", 9829),
+        ("hellip", 8230),
+        ("iacute", 237),
+        ("icirc", 238),
+        ("iexcl", 161),
+        ("igrave", 236),
+        ("image", 8465),
+        ("infin", 8734),
+        ("int", 8747),
+        ("iota", 953),
+        ("iquest", 191),
+        ("isin", 8712),
+        ("iuml", 239),
+        ("kappa", 954),
+        ("lArr", 8656),
+        ("lambda", 955),
+        ("lang", 9001),
+        ("laquo", 171),
+        ("larr", 8592),
+        ("lceil", 8968),
+        ("ldquo", 8220),
+        ("le", 8804),
+        ("lfloor", 8970),
+        ("lowast", 8727),
+        ("loz", 9674),
+        ("lrm", 8206),
+        ("lsaquo", 8249),
+        ("lsquo", 8216),
+        ("lt", 60),
+        ("macr", 175),
+        ("mdash", 8212),
+        ("micro", 181),
+        ("middot", 183),
+        ("minus", 8722),
+        ("mu", 956),
+        ("nabla", 8711),
+        ("nbsp", 160),
+        ("ndash", 8211),
+        ("ne", 8800),
+        ("ni", 8715),
+        ("not", 172),
+        ("notin", 8713),
+        ("nsub", 8836),
+        ("ntilde", 241),
+        ("nu", 957),
+        ("oacute", 243),
+        ("ocirc", 244),
+        ("oelig", 339),
+        ("ograve", 242),
+        ("oline", 8254),
+        ("omega", 969),
+        ("omicron", 959),
+        ("oplus", 8853),
+        ("or", 8744),
+        ("ordf", 170),
+        ("ordm", 186),
+        ("oslash", 248),
+        ("otilde", 245),
+        ("otimes", 8855),
+        ("ouml", 246),
+        ("para", 182),
+        ("part", 8706),
+        ("permil", 8240),
+        ("perp", 8869),
+        ("phi", 966),
+        ("pi", 960),
+        ("piv", 982),
+        ("plusmn", 177),
+        ("pound", 163),
+        ("prime", 8242),
+        ("prod", 8719),
+        ("prop", 8733),
+        ("psi", 968),
+        ("quot", 34),
+        ("rArr", 8658),
+        ("radic", 8730),
+        ("rang", 9002),
+        ("raquo", 187),
+        ("rarr", 8594),
+        ("rceil", 8969),
+        ("rdquo", 8221),
+        ("real", 8476),
+        ("reg", 174),
+        ("rfloor", 8971),
+        ("rho", 961),
+        ("rlm", 8207),
+        ("rsaquo", 8250),
+        ("rsquo", 8217),
+        ("sbquo", 8218),
+        ("scaron", 353),
+        ("sdot", 8901),
+        ("sect", 167),
+        ("shy", 173),
+        ("sigma", 963),
+        ("sigmaf", 962),
+        ("sim", 8764),
+        ("spades", 9824),
+        ("sub", 8834),
+        ("sube", 8838),
+        ("sum", 8721),
+        ("sup", 8835),
+        ("sup1", 185),
+        ("sup2", 178),
+        ("sup3", 179),
+        ("supe", 8839),
+        ("szlig", 223),
+        ("tau", 964),
+        ("there4", 8756),
+        ("theta", 952),
+        ("thetasym", 977),
+        ("thinsp", 8201),
+        ("thorn", 254),
+        ("tilde", 732),
+        ("times", 215),
+        ("trade", 8482),
+        ("uArr", 8657),
+        ("uacute", 250),
+        ("uarr", 8593),
+        ("ucirc", 251),
+        ("ugrave", 249),
+        ("uml", 168),
+        ("upsih", 978),
+        ("upsilon", 965),
+        ("uuml", 252),
+        ("weierp", 8472),
+        ("xi", 958),
+        ("yacute", 253),
+        ("yen", 165),
+        ("yuml", 255),
+        ("zeta", 950),
+        ("zwj", 8205),
+        ("zwnj", 8204),
+    ];
+
+    /// Replaces character references with the characters they name; one that
+    /// isn't recognized stays as written.
+    #[cfg(feature = "html")]
+    fn decode_entities(s: &str) -> std::borrow::Cow<'_, str> {
+        if !s.contains('&') {
+            return std::borrow::Cow::Borrowed(s);
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(at) = rest.find('&') {
+            out.push_str(&rest[..at]);
+            rest = &rest[at..];
+            // `&` + at most 32 reference characters + `;`
+            let end = rest
+                .char_indices()
+                .take(34)
+                .find(|&(_, c)| c == ';')
+                .map(|(i, _)| i);
+            let decoded = end.and_then(|end| {
+                let body = &rest[1..end];
+                if let Some(num) = body.strip_prefix('#') {
+                    let code = match num.strip_prefix(['x', 'X']) {
+                        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                        None => num.parse().ok(),
+                    }?;
+                    // Numeric references to the C1 block mean Windows-1252.
+                    let code = match code {
+                        0x80..=0x9F => codepage_support::table("windows-1252")
+                            .map(|t| u32::from(t[code as usize]))
+                            .unwrap_or(code),
+                        0 => 0xFFFD,
+                        c => c,
+                    };
+                    char::from_u32(code).map(|c| (c, end))
+                } else {
+                    ENTITIES
+                        .binary_search_by(|(name, _)| (*name).cmp(body))
+                        .ok()
+                        .and_then(|i| char::from_u32(ENTITIES[i].1))
+                        .map(|c| (c, end))
+                }
+            });
+            match decoded {
+                Some((c, end)) => {
+                    out.push(c);
+                    rest = &rest[end + 1..];
+                }
+                None => {
+                    out.push('&');
+                    rest = &rest[1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// The first case-insensitive occurrence of `needle` at or after `from`.
+    #[cfg(feature = "html")]
+    fn find_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+        haystack
+            .get(from..)?
+            .windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))
+            .map(|p| from + p)
+    }
+
+    #[cfg(feature = "html")]
+    struct Cell {
+        text: String,
+        header: bool,
+        colspan: usize,
+        rowspan: usize,
+    }
+
+    #[cfg(feature = "html")]
+    struct RowBuf {
+        cells: Vec<Cell>,
+        in_head: bool,
+    }
+
+    /// A table being read; tables nest, so these stack.
+    #[cfg(feature = "html")]
+    struct Ctx {
+        order: usize,
+        id: Option<String>,
+        caption: String,
+        rows: Vec<RowBuf>,
+        row: Option<RowBuf>,
+        cell: Option<Cell>,
+        in_caption: bool,
+        in_head: bool,
+        has_nested: bool,
+    }
+
+    #[cfg(feature = "html")]
+    impl Ctx {
+        fn close_cell(&mut self) {
+            if let Some(mut cell) = self.cell.take() {
+                cell.text = clean(&cell.text);
+                self.row
+                    .get_or_insert_with(|| RowBuf {
+                        cells: Vec::new(),
+                        in_head: self.in_head,
+                    })
+                    .cells
+                    .push(cell);
+            }
+        }
+
+        fn close_row(&mut self) {
+            self.close_cell();
+            if let Some(row) = self.row.take()
+                && !row.cells.is_empty()
+            {
+                self.rows.push(row);
+            }
+        }
+    }
+
+    /// Tags that end a line of text: a space goes between what they separate.
+    #[cfg(feature = "html")]
+    fn is_block_tag(name: &str) -> bool {
+        matches!(
+            name,
+            "br" | "p"
+                | "div"
+                | "li"
+                | "ul"
+                | "ol"
+                | "dl"
+                | "dt"
+                | "dd"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hr"
+                | "pre"
+                | "blockquote"
+                | "section"
+                | "article"
+        )
+    }
+
+    #[cfg(feature = "html")]
+    fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[cfg(feature = "html")]
+    fn span_attr(attrs: &[(String, String)], name: &str) -> usize {
+        attr(attrs, name)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, MAX_SPAN)
+    }
+
+    /// Turns a finished table's rows into a grid, expanding `colspan` and
+    /// `rowspan`, and splits off the header.
+    #[cfg(feature = "html")]
+    fn build_table(ctx: Ctx, budget: &mut usize) -> Option<RawTable> {
+        let Ctx {
+            id, caption, rows, ..
+        } = ctx;
+        if rows.is_empty() {
+            return None;
+        }
+        let mut grid: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+        // For each column, how many more rows a cell above still covers.
+        let mut carried: Vec<(usize, String)> = Vec::new();
+        for row in &rows {
+            let mut out: Vec<String> = Vec::new();
+            let mut col = 0usize;
+            let fill =
+                |out: &mut Vec<String>, col: &mut usize, carried: &mut Vec<(usize, String)>| {
+                    while let Some((left, text)) = carried.get_mut(*col) {
+                        if *left == 0 {
+                            break;
+                        }
+                        *left -= 1;
+                        out.push(text.clone());
+                        *col += 1;
+                    }
+                };
+            for cell in &row.cells {
+                fill(&mut out, &mut col, &mut carried);
+                // A span costs the cells it adds; past the budget it's one.
+                let extra = cell.colspan * cell.rowspan - 1;
+                let (colspan, rowspan) = if extra <= *budget {
+                    *budget -= extra;
+                    (cell.colspan, cell.rowspan)
+                } else {
+                    (1, 1)
+                };
+                for _ in 0..colspan {
+                    if col >= MAX_COLUMNS {
+                        break;
+                    }
+                    if carried.len() <= col {
+                        carried.resize(col + 1, (0, String::new()));
+                    }
+                    carried[col] = (rowspan - 1, cell.text.clone());
+                    out.push(cell.text.clone());
+                    col += 1;
+                }
+            }
+            fill(&mut out, &mut col, &mut carried);
+            grid.push(out);
+        }
+        let width = grid.iter().map(Vec::len).max().unwrap_or(0);
+        if width == 0 {
+            return None;
+        }
+        for row in &mut grid {
+            row.resize(width, String::new());
+        }
+        // The header: the `<thead>` rows, else the leading all-`<th>` rows.
+        let in_thead = rows.iter().take_while(|r| r.in_head).count();
+        let mut n_head = if in_thead > 0 {
+            in_thead
+        } else {
+            rows.iter()
+                .take_while(|r| r.cells.iter().all(|c| c.header))
+                .count()
+        };
+        if in_thead == 0 && n_head >= rows.len() {
+            // Every row is made of `<th>`: the first is the header.
+            n_head = 1;
+        }
+        if n_head >= rows.len() {
+            return None; // no data rows
+        }
+        let mut header = Vec::with_capacity(width);
+        for j in 0..width {
+            let mut parts: Vec<&str> = Vec::new();
+            for row in grid.iter().take(n_head) {
+                let part = row[j].as_str();
+                if !part.is_empty() && parts.last() != Some(&part) {
+                    parts.push(part);
+                }
+            }
+            header.push(if parts.is_empty() {
+                format!("column_{}", j + 1)
+            } else {
+                parts.join(" / ")
+            });
+        }
+        let data = grid.split_off(n_head);
+        let title = {
+            let c = clean(&caption);
+            if !c.is_empty() {
+                Some(c)
+            } else {
+                id.filter(|i| !i.is_empty())
+            }
+        };
+        Some(RawTable {
+            title,
+            header,
+            rows: data,
+        })
+    }
+
+    /// Every table in an HTML document, in document order.
+    #[cfg(feature = "html")]
+    pub(super) fn parse_html(text: &str) -> Vec<RawTable> {
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        let mut stack: Vec<Ctx> = Vec::new();
+        let mut done: Vec<(usize, RawTable)> = Vec::new();
+        let mut next_order = 0usize;
+        let mut span_budget = SPAN_BUDGET;
+        // `<table>`s past the nesting limit are ignored, with their ends.
+        let mut ignored_tables = 0usize;
+        // Text accumulates between tags, then goes to the cell (or caption).
+        let mut pending = String::new();
+
+        macro_rules! flush_text {
+            () => {
+                if !pending.is_empty() {
+                    if let Some(top) = stack.last_mut() {
+                        let text = decode_entities(&pending);
+                        if top.in_caption {
+                            push_text(&mut top.caption, &text);
+                        } else if let Some(cell) = top.cell.as_mut() {
+                            push_text(&mut cell.text, &text);
+                        }
+                    }
+                    pending.clear();
+                }
+            };
+        }
+
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                let end = text[i..].find('<').map_or(bytes.len(), |p| i + p);
+                // Only text inside a table matters; skip the rest quickly.
+                if !stack.is_empty() {
+                    pending.push_str(&text[i..end]);
+                }
+                i = end;
+                continue;
+            }
+            let rest = &text[i..];
+            if rest.starts_with("<!--") {
+                i = rest.find("-->").map_or(bytes.len(), |p| i + p + 3);
+                continue;
+            }
+            if rest.starts_with("<![CDATA[") {
+                let end = rest.find("]]>").map_or(bytes.len(), |p| i + p + 3);
+                if !stack.is_empty() {
+                    pending.push_str(&text[i + 9..end.saturating_sub(3).max(i + 9)]);
+                }
+                i = end;
+                continue;
+            }
+            let next = bytes.get(i + 1).copied().unwrap_or(0);
+            if next == b'!' || next == b'?' {
+                i = rest.find('>').map_or(bytes.len(), |p| i + p + 1);
+                continue;
+            }
+            let closing = next == b'/';
+            let name_start = i + 1 + usize::from(closing);
+            if !bytes.get(name_start).is_some_and(u8::is_ascii_alphabetic) {
+                // A lone `<` is text.
+                if !stack.is_empty() {
+                    pending.push('<');
+                }
+                i += 1;
+                continue;
+            }
+            let mut j = name_start;
+            while j < bytes.len()
+                && !bytes[j].is_ascii_whitespace()
+                && !matches!(bytes[j], b'/' | b'>')
+            {
+                j += 1;
+            }
+            let name = text[name_start..j].to_ascii_lowercase();
+            // Attributes, up to the tag's closing `>`.
+            let mut attrs: Vec<(String, String)> = Vec::new();
+            loop {
+                while j < bytes.len() && (bytes[j].is_ascii_whitespace() || bytes[j] == b'/') {
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    break;
+                }
+                if bytes[j] == b'>' {
+                    j += 1;
+                    break;
+                }
+                let key_start = j;
+                while j < bytes.len()
+                    && !bytes[j].is_ascii_whitespace()
+                    && !matches!(bytes[j], b'=' | b'>' | b'/')
+                {
+                    j += 1;
+                }
+                let key = text[key_start..j].to_ascii_lowercase();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let mut value = String::new();
+                if bytes.get(j) == Some(&b'=') {
+                    j += 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    match bytes.get(j) {
+                        Some(&q @ (b'"' | b'\'')) => {
+                            let from = j + 1;
+                            let to = text[from..]
+                                .find(q as char)
+                                .map_or(bytes.len(), |p| from + p);
+                            value = decode_entities(&text[from..to]).into_owned();
+                            j = (to + 1).min(bytes.len());
+                        }
+                        _ => {
+                            let from = j;
+                            while j < bytes.len()
+                                && !bytes[j].is_ascii_whitespace()
+                                && bytes[j] != b'>'
+                            {
+                                j += 1;
+                            }
+                            value = decode_entities(&text[from..j]).into_owned();
+                        }
+                    }
+                }
+                if !key.is_empty() {
+                    attrs.push((key, value));
+                }
+            }
+            i = j;
+            if !closing && matches!(name.as_str(), "script" | "style" | "textarea" | "title") {
+                // Raw text: nothing inside is markup.
+                let close = format!("</{name}");
+                let end = find_ci(bytes, close.as_bytes(), i).unwrap_or(bytes.len());
+                i = text[end..].find('>').map_or(bytes.len(), |p| end + p + 1);
+                continue;
+            }
+
+            flush_text!();
+            if !closing {
+                match name.as_str() {
+                    "table" if stack.len() >= MAX_TABLE_DEPTH => ignored_tables += 1,
+                    "table" => {
+                        if let Some(top) = stack.last_mut() {
+                            top.has_nested = true;
+                        }
+                        stack.push(Ctx {
+                            order: next_order,
+                            id: attr(&attrs, "id").map(str::to_string),
+                            caption: String::new(),
+                            rows: Vec::new(),
+                            row: None,
+                            cell: None,
+                            in_caption: false,
+                            in_head: false,
+                            has_nested: false,
+                        });
+                        next_order += 1;
+                    }
+                    _ => {
+                        let Some(top) = stack.last_mut() else {
+                            continue;
+                        };
+                        match name.as_str() {
+                            "caption" => top.in_caption = true,
+                            "thead" => {
+                                top.close_row();
+                                top.in_head = true;
+                            }
+                            "tbody" | "tfoot" => {
+                                top.close_row();
+                                top.in_head = false;
+                            }
+                            "tr" => {
+                                top.close_row();
+                                top.row = Some(RowBuf {
+                                    cells: Vec::new(),
+                                    in_head: top.in_head,
+                                });
+                            }
+                            "td" | "th" => {
+                                top.close_cell();
+                                top.cell = Some(Cell {
+                                    text: String::new(),
+                                    header: name == "th",
+                                    colspan: span_attr(&attrs, "colspan"),
+                                    rowspan: span_attr(&attrs, "rowspan"),
+                                });
+                            }
+                            n if is_block_tag(n) => {
+                                if let Some(cell) = top.cell.as_mut() {
+                                    push_text(&mut cell.text, " ");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            } else {
+                match name.as_str() {
+                    "table" if ignored_tables > 0 => ignored_tables -= 1,
+                    "table" => {
+                        if let Some(mut ctx) = stack.pop() {
+                            ctx.close_row();
+                            let order = ctx.order;
+                            let nested = ctx.has_nested;
+                            if !nested && let Some(t) = build_table(ctx, &mut span_budget) {
+                                done.push((order, t));
+                            }
+                        }
+                    }
+                    _ => {
+                        let Some(top) = stack.last_mut() else {
+                            continue;
+                        };
+                        match name.as_str() {
+                            "caption" => top.in_caption = false,
+                            "td" | "th" => top.close_cell(),
+                            "tr" => top.close_row(),
+                            "thead" | "tbody" | "tfoot" => {
+                                top.close_row();
+                                top.in_head = false;
+                            }
+                            n if is_block_tag(n) => {
+                                if let Some(cell) = top.cell.as_mut() {
+                                    push_text(&mut cell.text, " ");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        flush_text!();
+        // A table left open at the end of the document still counts.
+        while let Some(mut ctx) = stack.pop() {
+            ctx.close_row();
+            let order = ctx.order;
+            if !ctx.has_nested
+                && let Some(t) = build_table(ctx, &mut span_budget)
+            {
+                done.push((order, t));
+            }
+        }
+        done.sort_by_key(|(order, _)| *order);
+        done.into_iter().map(|(_, t)| t).collect()
+    }
+
+    // ---- Markdown ----
+
+    /// A pipe-table row split into cells: the optional outer pipes dropped,
+    /// `\|` kept as a literal pipe, each cell trimmed.
+    #[cfg(feature = "markdown")]
+    fn split_row(line: &str) -> Vec<String> {
+        let line = line.trim();
+        let line = line.strip_prefix('|').unwrap_or(line);
+        let mut cells: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&'|') => {
+                    cur.push('|');
+                    chars.next();
+                }
+                '|' => {
+                    cells.push(clean(&cur));
+                    cur.clear();
+                }
+                c => cur.push(c),
+            }
+        }
+        // Text after the last pipe is a cell; nothing after it is the
+        // optional closing pipe.
+        if !cur.trim().is_empty() || !line.ends_with('|') {
+            cells.push(clean(&cur));
+        }
+        cells
+    }
+
+    /// A delimiter cell: dashes with an optional colon at either end.
+    #[cfg(feature = "markdown")]
+    fn is_delimiter_cell(cell: &str) -> bool {
+        let c = cell.strip_prefix(':').unwrap_or(cell);
+        let c = c.strip_suffix(':').unwrap_or(c);
+        !c.is_empty() && c.bytes().all(|b| b == b'-')
+    }
+
+    #[cfg(feature = "markdown")]
+    fn starts_block(line: &str) -> bool {
+        let t = line.trim_start();
+        t.starts_with('#') || t.starts_with('>') || t.starts_with("```") || t.starts_with("~~~")
+    }
+
+    /// An ATX heading's text (`## Title ##`).
+    #[cfg(feature = "markdown")]
+    fn atx_heading(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        let hashes = t.bytes().take_while(|&b| b == b'#').count();
+        if !(1..=6).contains(&hashes) {
+            return None;
+        }
+        let rest = &t[hashes..];
+        if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+            return None;
+        }
+        let text = rest.trim().trim_end_matches('#').trim();
+        Some(text.to_string())
+    }
+
+    /// Every pipe table in a Markdown document, in order.
+    #[cfg(feature = "markdown")]
+    pub(super) fn parse_markdown(text: &str) -> Vec<RawTable> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut tables = Vec::new();
+        let mut heading: Option<String> = None;
+        let mut fence: Option<(char, usize)> = None;
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let trimmed = line.trim_start();
+            // Fenced code is not Markdown.
+            if let Some((ch, len)) = fence {
+                let run = trimmed.chars().take_while(|&c| c == ch).count();
+                if run >= len && trimmed[run..].trim().is_empty() {
+                    fence = None;
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(ch) = ['`', '~']
+                .into_iter()
+                .find(|&c| trimmed.chars().take_while(|&x| x == c).count() >= 3)
+            {
+                fence = Some((ch, trimmed.chars().take_while(|&x| x == ch).count()));
+                i += 1;
+                continue;
+            }
+            if let Some(h) = atx_heading(line) {
+                heading = (!h.is_empty()).then_some(h);
+                i += 1;
+                continue;
+            }
+            // A table starts at a header row that a delimiter row follows.
+            if i + 1 < lines.len() && (line.contains('|') || lines[i + 1].contains('|')) {
+                let header = split_row(line);
+                let delim = split_row(lines[i + 1]);
+                if !header.is_empty()
+                    && header.len() == delim.len()
+                    && delim.iter().all(|c| is_delimiter_cell(c))
+                    && !line.trim().is_empty()
+                {
+                    let width = header.len();
+                    let mut rows: Vec<Vec<String>> = Vec::new();
+                    let mut j = i + 2;
+                    while j < lines.len() && !lines[j].trim().is_empty() && !starts_block(lines[j])
+                    {
+                        let mut cells = split_row(lines[j]);
+                        cells.resize(width, String::new());
+                        rows.push(cells);
+                        j += 1;
+                    }
+                    let header: Vec<String> = header
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, h)| {
+                            if h.is_empty() {
+                                format!("column_{}", k + 1)
+                            } else {
+                                h
+                            }
+                        })
+                        .collect();
+                    tables.push(RawTable {
+                        title: heading.clone(),
+                        header,
+                        rows,
+                    });
+                    i = j;
+                    continue;
+                }
+            }
+            // A setext heading: a text line over `===` or `---`.
+            if i + 1 < lines.len() && !line.trim().is_empty() && !line.contains('|') {
+                let under = lines[i + 1].trim();
+                if !under.is_empty()
+                    && (under.bytes().all(|b| b == b'=') || under.bytes().all(|b| b == b'-'))
+                {
+                    heading = Some(clean(line));
+                }
+            }
+            i += 1;
+        }
+        tables
+    }
+
+    // ---- reading a file ----
+
+    fn read_text(path: &Path) -> Result<String> {
+        fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))
+    }
+
+    pub(super) fn parse_file(path: &Path, html: bool, stem: &str) -> Result<Vec<ParsedTable>> {
+        let text = read_text(path)?;
+        let raw = if html {
+            #[cfg(feature = "html")]
+            {
+                parse_html(&text)
+            }
+            #[cfg(not(feature = "html"))]
+            {
+                bail!("HTML table support isn't compiled in - rebuild with --features html")
+            }
+        } else {
+            #[cfg(feature = "markdown")]
+            {
+                parse_markdown(&text)
+            }
+            #[cfg(not(feature = "markdown"))]
+            {
+                bail!("Markdown table support isn't compiled in - rebuild with --features markdown")
+            }
+        };
+        if raw.is_empty() {
+            bail!(
+                "{path:?} has no {} tables with data rows",
+                if html { "HTML" } else { "Markdown pipe" }
+            );
+        }
+        Ok(name_tables(raw, stem))
+    }
+
+    /// A cell's value, or `None` when it's empty or a missing-value token.
+    fn cell_value(cell: &str) -> Option<&str> {
+        let t = cell.trim();
+        (!t.is_empty() && !is_missing_sentinel(t)).then_some(t)
+    }
+
+    pub(crate) fn columns_from_tables(
+        path: &Path,
+        html: bool,
+        stem: &str,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let tables = parse_file(path, html, stem)?;
+        Ok(tables
+            .into_iter()
+            .map(|t| {
+                let total = nrows.map_or(t.rows.len(), |n| n.min(t.rows.len()));
+                let profiles = t
+                    .header
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, name)| {
+                        let mut state = ColumnAccumulatorState::new();
+                        for row in t.rows.iter().take(total) {
+                            if let Some(v) = row.get(j).and_then(|c| cell_value(c)) {
+                                state.push(v.to_string(), n_samples);
+                            }
+                        }
+                        state.into_profile(name, total)
+                    })
+                    .collect();
+                (t.name, profiles)
+            })
+            .collect())
+    }
+
+    pub(crate) fn stream_table_rows_for_sql(
+        path: &Path,
+        html: bool,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        // A lone table takes the file's name, so asking for the same name as
+        // the stem finds it; with several tables the names come from titles.
+        let tables = parse_file(path, html, table_name)?;
+        let single = tables.len() == 1;
+        for t in tables {
+            if !(single || t.name == table_name) {
+                continue;
+            }
+            for row in t.rows.iter().take(nrows.unwrap_or(usize::MAX)) {
+                if sink.done {
+                    break;
+                }
+                let values = (0..t.header.len())
+                    .map(|j| row.get(j).and_then(|c| cell_value(c)).map(str::to_string))
+                    .collect();
+                sink.accept(values)?;
+            }
+            return Ok(());
+        }
+        bail!("{path:?} has no table named {table_name:?}")
+    }
+
+    /// Whether a file has at least one table worth reading - the gate that
+    /// keeps an ordinary README or web page from being claimed as data.
+    pub(crate) fn contains_table(path: &Path, html: bool) -> bool {
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        if html {
+            return bytes.windows(7).any(|w| {
+                w[..6].eq_ignore_ascii_case(b"<table")
+                    && (w[6] == b'>' || w[6].is_ascii_whitespace())
+            });
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let mut previous_has_pipe = false;
+        for line in text.lines() {
+            let t = line.trim();
+            let is_delim_row = t.contains('|')
+                && t.contains('-')
+                && t.bytes()
+                    .all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t'));
+            if is_delim_row && previous_has_pipe {
+                return true;
+            }
+            previous_has_pipe = t.contains('|');
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[cfg(feature = "html")]
+        fn html(text: &str) -> Vec<ParsedTable> {
+            name_tables(parse_html(text), "doc")
+        }
+
+        #[cfg(feature = "html")]
+        #[test]
+        fn header_rows_spans_and_entities() {
+            let t = html(
+                "<table><caption>Sales &amp; costs</caption>\
+                 <thead><tr><th rowspan=2>Region<th colspan=2>2024</tr>\
+                 <tr><th>Q1<th>Q2</tr></thead>\
+                 <tbody><tr><td>North<td>1,200<td>&lt;5\
+                 <tr><td>South<td colspan=2>n/a</table>",
+            );
+            assert_eq!(t.len(), 1);
+            assert_eq!(t[0].name, "doc");
+            assert_eq!(t[0].header, ["Region", "2024 / Q1", "2024 / Q2"]);
+            assert_eq!(t[0].rows[0], ["North", "1,200", "<5"]);
+            // A cell spanning two columns appears in both.
+            assert_eq!(t[0].rows[1], ["South", "n/a", "n/a"]);
+        }
+
+        #[cfg(feature = "html")]
+        #[test]
+        fn rowspan_carries_a_cell_down_and_a_headerless_table_is_numbered() {
+            let t = html("<table><tr><td rowspan=2>a<td>b<tr><td>c</table>");
+            assert_eq!(t[0].header, ["column_1", "column_2"]);
+            assert_eq!(t[0].rows, [["a", "b"], ["a", "c"]]);
+        }
+
+        #[cfg(feature = "html")]
+        #[test]
+        fn nested_tables_make_the_outer_one_layout() {
+            let t = html(
+                "<table id=layout><tr><td><table id=data><tr><th>x<th>y<tr><td>1<td>2</table></table>\
+                 <table><tr><th>p<tr><td>9</table>",
+            );
+            assert_eq!(t.len(), 2);
+            assert_eq!(t[0].name, "data");
+            assert_eq!(t[1].name, "table_2");
+        }
+
+        #[cfg(feature = "html")]
+        #[test]
+        fn script_style_comments_and_odd_markup_are_ignored() {
+            let t = html(
+                "<!-- <table> --><script>var t = '<table><tr><td>x</td></tr></table>';</script>\
+                 <table><tr><th>a<th>b</tr><tr><td><b>1</b> <i>one</i><br>x<td><a href='?q=1&amp;r=2'>2</a></tr>",
+            );
+            assert_eq!(t.len(), 1);
+            assert_eq!(t[0].rows[0], ["1 one x", "2"]);
+        }
+
+        #[cfg(feature = "html")]
+        #[test]
+        fn entities_decode_by_name_number_and_hex() {
+            assert_eq!(
+                decode_entities("a&nbsp;b &eacute;&#233;&#xE9; &bogus; &amp;amp"),
+                "a\u{a0}b ééé &bogus; &amp"
+            );
+            // Numeric references in the C1 block mean Windows-1252.
+            assert_eq!(decode_entities("&#150;&#128;"), "\u{2013}\u{20ac}");
+        }
+
+        #[cfg(feature = "markdown")]
+        #[test]
+        fn pipe_tables_with_alignment_escapes_and_padding() {
+            let t = name_tables(
+                parse_markdown(
+                    "# Results\n\n| name | score |\n|:-----|------:|\n| a \\| b | 1 |\n| c |\n| d | 2 | extra |\n\ntext\n",
+                ),
+                "doc",
+            );
+            assert_eq!(t.len(), 1);
+            assert_eq!(t[0].header, ["name", "score"]);
+            assert_eq!(t[0].rows, [["a | b", "1"], ["c", ""], ["d", "2"]]);
+        }
+
+        #[cfg(feature = "markdown")]
+        #[test]
+        fn markdown_tables_are_named_for_their_heading_and_code_is_skipped() {
+            let t = name_tables(
+                parse_markdown(
+                    "## First\n\na|b\n-|-\n1|2\n\n```\n| x | y |\n|---|---|\n| 1 | 2 |\n```\n\nSecond\n------\n\n| c |\n|---|\n| 3 |\n",
+                ),
+                "doc",
+            );
+            assert_eq!(t.len(), 2);
+            assert_eq!(t[0].name, "First");
+            assert_eq!(t[1].name, "Second");
+        }
+
+        #[cfg(feature = "markdown")]
+        #[test]
+        fn a_delimiter_row_of_the_wrong_width_is_not_a_table() {
+            assert!(parse_markdown("| a | b |\n|---|\n| 1 | 2 |\n").is_empty());
+            assert!(parse_markdown("just text\n---\nmore\n").is_empty());
+        }
+    }
+}
+
+#[cfg(any(feature = "html", feature = "markdown"))]
+fn columns_from_doc_tables(
+    path: &Path,
+    html: bool,
+    stem: &str,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    doctable_support::columns_from_tables(path, html, stem, nrows, n_samples)
+}
+
+#[cfg(not(any(feature = "html", feature = "markdown")))]
+fn columns_from_doc_tables(
+    _path: &Path,
+    _html: bool,
+    _stem: &str,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "HTML and Markdown table support isn't compiled in - rebuild with --features html or --features markdown (or --features full)"
+    )
+}
+
+#[cfg(any(feature = "html", feature = "markdown"))]
+fn render_sql_inline_flat_doc_tables(
+    read_path: &Path,
+    html: bool,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    doctable_support::stream_table_rows_for_sql(read_path, html, table_name, nrows, sink)
+}
+
+#[cfg(not(any(feature = "html", feature = "markdown")))]
+fn render_sql_inline_flat_doc_tables(
+    _read_path: &Path,
+    _html: bool,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "HTML and Markdown table support isn't compiled in - rebuild with --features html or --features markdown (or --features full)"
+    )
+}
+
+/// Whether a `.html`/`.md` file holds a table at all; a page or README that
+/// doesn't is left alone (a directory walk skips it, a single run says so).
+#[cfg(any(feature = "html", feature = "markdown"))]
+fn doc_has_table(path: &Path, html: bool) -> bool {
+    doctable_support::contains_table(path, html)
+}
+
+#[cfg(not(any(feature = "html", feature = "markdown")))]
+fn doc_has_table(_path: &Path, _html: bool) -> bool {
+    // Without the readers a document is claimed anyway, so the user gets the
+    // "rebuild with --features" error rather than a baffling "can't infer".
+    true
+}
+
 // --- SPSS reader (opt-in via --features spss) ---
 // .sav/.zsav files: a small fixed binary header, then a self-describing
 // dictionary section (variable records interleaved with value-label and
@@ -21420,11 +24721,7 @@ impl JsonPathAccumulator {
 
     fn finish(self, name: String, total: usize) -> Vec<ColumnProfile> {
         let missing = total.saturating_sub(self.pushed_count);
-        let missing_pct = round1(if total > 0 {
-            missing as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        });
+        let missing_pct = missing_percent(missing, total);
 
         if self.pushed_count == 0 {
             return vec![ColumnProfile {
@@ -75816,6 +79113,12 @@ enum InputFormat {
     Stata,
     Sas7bdat,
     Xport,
+    /// R serialized data: a `saveRDS` object or the objects of a `save` file.
+    RData,
+    /// The tables of an HTML document.
+    Html,
+    /// The pipe tables of a Markdown document.
+    Markdown,
     Spss,
     Orc,
     Bson,
@@ -75913,6 +79216,9 @@ impl InputFormat {
             InputFormat::Stata => "stata",
             InputFormat::Sas7bdat => "sas7bdat",
             InputFormat::Xport => "xport",
+            InputFormat::RData => "rdata",
+            InputFormat::Html => "html",
+            InputFormat::Markdown => "markdown",
             InputFormat::Spss => "spss",
             InputFormat::Orc => "orc",
             InputFormat::Bson => "bson",
@@ -76273,6 +79579,27 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         extensions: &["fq", "fastq"],
         feature: None,
         compiled_in: true,
+        directory: false,
+    },
+    FormatInfo {
+        name: "rdata",
+        extensions: &["rds", "rda", "rdata"],
+        feature: Some("rdata"),
+        compiled_in: cfg!(feature = "rdata"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "html",
+        extensions: &["html", "htm", "xhtml"],
+        feature: Some("html"),
+        compiled_in: cfg!(feature = "html"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "markdown",
+        extensions: &["md", "markdown", "mdown", "mkd"],
+        feature: Some("markdown"),
+        compiled_in: cfg!(feature = "markdown"),
         directory: false,
     },
     FormatInfo {
@@ -76679,6 +80006,26 @@ fn slice_contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// FASTA, FASTQ or SAM recognized from the first bytes of a file with no
 /// telling extension. Deliberately strict - a `>` or `@` first line is
 /// common in plain text - so the follow-up lines have to look right too.
+/// R serialization: an `RDX2`/`RDX3` (or `RDA`/`RDB`) magic for a `save()`
+/// file, or a bare `X\n`/`A\n`/`B\n` stream header followed by a version 2 or
+/// 3 (a `saveRDS()` file, once decompressed).
+fn looks_like_r_data(head: &[u8]) -> bool {
+    for magic in [
+        b"RDX2\n", b"RDX3\n", b"RDA2\n", b"RDA3\n", b"RDB2\n", b"RDB3\n",
+    ] {
+        if head.starts_with(magic) {
+            return true;
+        }
+    }
+    // XDR: `X\n`, then the version as a big-endian int (2 or 3) and the
+    // writer's R version (major 2-5).
+    if head.len() >= 8 && head.starts_with(b"X\n") && head[2..5] == [0, 0, 0] {
+        return matches!(head[5], 2 | 3) && head[6] == 0 && (2..=5).contains(&head[7]);
+    }
+    // Text: `A\n2\n` or `A\n3\n`.
+    head.starts_with(b"A\n2\n") || head.starts_with(b"A\n3\n")
+}
+
 fn sniff_sequence_text(head: &[u8]) -> Option<InputFormat> {
     let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
     for tag in [&b"@HD\t"[..], b"@SQ\t", b"@RG\t", b"@PG\t", b"@CO\t"] {
@@ -76809,6 +80156,9 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         || head.starts_with(b"HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!")
     {
         return Some(InputFormat::Xport);
+    }
+    if looks_like_r_data(&head) {
+        return Some(InputFormat::RData);
     }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
@@ -76952,6 +80302,20 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         if first == b'{' || first == b'[' {
             return Some(InputFormat::Json);
         }
+        // An HTML page: a doctype or an `<html>` root. (An XHTML page opens
+        // like XML, so the doctype is looked for anywhere in the first KiB.)
+        if first == b'<' {
+            let ci_contains = |needle: &[u8]| {
+                head[idx..head.len().min(idx + 1024)]
+                    .windows(needle.len())
+                    .any(|w| w.eq_ignore_ascii_case(needle))
+            };
+            if ci_contains(b"<!doctype html")
+                || head[idx..].len() >= 5 && head[idx..idx + 5].eq_ignore_ascii_case(b"<html")
+            {
+                return Some(InputFormat::Html);
+            }
+        }
         if first == b'<'
             && let Some(&next) = head.get(idx + 1)
             && (next.is_ascii_alphabetic() || next == b'_' || next == b'?')
@@ -77021,6 +80385,9 @@ fn detect_format(
             "stata" | "dta" => Ok(InputFormat::Stata),
             "sas7bdat" | "sas" => Ok(InputFormat::Sas7bdat),
             "xport" | "xpt" | "sas-xport" | "sasxport" => Ok(InputFormat::Xport),
+            "rdata" | "rds" | "rda" | "r" => Ok(InputFormat::RData),
+            "html" | "htm" | "xhtml" => Ok(InputFormat::Html),
+            "markdown" | "md" => Ok(InputFormat::Markdown),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             "orc" => Ok(InputFormat::Orc),
             "bson" => Ok(InputFormat::Bson),
@@ -77058,6 +80425,20 @@ fn detect_format(
         // `.vcf` is vCard contacts or Variant Call Format; the content says which.
         if matches!(format, InputFormat::Vcard) && sniff_variant_calls(read_path) {
             return Ok(InputFormat::Vcf);
+        }
+        // A web page or a README is a document first: only one that holds a
+        // table is data (`--format html`/`markdown` skips this check).
+        if matches!(format, InputFormat::Html | InputFormat::Markdown)
+            && !doc_has_table(read_path, matches!(format, InputFormat::Html))
+        {
+            bail!(
+                "{logical_path:?} has no {} tables, so there's nothing to profile",
+                if matches!(format, InputFormat::Html) {
+                    "HTML"
+                } else {
+                    "Markdown pipe"
+                }
+            );
         }
         return Ok(format);
     }
@@ -77114,6 +80495,9 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "dta" => InputFormat::Stata,
         "sas7bdat" => InputFormat::Sas7bdat,
         "xpt" | "xport" => InputFormat::Xport,
+        "rds" | "rda" | "rdata" => InputFormat::RData,
+        "html" | "htm" | "xhtml" => InputFormat::Html,
+        "md" | "markdown" | "mdown" | "mkd" => InputFormat::Markdown,
         "sav" | "zsav" => InputFormat::Spss,
         "orc" => InputFormat::Orc,
         "bson" => InputFormat::Bson,
@@ -77141,11 +80525,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
 fn profile_column(col: ColumnInput, n_samples: usize) -> ColumnProfile {
     let non_null = &col.raw_values;
     let missing = col.total.saturating_sub(non_null.len());
-    let missing_pct = round1(if col.total > 0 {
-        missing as f64 / col.total as f64 * 100.0
-    } else {
-        0.0
-    });
+    let missing_pct = missing_percent(missing, col.total);
 
     let (ideal_type, mut notes, temporal_format) = if non_null.is_empty() {
         (
@@ -82002,6 +85382,15 @@ fn render_sql_inline_flat(
             InputFormat::Xport => {
                 render_sql_inline_flat_xport(read_path, table_name, args.nrows, &mut sink)?
             }
+            InputFormat::RData => {
+                render_sql_inline_flat_rdata(read_path, table_name, args.nrows, &mut sink)?
+            }
+            InputFormat::Html => render_sql_inline_flat_doc_tables(
+                read_path, true, table_name, args.nrows, &mut sink,
+            )?,
+            InputFormat::Markdown => render_sql_inline_flat_doc_tables(
+                read_path, false, table_name, args.nrows, &mut sink,
+            )?,
             InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
             InputFormat::Orc => {
                 render_sql_inline_flat_orc(read_path, source_profiles, args.nrows, &mut sink)?
@@ -83109,6 +86498,9 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::Stata
             | InputFormat::Sas7bdat
             | InputFormat::Xport
+            | InputFormat::RData
+            | InputFormat::Html
+            | InputFormat::Markdown
             | InputFormat::Spss
             | InputFormat::Orc
             | InputFormat::Npy
@@ -94162,6 +97554,8 @@ fn is_text_format(format: &InputFormat) -> bool {
             | InputFormat::Fastq
             | InputFormat::Arff
             | InputFormat::Sam
+            | InputFormat::Html
+            | InputFormat::Markdown
             | InputFormat::Gff
             | InputFormat::Json
             | InputFormat::Toml
@@ -95090,11 +98484,14 @@ fn has_no_nul_in_head(path: &Path) -> bool {
 /// the bytes in. Only a file with no byte-order mark is consulted (a BOM
 /// already settles the matter), and only for an encoding other than UTF-8.
 fn declared_text_encoding(format: &InputFormat, path: &Path) -> Option<TextEncoding> {
-    if !matches!(format, InputFormat::Xml) {
+    if !matches!(format, InputFormat::Xml | InputFormat::Html) {
         return None;
     }
     if !matches!(sniff_bom(path), Ok(Bom::None)) {
         return None;
+    }
+    if matches!(format, InputFormat::Html) {
+        return html_declared_encoding(path);
     }
     let mut head = [0u8; 256];
     let n = std::io::Read::read(&mut fs::File::open(path).ok()?, &mut head).ok()?;
@@ -95112,6 +98509,34 @@ fn declared_text_encoding(format: &InputFormat, path: &Path) -> Option<TextEncod
     match parse_text_encoding(name).ok()? {
         // UTF-8 is what the readers assume; a BOM-less UTF-16/32 declaration
         // can't be acted on without knowing the byte order.
+        TextEncoding::Utf8
+        | TextEncoding::Utf16
+        | TextEncoding::Utf16Le
+        | TextEncoding::Utf16Be
+        | TextEncoding::Utf32
+        | TextEncoding::Utf32Le
+        | TextEncoding::Utf32Be => None,
+        other => Some(other),
+    }
+}
+
+/// An HTML page's own `<meta charset=...>` (or the older
+/// `<meta http-equiv content="text/html; charset=...">`), from the first 4 KiB,
+/// when it names something other than UTF-8.
+fn html_declared_encoding(path: &Path) -> Option<TextEncoding> {
+    let mut head = [0u8; 4096];
+    let n = std::io::Read::read(&mut fs::File::open(path).ok()?, &mut head).ok()?;
+    let text = String::from_utf8_lossy(&head[..n]).to_ascii_lowercase();
+    let at = text.find("charset")?;
+    let rest = text[at + "charset".len()..]
+        .trim_start()
+        .strip_prefix('=')?;
+    let rest = rest.trim_start().trim_start_matches(['"', '\'']);
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    match parse_text_encoding(&name).ok()? {
         TextEncoding::Utf8
         | TextEncoding::Utf16
         | TextEncoding::Utf16Le
@@ -95534,7 +98959,9 @@ fn container_from_magic(path: &Path) -> Option<Container> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if format_from_extension(&ext).is_some() {
+    // An R data file is a data format with a data-format extension and is
+    // still normally compressed (`saveRDS` and `save` gzip by default).
+    if format_from_extension(&ext).is_some() && !matches!(ext.as_str(), "rds" | "rda" | "rdata") {
         return None;
     }
     let mut head = [0u8; 512];
@@ -96795,6 +100222,9 @@ fn dispatch_reader(
             | InputFormat::Ini
             | InputFormat::Npz
             | InputFormat::Xport
+            | InputFormat::RData
+            | InputFormat::Html
+            | InputFormat::Markdown
     ) {
         match format {
             InputFormat::Sqlite => columns_from_sqlite(read_path, args.nrows, args.samples)?,
@@ -96802,6 +100232,15 @@ fn dispatch_reader(
             InputFormat::Ini => columns_from_ini(read_path, args.samples)?,
             InputFormat::Npz => columns_from_npz(read_path, args.nrows, args.samples)?,
             InputFormat::Xport => columns_from_xport(read_path, args.nrows, args.samples)?,
+            InputFormat::RData => {
+                columns_from_rdata(read_path, &file_stem, args.nrows, args.samples)?
+            }
+            InputFormat::Html => {
+                columns_from_doc_tables(read_path, true, &file_stem, args.nrows, args.samples)?
+            }
+            InputFormat::Markdown => {
+                columns_from_doc_tables(read_path, false, &file_stem, args.nrows, args.samples)?
+            }
             _ => unreachable!("handled by the outer matches! guard"),
         }
         .into_iter()
@@ -96882,7 +100321,10 @@ fn dispatch_reader(
             | InputFormat::Xlsx
             | InputFormat::Ini
             | InputFormat::Npz
-            | InputFormat::Xport => {
+            | InputFormat::Xport
+            | InputFormat::RData
+            | InputFormat::Html
+            | InputFormat::Markdown => {
                 unreachable!("handled above")
             }
             InputFormat::DeltaTable | InputFormat::IcebergTable => {
@@ -119188,5 +122630,24 @@ mod arff_tests {
             arff_sparse_values(br#"{1 "}"}"#).unwrap(),
             [(1, Some(b"}".to_vec()))]
         );
+    }
+}
+
+#[cfg(test)]
+mod missing_percent_tests {
+    use super::*;
+
+    #[test]
+    fn any_missing_value_is_never_reported_as_zero() {
+        assert_eq!(missing_percent(0, 100), 0.0);
+        assert_eq!(missing_percent(0, 0), 0.0);
+        assert_eq!(missing_percent(1, 3), 33.3);
+        assert_eq!(missing_percent(1, 1), 100.0);
+        // 4 in 26,115 is 0.0153%: one decimal would say 0.0.
+        assert_eq!(missing_percent(4, 26_115), 0.015);
+        // So small that three decimals would too: clamped to the smallest.
+        assert_eq!(missing_percent(1, 100_000_000), 0.001);
+        // At or above 0.05% the usual one decimal is kept.
+        assert_eq!(missing_percent(1, 1_000), 0.1);
     }
 }
