@@ -3432,7 +3432,7 @@ INI, XML, fixed-width text, NumPy (.npy/.npz), a Common/Combined Log
 Format access log, an RFC 3164/5424 syslog file, dBase (.dbf), Stata
 (.dta), SAS7BDAT, SAS Transport (.xpt), SPSS, ORC, BSON, Property List (plist), JSON5/JSONC,
 HAR, GeoJSON, vCard, iCalendar, MBOX, Jupyter notebooks (.ipynb), PDF
-text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, R data (.rds/.RData), the tables in an HTML or Markdown document, or a Delta Lake/Apache Iceberg
+text, VCF variant calls, BED, GFF/GTF, FASTA, FASTQ and SAM genomic data, Weka ARFF, R data (.rds/.RData), NetCDF, the tables in an HTML or Markdown document, or a Delta Lake/Apache Iceberg
 table directory: one row per column, with a current type, a heuristic
 "ideal" type suggestion, missing %, sample values, and a blank
 Description field to fill in by hand. Each optional format needs its
@@ -3510,7 +3510,7 @@ OPTIONS:
                                 ini, xml, fixed-width, npy, npz, common-log,
                                 combined-log, syslog, syslog5424, dbase, stata,
                                  sas7bdat, xport, spss, orc, bson, plist, json5, har, geojson,
-                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, rdata, html, markdown, icalendar, ipynb, or pdf - single-file mode only. Run
+                                 mbox, vcard, vcf-variants, bed, gff, fasta, fastq, sam, arff, rdata, netcdf, html, markdown, icalendar, ipynb, or pdf - single-file mode only. Run
                                 --list-formats to see exactly which of these (plus
                                 delta/iceberg, detected from directory structure
                                 instead) this particular build actually has compiled
@@ -20395,6 +20395,1252 @@ fn doc_has_table(_path: &Path, _html: bool) -> bool {
     // Without the readers a document is claimed anyway, so the user gets the
     // "rebuild with --features" error rather than a baffling "can't infer".
     true
+}
+
+// --- Scientific array files: the shared layer (NetCDF, HDF5) ---
+//
+// A NetCDF or HDF5 file holds *variables*: arrays with a shape, named
+// dimensions (NetCDF always; HDF5 only through dimension scales), and
+// attributes (`units`, `long_name`, `_FillValue`, ...). Read as data, the
+// natural table is the one `xarray.Dataset.to_dataframe()` makes: one row per
+// cell of the grid, a column per dimension holding its coordinate (the
+// coordinate variable of the same name - `time`, `lat` - or the plain index
+// when there isn't one) and a column per variable. Variables that share the
+// same dimensions share a table (`time_lat_lon`); one with different
+// dimensions gets its own; scalars go together in `scalars`. A file with one
+// table takes the file's name.
+//
+// What the file declares is applied, because reading the raw numbers would be
+// misleading: `_FillValue`/`missing_value` (and NaN) are missing, a packed
+// variable's `scale_factor`/`add_offset` are applied, and a CF time axis
+// (`days since 1970-01-01`, standard calendars) becomes dates. Each of these
+// is named in the column's notes. `long_name` (else `title`, `description`,
+// `standard_name`) is the column's description - the author's own words - and
+// `units` goes in the notes; `flag_values`/`flag_meanings` become value labels.
+//
+// Rows are produced a block at a time through each variable's own reader, so
+// memory is one block however large the grid is.
+#[cfg(any(feature = "netcdf", feature = "hdf5"))]
+mod scidata_support {
+    use super::*;
+
+    /// Rows per block: big enough to amortize a read, small enough to keep
+    /// memory flat for a wide table.
+    const BLOCK_ROWS: usize = 16 * 1024;
+
+    /// A block of one variable's elements, in row-major order.
+    pub(crate) enum Cells {
+        I64(Vec<i64>),
+        U64(Vec<u64>),
+        F32(Vec<f32>),
+        F64(Vec<f64>),
+        /// Strings (a char array's rows, an enum's labels); `None` is missing.
+        Text(Vec<Option<String>>),
+    }
+
+    impl Cells {
+        pub(crate) fn len(&self) -> usize {
+            match self {
+                Cells::I64(v) => v.len(),
+                Cells::U64(v) => v.len(),
+                Cells::F32(v) => v.len(),
+                Cells::F64(v) => v.len(),
+                Cells::Text(v) => v.len(),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum Attr {
+        Text(String),
+        Num(Vec<f64>),
+    }
+
+    pub(crate) type Reader = Box<dyn FnMut(u64, usize) -> Result<Cells>>;
+
+    pub(crate) struct Var {
+        pub(crate) name: String,
+        /// Dimension names and lengths, slowest first.
+        pub(crate) dims: Vec<(String, u64)>,
+        pub(crate) attrs: Vec<(String, Attr)>,
+        /// What the file stores it as (`float32`, `int16`, `char`, ...).
+        pub(crate) type_name: &'static str,
+        /// Reads `count` elements from element `start`, row-major.
+        pub(crate) read: Reader,
+    }
+
+    impl Var {
+        fn attr(&self, name: &str) -> Option<&Attr> {
+            self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+        }
+        fn attr_text(&self, name: &str) -> Option<&str> {
+            match self.attr(name) {
+                Some(Attr::Text(s)) => Some(s.as_str()),
+                _ => None,
+            }
+        }
+        fn attr_num(&self, name: &str) -> Option<f64> {
+            match self.attr(name) {
+                Some(Attr::Num(v)) => v.first().copied(),
+                _ => None,
+            }
+        }
+        fn count(&self) -> Option<u64> {
+            self.dims.iter().try_fold(1u64, |a, d| a.checked_mul(d.1))
+        }
+    }
+
+    /// How a numeric variable's values are turned into cells.
+    #[derive(Clone, Default)]
+    struct Decode {
+        /// Raw values that mean "missing".
+        fills: Vec<f64>,
+        scale: Option<f64>,
+        offset: Option<f64>,
+        time: Option<TimeAxis>,
+    }
+
+    /// A CF time axis: seconds since an origin.
+    #[derive(Clone)]
+    struct TimeAxis {
+        /// Seconds per unit.
+        unit_secs: f64,
+        /// The origin, in seconds since the Unix epoch.
+        origin: f64,
+        digits: u32,
+    }
+
+    /// `days since 1970-01-01 00:00:00` and friends (standard calendars).
+    fn parse_time_units(units: &str, calendar: Option<&str>) -> Option<TimeAxis> {
+        if let Some(c) = calendar
+            && !matches!(
+                c.to_ascii_lowercase().as_str(),
+                "standard" | "gregorian" | "proleptic_gregorian"
+            )
+        {
+            return None;
+        }
+        let lower = units.trim().to_ascii_lowercase();
+        let (unit, origin) = lower.split_once(" since ")?;
+        let unit_secs = match unit.trim() {
+            "second" | "seconds" | "s" | "sec" | "secs" => 1.0,
+            "minute" | "minutes" | "min" | "mins" => 60.0,
+            "hour" | "hours" | "h" | "hr" | "hrs" => 3600.0,
+            "day" | "days" | "d" => 86400.0,
+            _ => return None,
+        };
+        let origin = origin.trim();
+        // YYYY-MM-DD[ T]HH:MM[:SS[.f]][ ]['Z'|'UTC'|+hh[:mm]]
+        let (date, rest) = match origin.find([' ', 't']) {
+            Some(i) => (&origin[..i], origin[i + 1..].trim()),
+            None => (origin, ""),
+        };
+        let mut dp = date.split('-');
+        let y: i64 = dp.next()?.parse().ok()?;
+        let m: u32 = dp.next()?.parse().ok()?;
+        let d: u32 = dp.next().unwrap_or("1").parse().ok()?;
+        if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+            return None;
+        }
+        let mut secs = 0.0f64;
+        let mut tz = 0.0f64;
+        if !rest.is_empty() {
+            let (clock, zone) = match rest.find(['z', '+']) {
+                Some(i) => (rest[..i].trim(), rest[i..].trim()),
+                None => match rest.rfind('-') {
+                    Some(i) if i > 0 => (rest[..i].trim(), rest[i..].trim()),
+                    _ => (rest, ""),
+                },
+            };
+            let mut cp = clock.split(':');
+            let hh: f64 = cp.next().unwrap_or("0").parse().ok()?;
+            let mm: f64 = cp.next().unwrap_or("0").parse().ok()?;
+            let ss: f64 = cp.next().unwrap_or("0").parse().ok()?;
+            secs = hh * 3600.0 + mm * 60.0 + ss;
+            if !zone.is_empty() && !zone.starts_with('z') && zone != "utc" {
+                let sign = if zone.starts_with('-') { -1.0 } else { 1.0 };
+                let z = zone.trim_start_matches(['+', '-']);
+                let (zh, zm) = match z.split_once(':') {
+                    Some((h, m)) => (h, m),
+                    None if z.len() == 4 => (&z[..2], &z[2..]),
+                    None => (z, "0"),
+                };
+                tz = sign * (zh.parse::<f64>().ok()? * 3600.0 + zm.parse::<f64>().ok()? * 60.0);
+            }
+        }
+        let days = days_from_civil(y, m, d);
+        Some(TimeAxis {
+            unit_secs,
+            origin: days as f64 * 86400.0 + secs - tz,
+            digits: 0,
+        })
+    }
+
+    fn round_sig(x: f64) -> f64 {
+        if x == 0.0 || !x.is_finite() {
+            return x;
+        }
+        format!("{x:.13e}").parse().unwrap_or(x)
+    }
+
+    fn push_f64(out: &mut String, x: f64) {
+        use std::fmt::Write;
+        let x = round_sig(x);
+        if x == 0.0 || (1e-5..1e15).contains(&x.abs()) {
+            let _ = write!(out, "{x}");
+        } else {
+            let _ = write!(out, "{x:e}");
+        }
+    }
+
+    fn push_f32(out: &mut String, x: f32) {
+        use std::fmt::Write;
+        if x == 0.0 || (1e-5..1e15).contains(&x.abs()) {
+            let _ = write!(out, "{x}");
+        } else {
+            let _ = write!(out, "{x:e}");
+        }
+    }
+
+    fn time_text(t: &TimeAxis, value: f64, out: &mut String) -> bool {
+        use std::fmt::Write;
+        let secs = t.origin + value * t.unit_secs;
+        if !secs.is_finite() {
+            return false;
+        }
+        let mut whole = secs.floor();
+        let mut micros = ((secs - whole) * 1e6).round() as i64;
+        if micros >= 1_000_000 {
+            whole += 1.0;
+            micros -= 1_000_000;
+        }
+        match EpochDateTime::from_unix_seconds(whole as i64, (micros * 1000) as u32) {
+            Some(dt) => {
+                if t.digits == 0 {
+                    out.push_str(&dt.format_space());
+                } else {
+                    let _ = write!(
+                        out,
+                        "{} {}",
+                        dt.date.format_ymd(),
+                        dt.time.format_hms_frac(t.digits)
+                    );
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    impl Decode {
+        fn is_fill(&self, x: f64) -> bool {
+            x.is_nan()
+                || self
+                    .fills
+                    .iter()
+                    .any(|&f| f == x || (f.is_nan() && x.is_nan()))
+        }
+
+        /// One block of cells as text; `None` is missing.
+        fn block(&self, cells: &Cells) -> Vec<Option<String>> {
+            use std::fmt::Write;
+            let mut out: Vec<Option<String>> = Vec::with_capacity(cells.len());
+            let plain_float = self.scale.is_none() && self.offset.is_none() && self.time.is_none();
+            let mut s = String::new();
+            let emit = |out: &mut Vec<Option<String>>, ok: bool, s: &mut String| {
+                out.push(ok.then(|| std::mem::take(s)));
+                s.clear();
+            };
+            match cells {
+                Cells::Text(v) => return v.clone(),
+                Cells::I64(v) => {
+                    for &x in v {
+                        s.clear();
+                        let f = x as f64;
+                        let ok = if self.fills.iter().any(|&fl| fl == f) {
+                            false
+                        } else if plain_float {
+                            let _ = write!(s, "{x}");
+                            true
+                        } else {
+                            self.scaled(f, &mut s)
+                        };
+                        emit(&mut out, ok, &mut s);
+                    }
+                }
+                Cells::U64(v) => {
+                    for &x in v {
+                        s.clear();
+                        let f = x as f64;
+                        let ok = if self.fills.iter().any(|&fl| fl == f) {
+                            false
+                        } else if plain_float {
+                            let _ = write!(s, "{x}");
+                            true
+                        } else {
+                            self.scaled(f, &mut s)
+                        };
+                        emit(&mut out, ok, &mut s);
+                    }
+                }
+                Cells::F32(v) => {
+                    for &x in v {
+                        s.clear();
+                        let f = f64::from(x);
+                        let ok = if self.is_fill(f) {
+                            false
+                        } else if plain_float {
+                            push_f32(&mut s, x);
+                            true
+                        } else {
+                            self.scaled(f, &mut s)
+                        };
+                        emit(&mut out, ok, &mut s);
+                    }
+                }
+                Cells::F64(v) => {
+                    for &x in v {
+                        s.clear();
+                        let ok = if self.is_fill(x) {
+                            false
+                        } else if plain_float {
+                            push_f64(&mut s, x);
+                            true
+                        } else {
+                            self.scaled(x, &mut s)
+                        };
+                        emit(&mut out, ok, &mut s);
+                    }
+                }
+            }
+            out
+        }
+
+        fn scaled(&self, raw: f64, out: &mut String) -> bool {
+            let value = raw * self.scale.unwrap_or(1.0) + self.offset.unwrap_or(0.0);
+            match &self.time {
+                Some(t) => time_text(t, value, out),
+                None => {
+                    push_f64(out, value);
+                    true
+                }
+            }
+        }
+    }
+
+    /// Builds the decoding rules a variable's attributes declare.
+    fn decode_for(var: &Var) -> (Decode, Vec<String>) {
+        let mut d = Decode::default();
+        let mut notes = Vec::new();
+        for name in ["_FillValue", "missing_value"] {
+            if let Some(Attr::Num(v)) = var.attr(name) {
+                d.fills.extend(v.iter().copied());
+                if let Some(first) = v.first() {
+                    notes.push(format!("{name} {first} reads as missing"));
+                }
+            }
+        }
+        d.scale = var.attr_num("scale_factor");
+        d.offset = var.attr_num("add_offset");
+        if d.scale.is_some() || d.offset.is_some() {
+            notes.push(format!(
+                "packed values unpacked with scale_factor {} and add_offset {}",
+                d.scale.unwrap_or(1.0),
+                d.offset.unwrap_or(0.0)
+            ));
+        }
+        if let Some(units) = var.attr_text("units")
+            && let Some(t) = parse_time_units(units, var.attr_text("calendar"))
+        {
+            notes.push(format!("decoded from CF time units {units:?} (UTC)"));
+            d.time = Some(t);
+        } else if var
+            .attr_text("units")
+            .is_some_and(|u| u.contains(" since "))
+            && let Some(cal) = var.attr_text("calendar")
+        {
+            notes.push(format!(
+                "CF time with calendar {cal:?} isn't decoded (only standard calendars are)"
+            ));
+        }
+        (d, notes)
+    }
+
+    /// The label for a variable: its own words.
+    fn description_of(var: &Var) -> (String, Vec<String>) {
+        let mut notes = Vec::new();
+        let long = ["long_name", "title", "description"]
+            .into_iter()
+            .find_map(|k| var.attr_text(k).filter(|s| !s.trim().is_empty()));
+        let std_name = var.attr_text("standard_name");
+        let description = match (long, std_name) {
+            (Some(l), s) => {
+                if let Some(s) = s {
+                    notes.push(format!("standard_name: {s}"));
+                }
+                l.trim().to_string()
+            }
+            (None, Some(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        if let Some(u) = var.attr_text("units").filter(|u| !u.trim().is_empty()) {
+            notes.push(format!("units: {u}"));
+        }
+        (description, notes)
+    }
+
+    fn value_labels_of(var: &Var) -> Vec<(String, String)> {
+        let (Some(Attr::Num(values)), Some(meanings)) =
+            (var.attr("flag_values"), var.attr_text("flag_meanings"))
+        else {
+            return Vec::new();
+        };
+        values
+            .iter()
+            .zip(meanings.split_whitespace())
+            .map(|(v, m)| {
+                let mut s = String::new();
+                push_f64(&mut s, *v);
+                (s, m.replace('_', " "))
+            })
+            .collect()
+    }
+
+    /// One column of a table: a dimension's coordinate or a variable.
+    struct Column {
+        name: String,
+        description: String,
+        notes: Vec<String>,
+        value_labels: Vec<(String, String)>,
+        current_type: &'static str,
+        source: Source,
+    }
+
+    enum Source {
+        /// Dimension `k` of the table; `labels` are its coordinates as text
+        /// (empty: the index itself).
+        Dim {
+            k: usize,
+            labels: Vec<Option<String>>,
+        },
+        /// A variable, by index.
+        Var { index: usize, decode: Decode },
+    }
+
+    pub(crate) struct Table {
+        pub(crate) name: String,
+        dims: Vec<u64>,
+        columns: Vec<Column>,
+        nrows: u64,
+    }
+
+    /// Groups variables into tables and resolves their columns. Reads each
+    /// coordinate variable once (they're small), nothing else.
+    pub(crate) fn plan(vars: &mut [Var], stem: &str) -> Result<Vec<Table>> {
+        // Coordinate variables: one dimension, named for it.
+        let coord_of = |vars: &[Var], dim: &str| -> Option<usize> {
+            vars.iter()
+                .position(|v| v.name == dim && v.dims.len() == 1 && v.dims[0].0 == dim)
+        };
+        // Group by dimension signature, in file order.
+        let mut groups: Vec<(Vec<(String, u64)>, Vec<usize>)> = Vec::new();
+        for (i, v) in vars.iter().enumerate() {
+            let is_coord = v.dims.len() == 1 && v.dims[0].0 == v.name;
+            if is_coord {
+                continue;
+            }
+            match groups.iter_mut().find(|(d, _)| *d == v.dims) {
+                Some((_, members)) => members.push(i),
+                None => groups.push((v.dims.clone(), vec![i])),
+            }
+        }
+        // A coordinate variable no data variable uses is data itself.
+        for (i, v) in vars.iter().enumerate() {
+            if v.dims.len() == 1 && v.dims[0].0 == v.name {
+                let used = groups
+                    .iter()
+                    .any(|(d, _)| d.iter().any(|(n, _)| *n == v.name));
+                if !used {
+                    groups.push((v.dims.clone(), vec![i]));
+                }
+            }
+        }
+        let mut tables = Vec::new();
+        for (dims, members) in &groups {
+            // A coordinate-only group is the coordinate variable itself, so
+            // its dimension column would repeat it.
+            let coord_only = members.len() == 1
+                && vars[members[0]].dims.len() == 1
+                && vars[members[0]].dims[0].0 == vars[members[0]].name;
+            let mut columns: Vec<Column> = Vec::new();
+            if !coord_only {
+                for (k, (dname, len)) in dims.iter().enumerate() {
+                    let (labels, description, notes, ty) = match coord_of(vars, dname) {
+                        Some(ci) => {
+                            let (decode, mut notes) = decode_for(&vars[ci]);
+                            let n = vars[ci].count().unwrap_or(0);
+                            if n != *len {
+                                (Vec::new(), String::new(), Vec::new(), "index")
+                            } else {
+                                // Prepass for the time axis's fraction width.
+                                let mut decode = decode;
+                                let cells = (vars[ci].read)(0, n as usize).with_context(|| {
+                                    format!("failed reading coordinate {dname:?}")
+                                })?;
+                                fix_time_digits(&mut decode, &cells);
+                                let (desc, more) = description_of(&vars[ci]);
+                                notes.extend(more);
+                                (decode.block(&cells), desc, notes, vars[ci].type_name)
+                            }
+                        }
+                        None => (Vec::new(), String::new(), Vec::new(), "index"),
+                    };
+                    columns.push(Column {
+                        name: dname.clone(),
+                        description,
+                        notes,
+                        value_labels: Vec::new(),
+                        current_type: ty,
+                        source: Source::Dim { k, labels },
+                    });
+                }
+            }
+            for &i in members {
+                let v = &vars[i];
+                let (mut decode, mut notes) = decode_for(v);
+                let (description, more) = description_of(v);
+                notes.extend(more);
+                // The fraction width of a time axis is decided from the data
+                // (first block), so a column has one date format throughout.
+                if decode.time.is_some() {
+                    let n = v.count().unwrap_or(0).min(4096) as usize;
+                    let cells = (vars[i].read)(0, n)?;
+                    fix_time_digits(&mut decode, &cells);
+                }
+                let v = &vars[i];
+                columns.push(Column {
+                    name: v.name.clone(),
+                    description,
+                    notes,
+                    value_labels: value_labels_of(v),
+                    current_type: v.type_name,
+                    source: Source::Var { index: i, decode },
+                });
+            }
+            let lens: Vec<u64> = dims.iter().map(|d| d.1).collect();
+            let nrows = lens
+                .iter()
+                .try_fold(1u64, |a, &l| a.checked_mul(l))
+                .unwrap_or(0);
+            let name = if dims.is_empty() {
+                "scalars".to_string()
+            } else {
+                dims.iter()
+                    .map(|d| d.0.as_str())
+                    .collect::<Vec<_>>()
+                    .join("_")
+            };
+            tables.push(Table {
+                name,
+                dims: lens,
+                columns,
+                nrows,
+            });
+        }
+        if tables.len() == 1 {
+            tables[0].name = stem.to_string();
+        }
+        Ok(tables)
+    }
+
+    /// Chooses a time column's fraction digits: none when every value in the
+    /// block lands on a whole second.
+    fn fix_time_digits(decode: &mut Decode, cells: &Cells) {
+        let Some(t) = decode.time.as_mut() else {
+            return;
+        };
+        let scale = decode.scale;
+        let offset = decode.offset;
+        let check = |x: f64| -> bool {
+            let secs = t.origin + (x * scale.unwrap_or(1.0) + offset.unwrap_or(0.0)) * t.unit_secs;
+            secs.is_finite() && ((secs - secs.floor()) * 1e6).round() % 1e6 != 0.0
+        };
+        let fractional = match cells {
+            Cells::I64(v) => v.iter().any(|&x| check(x as f64)),
+            Cells::U64(v) => v.iter().any(|&x| check(x as f64)),
+            Cells::F32(v) => v.iter().any(|&x| check(f64::from(x))),
+            Cells::F64(v) => v.iter().any(|&x| check(x)),
+            Cells::Text(_) => false,
+        };
+        t.digits = if fractional { 6 } else { 0 };
+    }
+
+    impl Table {
+        /// Calls `each` with consecutive blocks of rows (each row a `Vec`
+        /// of cells), until `limit` rows or `each` returns `false`.
+        pub(crate) fn for_each_block(
+            &self,
+            vars: &mut [Var],
+            limit: Option<u64>,
+            mut each: impl FnMut(Vec<Vec<Option<String>>>) -> Result<bool>,
+        ) -> Result<()> {
+            let total = limit.map_or(self.nrows, |l| l.min(self.nrows));
+            // Row strides of each dimension (row-major).
+            let mut strides = vec![1u64; self.dims.len()];
+            for k in (0..self.dims.len().saturating_sub(1)).rev() {
+                strides[k] = strides[k + 1] * self.dims[k + 1];
+            }
+            let mut start = 0u64;
+            while start < total {
+                let n = ((total - start) as usize).min(BLOCK_ROWS);
+                // Each variable's block, decoded.
+                let mut var_cols: Vec<Option<Vec<Option<String>>>> = Vec::new();
+                for col in &self.columns {
+                    var_cols.push(match &col.source {
+                        Source::Dim { .. } => None,
+                        Source::Var { index, decode } => {
+                            let cells = (vars[*index].read)(start, n).with_context(|| {
+                                format!("failed reading variable {:?}", vars[*index].name)
+                            })?;
+                            Some(decode.block(&cells))
+                        }
+                    });
+                }
+                let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
+                for r in 0..n {
+                    let row_index = start + r as u64;
+                    let mut row = Vec::with_capacity(self.columns.len());
+                    for (c, col) in self.columns.iter().enumerate() {
+                        row.push(match &col.source {
+                            Source::Dim { k, labels } => {
+                                let idx = (row_index / strides[*k]) % self.dims[*k].max(1);
+                                if labels.is_empty() {
+                                    Some(idx.to_string())
+                                } else {
+                                    labels.get(idx as usize).cloned().flatten()
+                                }
+                            }
+                            Source::Var { .. } => var_cols[c]
+                                .as_mut()
+                                .and_then(|v| v.get_mut(r).and_then(Option::take)),
+                        });
+                    }
+                    rows.push(row);
+                }
+                if !each(rows)? {
+                    break;
+                }
+                start += n as u64;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn profile(
+            &self,
+            vars: &mut [Var],
+            nrows: Option<usize>,
+            n_samples: usize,
+        ) -> Result<Vec<ColumnProfile>> {
+            let mut states: Vec<ColumnAccumulatorState> = (0..self.columns.len())
+                .map(|_| ColumnAccumulatorState::new())
+                .collect();
+            let mut total = 0usize;
+            self.for_each_block(vars, nrows.map(|n| n as u64), |rows| {
+                for row in rows {
+                    for (i, cell) in row.into_iter().enumerate() {
+                        if let Some(s) = cell {
+                            states[i].push(s, n_samples);
+                        }
+                    }
+                    total += 1;
+                }
+                Ok(true)
+            })?;
+            Ok(self
+                .columns
+                .iter()
+                .zip(states)
+                .map(|(col, state)| {
+                    let mut profile = state.into_profile_with_declared_type(
+                        col.name.clone(),
+                        total,
+                        col.current_type.to_string(),
+                    );
+                    apply_variable_labels(&mut profile, &col.description, &col.value_labels);
+                    if !col.notes.is_empty() {
+                        let extra = col.notes.join("; ");
+                        profile.notes = if profile.notes.is_empty() {
+                            extra
+                        } else {
+                            format!("{}; {extra}", profile.notes)
+                        };
+                    }
+                    profile
+                })
+                .collect())
+        }
+
+        pub(crate) fn emit(
+            &self,
+            vars: &mut [Var],
+            nrows: Option<usize>,
+            sink: &mut InlineRowSink<'_>,
+        ) -> Result<()> {
+            self.for_each_block(vars, nrows.map(|n| n as u64), |rows| {
+                for row in rows {
+                    if sink.done {
+                        return Ok(false);
+                    }
+                    sink.accept(row)?;
+                }
+                Ok(!sink.done)
+            })
+        }
+    }
+}
+
+// --- NetCDF classic (`.nc`: CDF-1, CDF-2 and CDF-5) ---
+//
+// The classic format: a `CDF` magic and version byte (1: 32-bit offsets, 2:
+// 64-bit offsets, 5: 64-bit data), the number of records, then three lists -
+// dimensions, global attributes, variables - and then the data. Everything is
+// big-endian and padded to 4 bytes. A variable's data is contiguous at its
+// `begin` offset, except a *record* variable (its first dimension is the
+// unlimited one): its records are interleaved with the other record variables',
+// one record after another, each `recsize` bytes. A `char` array is text: its
+// last dimension is the string length. (NetCDF-4 files are HDF5 and are read by
+// that reader.) The layout is the NetCDF Classic Format Specification; the
+// reference for checking is the netCDF library through netCDF4-python and
+// scipy.
+#[cfg(feature = "netcdf")]
+mod netcdf_support {
+    use super::scidata_support::*;
+    use super::*;
+    use std::cell::RefCell;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::rc::Rc;
+
+    const NC_DIMENSION: u32 = 0x0A;
+    const NC_VARIABLE: u32 = 0x0B;
+    const NC_ATTRIBUTE: u32 = 0x0C;
+    /// Counts and names are read from the file; none may claim more than this.
+    const MAX_ITEMS: u64 = 1 << 20;
+    const MAX_NAME: u64 = 1 << 20;
+
+    pub(crate) fn is_netcdf_classic(head: &[u8]) -> bool {
+        head.len() >= 4 && &head[..3] == b"CDF" && matches!(head[3], 1 | 2 | 5)
+    }
+
+    struct Head<R: Read> {
+        r: R,
+        wide: bool, // CDF-5: 64-bit counts and ids
+    }
+
+    impl<R: Read> Head<R> {
+        fn u32(&mut self) -> Result<u32> {
+            let mut b = [0u8; 4];
+            self.r
+                .read_exact(&mut b)
+                .context("the NetCDF header ends early")?;
+            Ok(u32::from_be_bytes(b))
+        }
+        fn u64(&mut self) -> Result<u64> {
+            let mut b = [0u8; 8];
+            self.r
+                .read_exact(&mut b)
+                .context("the NetCDF header ends early")?;
+            Ok(u64::from_be_bytes(b))
+        }
+        /// A count or size: 32-bit, or 64-bit in CDF-5.
+        fn non_neg(&mut self) -> Result<u64> {
+            if self.wide {
+                self.u64()
+            } else {
+                self.u32().map(u64::from)
+            }
+        }
+        fn count(&mut self) -> Result<u64> {
+            let n = self.non_neg()?;
+            if n > MAX_ITEMS {
+                bail!("the NetCDF header claims {n} items, which is implausible");
+            }
+            Ok(n)
+        }
+        fn bytes(&mut self, n: u64) -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            let got = (&mut self.r)
+                .take(n)
+                .read_to_end(&mut out)
+                .context("the NetCDF header ends early")?;
+            if got as u64 != n {
+                bail!("the NetCDF header ends early");
+            }
+            let pad = (4 - n % 4) % 4;
+            let mut skip = [0u8; 3];
+            self.r
+                .read_exact(&mut skip[..pad as usize])
+                .context("the NetCDF header ends early")?;
+            Ok(out)
+        }
+        fn name(&mut self) -> Result<String> {
+            let n = self.non_neg()?;
+            if n > MAX_NAME {
+                bail!("a NetCDF name claims {n} bytes");
+            }
+            Ok(String::from_utf8_lossy(&self.bytes(n)?).into_owned())
+        }
+        /// The tag of a list and its element count (`ABSENT` is two zeros).
+        fn list(&mut self, tag: u32) -> Result<u64> {
+            let t = self.u32()?;
+            let n = self.count()?;
+            if t == 0 && n == 0 {
+                return Ok(0);
+            }
+            if t != tag {
+                bail!("a NetCDF list has tag {t:#x}, expected {tag:#x}");
+            }
+            Ok(n)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ty {
+        Byte,
+        Char,
+        Short,
+        Int,
+        Float,
+        Double,
+        UByte,
+        UShort,
+        UInt,
+        Int64,
+        UInt64,
+    }
+
+    impl Ty {
+        fn from_code(c: u32) -> Result<Ty> {
+            Ok(match c {
+                1 => Ty::Byte,
+                2 => Ty::Char,
+                3 => Ty::Short,
+                4 => Ty::Int,
+                5 => Ty::Float,
+                6 => Ty::Double,
+                7 => Ty::UByte,
+                8 => Ty::UShort,
+                9 => Ty::UInt,
+                10 => Ty::Int64,
+                11 => Ty::UInt64,
+                other => bail!("unknown NetCDF type code {other}"),
+            })
+        }
+        fn size(self) -> u64 {
+            match self {
+                Ty::Byte | Ty::Char | Ty::UByte => 1,
+                Ty::Short | Ty::UShort => 2,
+                Ty::Int | Ty::UInt | Ty::Float => 4,
+                Ty::Double | Ty::Int64 | Ty::UInt64 => 8,
+            }
+        }
+        fn name(self) -> &'static str {
+            match self {
+                Ty::Byte => "byte",
+                Ty::Char => "char",
+                Ty::Short => "short",
+                Ty::Int => "int",
+                Ty::Float => "float",
+                Ty::Double => "double",
+                Ty::UByte => "ubyte",
+                Ty::UShort => "ushort",
+                Ty::UInt => "uint",
+                Ty::Int64 => "int64",
+                Ty::UInt64 => "uint64",
+            }
+        }
+    }
+
+    fn read_attrs<R: Read>(h: &mut Head<R>) -> Result<Vec<(String, Attr)>> {
+        let n = h.list(NC_ATTRIBUTE)?;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let name = h.name()?;
+            let ty = Ty::from_code(h.u32()?)?;
+            let count = h.non_neg()?;
+            let nbytes = count
+                .checked_mul(ty.size())
+                .filter(|&b| b <= 1 << 28)
+                .context("a NetCDF attribute is implausibly large")?;
+            let raw = h.bytes(nbytes)?;
+            out.push((name, attr_value(ty, &raw)));
+        }
+        Ok(out)
+    }
+
+    fn attr_value(ty: Ty, raw: &[u8]) -> Attr {
+        if ty == Ty::Char {
+            let text = String::from_utf8_lossy(raw);
+            return Attr::Text(text.trim_end_matches('\0').to_string());
+        }
+        let n = raw.len() / ty.size() as usize;
+        let mut v = Vec::with_capacity(n);
+        for i in 0..n {
+            let b = &raw[i * ty.size() as usize..];
+            v.push(match ty {
+                Ty::Byte => f64::from(b[0] as i8),
+                Ty::UByte => f64::from(b[0]),
+                Ty::Short => f64::from(i16::from_be_bytes([b[0], b[1]])),
+                Ty::UShort => f64::from(u16::from_be_bytes([b[0], b[1]])),
+                Ty::Int => f64::from(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                Ty::UInt => f64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                Ty::Float => f64::from(f32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                Ty::Double => f64::from_be_bytes(b[..8].try_into().expect("8 bytes")),
+                Ty::Int64 => i64::from_be_bytes(b[..8].try_into().expect("8 bytes")) as f64,
+                Ty::UInt64 => u64::from_be_bytes(b[..8].try_into().expect("8 bytes")) as f64,
+                Ty::Char => 0.0,
+            });
+        }
+        Attr::Num(v)
+    }
+
+    struct RawVar {
+        name: String,
+        dimids: Vec<usize>,
+        attrs: Vec<(String, Attr)>,
+        ty: Ty,
+        vsize: u64,
+        begin: u64,
+    }
+
+    /// Reads a classic NetCDF file's variables; `Var`s read their own data
+    /// through a shared file handle.
+    pub(crate) fn open(path: &Path) -> Result<Vec<Var>> {
+        let mut file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic)
+            .with_context(|| format!("{path:?} is too short to be NetCDF"))?;
+        if !is_netcdf_classic(&magic) {
+            bail!("{path:?} isn't a classic NetCDF file (no CDF magic)");
+        }
+        let version = magic[3];
+        let mut h = Head {
+            r: std::io::BufReader::new(&mut file),
+            wide: version == 5,
+        };
+        let mut numrecs = h.non_neg()?;
+        // dimensions
+        let ndims = h.list(NC_DIMENSION)?;
+        let mut dims: Vec<(String, u64)> = Vec::new();
+        let mut record_dim: Option<usize> = None;
+        for i in 0..ndims {
+            let name = h.name()?;
+            let len = h.non_neg()?;
+            if len == 0 {
+                record_dim = Some(i as usize);
+            }
+            dims.push((name, len));
+        }
+        let _global = read_attrs(&mut h)?;
+        let nvars = h.list(NC_VARIABLE)?;
+        let mut raws: Vec<RawVar> = Vec::new();
+        for _ in 0..nvars {
+            let name = h.name()?;
+            let nd = h.count()?;
+            let mut dimids = Vec::new();
+            for _ in 0..nd {
+                let id = h.non_neg()? as usize;
+                if id >= dims.len() {
+                    bail!(
+                        "variable {name:?} names dimension {id}, but only {} exist",
+                        dims.len()
+                    );
+                }
+                dimids.push(id);
+            }
+            let attrs = read_attrs(&mut h)?;
+            let ty = Ty::from_code(h.u32()?)?;
+            let vsize = h.non_neg()?;
+            let begin = if version == 1 {
+                u64::from(h.u32()?)
+            } else {
+                h.u64()?
+            };
+            raws.push(RawVar {
+                name,
+                dimids,
+                attrs,
+                ty,
+                vsize,
+                begin,
+            });
+        }
+        drop(h);
+        let is_record = |r: &RawVar| r.dimids.first().is_some_and(|&d| Some(d) == record_dim);
+        // The record size: each record variable's slab per record, padded -
+        // except that a file with one record variable packs them unpadded.
+        let record_vars: Vec<&RawVar> = raws.iter().filter(|r| is_record(r)).collect();
+        let per_record_elems = |r: &RawVar| -> u64 {
+            r.dimids[1..]
+                .iter()
+                .map(|&d| dims[d].1)
+                .try_fold(1u64, |a, l| a.checked_mul(l))
+                .unwrap_or(0)
+        };
+        let recsize: u64 = if record_vars.len() == 1 {
+            per_record_elems(record_vars[0]) * record_vars[0].ty.size()
+        } else {
+            record_vars.iter().map(|r| r.vsize).sum()
+        };
+        // A streaming file (numrecs = -1) stores no count: work it out from
+        // where the records end.
+        if numrecs == u64::from(u32::MAX) || numrecs == u64::MAX {
+            let first = record_vars.iter().map(|r| r.begin).min();
+            numrecs = match (first, recsize) {
+                (Some(first), rs) if rs > 0 => file_len.saturating_sub(first) / rs,
+                _ => 0,
+            };
+        }
+        if let Some(rd) = record_dim {
+            dims[rd].1 = numrecs;
+        }
+        let shared = Rc::new(RefCell::new(file));
+        let mut out = Vec::new();
+        for raw in raws {
+            let record = is_record(&raw);
+            let mut vdims: Vec<(String, u64)> =
+                raw.dimids.iter().map(|&d| dims[d].clone()).collect();
+            let ty = raw.ty;
+            // A char array's last dimension is the string length.
+            let strlen = if ty == Ty::Char && !vdims.is_empty() {
+                vdims.pop().map(|d| d.1)
+            } else {
+                None
+            };
+            let elem_bytes = strlen.unwrap_or(1) * ty.size();
+            let inner: u64 = {
+                let skip = usize::from(record);
+                vdims[skip.min(vdims.len())..]
+                    .iter()
+                    .try_fold(1u64, |a, d| a.checked_mul(d.1))
+                    .unwrap_or(0)
+            };
+            let begin = raw.begin;
+            let file = Rc::clone(&shared);
+            let encoding_utf8 = raw
+                .attrs
+                .iter()
+                .any(|(k, v)| matches!((k.as_str(), v), ("_Encoding", Attr::Text(t)) if t.eq_ignore_ascii_case("utf-8")));
+            let reader: Reader = Box::new(move |start: u64, count: usize| -> Result<Cells> {
+                // Gather the bytes of elements [start, start + count).
+                let total = (count as u64)
+                    .checked_mul(elem_bytes)
+                    .filter(|&b| b <= 1 << 31)
+                    .context("a NetCDF block is implausibly large")?;
+                let mut bytes = vec![0u8; total as usize];
+                let mut f = file.borrow_mut();
+                let mut done = 0u64;
+                let mut e = start;
+                while done < count as u64 {
+                    let (offset, run) = if record {
+                        let r = e / inner.max(1);
+                        let in_rec = e % inner.max(1);
+                        (
+                            begin + r * recsize + in_rec * elem_bytes,
+                            (inner - in_rec).min(count as u64 - done),
+                        )
+                    } else {
+                        (begin + e * elem_bytes, count as u64 - done)
+                    };
+                    let want = run * elem_bytes;
+                    f.seek(SeekFrom::Start(offset))
+                        .context("a NetCDF variable's data lies past the end of the file")?;
+                    f.read_exact(
+                        &mut bytes
+                            [(done * elem_bytes) as usize..(done * elem_bytes + want) as usize],
+                    )
+                    .context("a NetCDF variable's data is cut short")?;
+                    done += run;
+                    e += run;
+                }
+                Ok(decode_cells(ty, strlen, &bytes, count, encoding_utf8))
+            });
+            out.push(Var {
+                name: raw.name,
+                dims: vdims,
+                attrs: raw.attrs,
+                type_name: if strlen.is_some() { "char" } else { ty.name() },
+                read: reader,
+            });
+        }
+        Ok(out)
+    }
+
+    fn decode_cells(ty: Ty, strlen: Option<u64>, b: &[u8], count: usize, utf8: bool) -> Cells {
+        if let Some(len) = strlen {
+            let len = len as usize;
+            let mut v = Vec::with_capacity(count);
+            for i in 0..count {
+                let chunk = &b[i * len..(i + 1) * len];
+                let end = chunk.iter().position(|&c| c == 0).unwrap_or(len);
+                let text = if utf8 {
+                    String::from_utf8_lossy(&chunk[..end]).into_owned()
+                } else {
+                    chunk[..end].iter().map(|&c| c as char).collect()
+                };
+                let text = text.trim_end().to_string();
+                v.push((!text.is_empty()).then_some(text));
+            }
+            return Cells::Text(v);
+        }
+        match ty {
+            Ty::Char => Cells::Text(
+                b.iter()
+                    .map(|&c| (c != 0).then(|| (c as char).to_string()))
+                    .collect(),
+            ),
+            Ty::Byte => Cells::I64(b.iter().map(|&x| i64::from(x as i8)).collect()),
+            Ty::UByte => Cells::I64(b.iter().map(|&x| i64::from(x)).collect()),
+            Ty::Short => Cells::I64(
+                (0..count)
+                    .map(|i| i64::from(i16::from_be_bytes([b[2 * i], b[2 * i + 1]])))
+                    .collect(),
+            ),
+            Ty::UShort => Cells::I64(
+                (0..count)
+                    .map(|i| i64::from(u16::from_be_bytes([b[2 * i], b[2 * i + 1]])))
+                    .collect(),
+            ),
+            Ty::Int => Cells::I64(
+                (0..count)
+                    .map(|i| {
+                        i64::from(i32::from_be_bytes([
+                            b[4 * i],
+                            b[4 * i + 1],
+                            b[4 * i + 2],
+                            b[4 * i + 3],
+                        ]))
+                    })
+                    .collect(),
+            ),
+            Ty::UInt => Cells::I64(
+                (0..count)
+                    .map(|i| {
+                        i64::from(u32::from_be_bytes([
+                            b[4 * i],
+                            b[4 * i + 1],
+                            b[4 * i + 2],
+                            b[4 * i + 3],
+                        ]))
+                    })
+                    .collect(),
+            ),
+            Ty::Float => Cells::F32(
+                (0..count)
+                    .map(|i| {
+                        f32::from_be_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+                    })
+                    .collect(),
+            ),
+            Ty::Double => Cells::F64(
+                (0..count)
+                    .map(|i| f64::from_be_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
+                    .collect(),
+            ),
+            Ty::Int64 => Cells::I64(
+                (0..count)
+                    .map(|i| i64::from_be_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
+                    .collect(),
+            ),
+            Ty::UInt64 => Cells::U64(
+                (0..count)
+                    .map(|i| u64::from_be_bytes(b[8 * i..8 * i + 8].try_into().expect("8 bytes")))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn columns_from_netcdf(
+        path: &Path,
+        stem: &str,
+        nrows: Option<usize>,
+        n_samples: usize,
+    ) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+        let mut vars = open(path)?;
+        let tables = plan(&mut vars, stem)?;
+        if tables.is_empty() {
+            bail!("{path:?} is a NetCDF file with no variables");
+        }
+        let mut out = Vec::new();
+        for t in &tables {
+            let profiles = t.profile(&mut vars, nrows, n_samples)?;
+            out.push((t.name.clone(), profiles));
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn stream_netcdf_rows_for_sql(
+        path: &Path,
+        table_name: &str,
+        nrows: Option<usize>,
+        sink: &mut InlineRowSink<'_>,
+    ) -> Result<()> {
+        let mut vars = open(path)?;
+        // A lone table takes the file's name, so the name asked for (the
+        // stem) is that table.
+        let tables = plan(&mut vars, table_name)?;
+        let single = tables.len() == 1;
+        for t in &tables {
+            if single || t.name == table_name {
+                return t.emit(&mut vars, nrows, sink);
+            }
+        }
+        bail!("{path:?} has no table named {table_name:?}")
+    }
+}
+
+#[cfg(feature = "netcdf")]
+fn columns_from_netcdf(
+    path: &Path,
+    stem: &str,
+    nrows: Option<usize>,
+    n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    netcdf_support::columns_from_netcdf(path, stem, nrows, n_samples)
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn columns_from_netcdf(
+    _path: &Path,
+    _stem: &str,
+    _nrows: Option<usize>,
+    _n_samples: usize,
+) -> Result<Vec<(String, Vec<ColumnProfile>)>> {
+    bail!(
+        "NetCDF support isn't compiled in - rebuild with `cargo build --release --features netcdf` (or --features full)"
+    )
+}
+
+#[cfg(feature = "netcdf")]
+fn render_sql_inline_flat_netcdf(
+    read_path: &Path,
+    table_name: &str,
+    nrows: Option<usize>,
+    sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    netcdf_support::stream_netcdf_rows_for_sql(read_path, table_name, nrows, sink)
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn render_sql_inline_flat_netcdf(
+    _read_path: &Path,
+    _table_name: &str,
+    _nrows: Option<usize>,
+    _sink: &mut InlineRowSink<'_>,
+) -> Result<()> {
+    bail!(
+        "NetCDF support isn't compiled in - rebuild with `cargo build --release --features netcdf` (or --features full)"
+    )
 }
 
 // --- SPSS reader (opt-in via --features spss) ---
@@ -79119,6 +80365,8 @@ enum InputFormat {
     Html,
     /// The pipe tables of a Markdown document.
     Markdown,
+    /// NetCDF classic (CDF-1/2/5).
+    NetCdf,
     Spss,
     Orc,
     Bson,
@@ -79219,6 +80467,7 @@ impl InputFormat {
             InputFormat::RData => "rdata",
             InputFormat::Html => "html",
             InputFormat::Markdown => "markdown",
+            InputFormat::NetCdf => "netcdf",
             InputFormat::Spss => "spss",
             InputFormat::Orc => "orc",
             InputFormat::Bson => "bson",
@@ -79600,6 +80849,13 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
         extensions: &["md", "markdown", "mdown", "mkd"],
         feature: Some("markdown"),
         compiled_in: cfg!(feature = "markdown"),
+        directory: false,
+    },
+    FormatInfo {
+        name: "netcdf",
+        extensions: &["nc", "cdf", "netcdf"],
+        feature: Some("netcdf"),
+        compiled_in: cfg!(feature = "netcdf"),
         directory: false,
     },
     FormatInfo {
@@ -80160,6 +81416,9 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
     if looks_like_r_data(&head) {
         return Some(InputFormat::RData);
     }
+    if head.len() >= 4 && &head[..3] == b"CDF" && matches!(head[3], 1 | 2 | 5) {
+        return Some(InputFormat::NetCdf);
+    }
     if head.len() >= 32 && head[..32] == SAS7BDAT_MAGIC[..] {
         return Some(InputFormat::Sas7bdat);
     }
@@ -80388,6 +81647,7 @@ fn detect_format(
             "rdata" | "rds" | "rda" | "r" => Ok(InputFormat::RData),
             "html" | "htm" | "xhtml" => Ok(InputFormat::Html),
             "markdown" | "md" => Ok(InputFormat::Markdown),
+            "netcdf" | "nc" | "cdf" => Ok(InputFormat::NetCdf),
             "spss" | "sav" | "zsav" => Ok(InputFormat::Spss),
             "orc" => Ok(InputFormat::Orc),
             "bson" => Ok(InputFormat::Bson),
@@ -80498,6 +81758,7 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "rds" | "rda" | "rdata" => InputFormat::RData,
         "html" | "htm" | "xhtml" => InputFormat::Html,
         "md" | "markdown" | "mdown" | "mkd" => InputFormat::Markdown,
+        "nc" | "cdf" | "netcdf" => InputFormat::NetCdf,
         "sav" | "zsav" => InputFormat::Spss,
         "orc" => InputFormat::Orc,
         "bson" => InputFormat::Bson,
@@ -85391,6 +86652,9 @@ fn render_sql_inline_flat(
             InputFormat::Markdown => render_sql_inline_flat_doc_tables(
                 read_path, false, table_name, args.nrows, &mut sink,
             )?,
+            InputFormat::NetCdf => {
+                render_sql_inline_flat_netcdf(read_path, table_name, args.nrows, &mut sink)?
+            }
             InputFormat::Spss => render_sql_inline_flat_spss(read_path, &mut sink)?,
             InputFormat::Orc => {
                 render_sql_inline_flat_orc(read_path, source_profiles, args.nrows, &mut sink)?
@@ -86501,6 +87765,7 @@ fn inline_supported_format(format: &InputFormat) -> bool {
             | InputFormat::RData
             | InputFormat::Html
             | InputFormat::Markdown
+            | InputFormat::NetCdf
             | InputFormat::Spss
             | InputFormat::Orc
             | InputFormat::Npy
@@ -100225,6 +101490,7 @@ fn dispatch_reader(
             | InputFormat::RData
             | InputFormat::Html
             | InputFormat::Markdown
+            | InputFormat::NetCdf
     ) {
         match format {
             InputFormat::Sqlite => columns_from_sqlite(read_path, args.nrows, args.samples)?,
@@ -100240,6 +101506,9 @@ fn dispatch_reader(
             }
             InputFormat::Markdown => {
                 columns_from_doc_tables(read_path, false, &file_stem, args.nrows, args.samples)?
+            }
+            InputFormat::NetCdf => {
+                columns_from_netcdf(read_path, &file_stem, args.nrows, args.samples)?
             }
             _ => unreachable!("handled by the outer matches! guard"),
         }
@@ -100324,7 +101593,8 @@ fn dispatch_reader(
             | InputFormat::Xport
             | InputFormat::RData
             | InputFormat::Html
-            | InputFormat::Markdown => {
+            | InputFormat::Markdown
+            | InputFormat::NetCdf => {
                 unreachable!("handled above")
             }
             InputFormat::DeltaTable | InputFormat::IcebergTable => {

@@ -18658,3 +18658,126 @@ fn an_html_page_without_an_extension_is_sniffed_from_its_doctype() {
     assert_eq!(doc["format"], "html");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(feature = "netcdf")]
+#[test]
+fn netcdf_groups_variables_by_dimensions_into_tidy_tables() {
+    let doc = run_json("edge_netcdf_classic.nc", &[]);
+    assert_eq!(doc["format"], "netcdf");
+    assert_eq!(
+        tables_of(&doc),
+        ["lat_lon", "scalars", "station", "time_lat_lon"]
+    );
+    // One row per cell of the grid; a column per dimension and per variable.
+    let grid = "time_lat_lon";
+    assert_eq!(
+        col_names(&doc, grid),
+        ["time", "lat", "lon", "temp", "pressure"]
+    );
+    assert_eq!(table(&doc, grid)[0]["row_count"], 48);
+    assert_eq!(table(&doc, "lat_lon")[0]["row_count"], 12);
+    // The three classic versions (32-bit offsets, 64-bit offsets, 64-bit data)
+    // read the same.
+    for other in ["offset64", "data64"] {
+        let d = run_json(&format!("edge_netcdf_{other}.nc"), &[]);
+        assert_eq!(tables_of(&d), tables_of(&doc), "{other}");
+        assert_eq!(table(&d, grid), table(&doc, grid), "{other}");
+    }
+}
+
+#[cfg(feature = "netcdf")]
+#[test]
+fn netcdf_applies_what_the_file_declares() {
+    let doc = run_json("edge_netcdf_classic.nc", &[]);
+    let grid = table(&doc, "time_lat_lon");
+    // A CF time axis ("days since 2020-01-01") becomes dates.
+    let time = column(grid, "time");
+    assert_eq!(time["ideal_type"], "NaiveDate / DateTime");
+    assert_eq!(
+        sample_names(&doc, "time_lat_lon", "time")[0],
+        "2020-01-01 00:00:00"
+    );
+    // Packed short values are unpacked with scale_factor/add_offset, and the
+    // _FillValue is missing.
+    let temp = column(grid, "temp");
+    assert_eq!(temp["ideal_type"], "f64");
+    assert_eq!(temp["description"], "Air temperature");
+    let notes = temp["notes"].as_str().unwrap();
+    assert!(
+        notes.contains("add_offset 273.15") && notes.contains("units: K"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("_FillValue -32768 reads as missing"),
+        "{notes}"
+    );
+    assert!(temp["missing_pct"].as_f64().unwrap() > 0.0);
+    // flag_values/flag_meanings are value labels.
+    let mask = column(table(&doc, "lat_lon"), "landsea");
+    assert!(
+        mask["notes"].as_str().unwrap().contains("1 = land"),
+        "{mask}"
+    );
+    // A char array is a string; its dimension is the station.
+    let names = sample_names(&doc, "station", "station_name");
+    assert_eq!(names, ["alpha", "be"]);
+}
+
+#[cfg(feature = "netcdf")]
+#[test]
+fn netcdf_record_variables_interleave_with_padding() {
+    // Four record variables of different widths (a 3-byte slab is padded to
+    // 4), and a file whose single record variable is packed without padding.
+    let sql = run_sql("edge_netcdf_multi_record.nc", &[]);
+    // `small` and `odd` share (t, x); `count` and `wide` have their own tables.
+    assert!(
+        sql.contains("(0, 0, -5, 0)") && sql.contains("(1, 2, 0, 500)"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("(3, 40)") && sql.contains("(3, 1, 3.5)"),
+        "{sql}"
+    );
+    let single = run_sql("edge_netcdf_single_record_short.nc", &[]);
+    assert!(single.contains("(4, 2, 14)"), "{single}");
+}
+
+#[cfg(feature = "netcdf")]
+#[test]
+fn netcdf_masks_fill_values_missing_values_and_nan() {
+    let doc = run_json("edge_netcdf_example_3_maskedvals.nc", &[]);
+    let t = "dim1";
+    // _FillValue 0, a _FillValue and a missing_value, only a missing_value, NaN.
+    assert_eq!(column(table(&doc, t), "var1_fillval0")["missing_pct"], 33.3);
+    assert_eq!(
+        column(table(&doc, t), "var3_fillvalAndMissingValue")["missing_pct"],
+        66.7
+    );
+    assert_eq!(
+        column(table(&doc, t), "var5_fillvalNaN")["missing_pct"],
+        33.3
+    );
+    assert_eq!(column(table(&doc, t), "var2_noFillval")["missing_pct"], 0.0);
+}
+
+#[cfg(feature = "netcdf")]
+#[test]
+fn netcdf_nrows_bounds_the_rows_and_a_cut_file_is_refused() {
+    let sql = run_sql("edge_netcdf_classic.nc", &["--nrows", "5"]);
+    assert_eq!(
+        sql.matches("2020-01-01 00:00:00'").count() >= 5,
+        true,
+        "{sql}"
+    );
+    let dir = std::env::temp_dir().join(format!("sniff-rs-nc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = std::fs::read(fixture("edge_netcdf_classic.nc")).unwrap();
+    let cut = dir.join("cut.nc");
+    std::fs::write(&cut, &bytes[..bytes.len() - 200]).unwrap();
+    let stderr = run_fails(&[cut.to_str().unwrap(), "-", "--output-format", "json"]);
+    assert!(
+        stderr.contains("cut short") || stderr.contains("past the end"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
