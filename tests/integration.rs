@@ -16225,6 +16225,52 @@ fn graph_turns_declared_foreign_keys_into_joins() {
     assert!(declared, "{}", doc["links"]);
 }
 
+#[test]
+fn graph_links_photos_by_the_photographer_and_camera_in_their_own_metadata() {
+    let run = run_graph(&[
+        "graph",
+        fixture("edge_graph_image_metadata").to_str().unwrap(),
+        "-",
+        "--no-cache",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    // One photographer by EXIF Artist, XMP in a PNG and EXIF in a WebP; one
+    // by a TIFF Artist (Latin-1), a Windows XPAuthor and a PNG Author text;
+    // and one camera that the first three share.
+    for (file, entity) in [
+        ("jane_exif.jpg", "author:jane photographer"),
+        ("jane_xmp.png", "author:jane photographer"),
+        ("jane_webp.webp", "author:jane photographer"),
+        ("orjan.tif", "author:ørjan bakke"),
+        ("orjan_xp.jpg", "author:ørjan bakke"),
+        ("orjan_text.png", "author:ørjan bakke"),
+        ("jane_exif.jpg", "camera:canon eos r5"),
+        ("jane_xmp.png", "camera:canon eos r5"),
+        ("jane_webp.webp", "camera:canon eos r5"),
+    ] {
+        assert!(
+            kg_link_any(&doc, "metadata", file, entity),
+            "{file} - {entity}"
+        );
+    }
+    // A photographer or camera only one file names is not a link, and a
+    // file with no metadata has none.
+    let links: Vec<String> = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["relation"] == "metadata")
+        .map(|l| l["source"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(links.len(), 9, "{links:?}");
+    assert!(!links.iter().any(|f| f == "lone.jpg" || f == "plain.png"));
+}
+
 // --- Compressed input recognized by content, and `diff` reading stdin ---
 
 /// A gzip-compressed CSV with no extension at all is decompressed from

@@ -18382,10 +18382,30 @@ nodes, links and communities) and only the intended differences remained.
   `MAX_HASH_POSTING` (64) columns proposes no pair, and a name shared by
   more than `MAX_NAME_GROUP` (512) tables proposes none by name alone.
 - **New links.** `duplicate_of` (content hash of byte-identical files, 100
-  copies link as a star), `metadata` (author and organization two or more
-  files name in their own properties; INFERRED), `in_folder` (with
+  copies link as a star), `metadata` (author, organization and camera two
+  or more files name in their own properties; INFERRED), `in_folder` (with
   `--folders`, a `Folder` node per directory; communities 254 to 77 on the
   corpus). Relations are now twelve.
+- **Image metadata (`image_meta`).** The author and camera of a photo come
+  from its own EXIF and XMP: JPEG (APP1), PNG (`eXIf`, `tEXt`, `iTXt`),
+  WebP (`EXIF`, `XMP `) and TIFF with the TIFF-based raw formats (`dng`,
+  `nef`, `cr2`, `arw`), found by the file's leading bytes, not its name.
+  Read: EXIF `Artist` and Windows `XPAuthor`, XMP `dc:creator`, a PNG
+  `Author` text, and `Make`/`Model` (EXIF or XMP; the camera is
+  `Make Model`, the make dropped when the model starts with it). Not read,
+  on purpose: GPS position and capture time. EXIF text is UTF-8 when valid,
+  else Windows-1252. Only the first directory of a TIFF stream is read, a
+  segment is capped at 1 MiB, and nothing after the start of a JPEG scan is
+  looked at; a damaged file gives fewer facts, never a failure. The same
+  `metadata` rules apply as for documents: a name shared by more than
+  `max(12, files / 20)` files is a default, not a link, which also keeps a
+  camera that took most of a folder from becoming a hub. Checked against
+  Pillow's own read-back on 576 random JPEG, PNG, WebP and TIFF files (EXIF,
+  XMP, `XPAuthor`, PNG text; every `metadata` link matched), and by 8 unit
+  tests (both byte orders, inline and offset values, fill bytes, every
+  truncation, 12,000 bit flips on a debug build). **Disclosed:** HEIC/AVIF,
+  Olympus and Panasonic raw (`ORF`, `RW2`: their TIFF magic differs), IPTC
+  and `zTXt` (compressed PNG text) are not read.
 - **Communities.** Louvain takes a resolution (`gain = neigh[c] -
   resolution * tot[c] * k[i] / m2`); `--resolution <X>` is a positive
   number, 1.0 the default. `community_label` weights each word by
@@ -18412,11 +18432,38 @@ through `graph_turns_declared_foreign_keys_into_joins`), the unit tests on
 Louvain, label and diff logic, a fixture sweep against the baseline graph,
 and the corpus runs above.
 
-**Not done, disclosed.** EXIF and other image metadata do not feed
-`metadata` links. Julian-calendar CF time stays raw (an earlier item).
-`detect_relationships_scored`, the dictionary-mode path behind
-`explain`/`path`/`rank` on a plain dictionary, still compares table pairs,
-so it is not on the fast path.
+**Dictionary mode no longer compares every pair.** `explain`, `path`,
+`rank` and `--combine` on a profiled dictionary (not on a directory, which
+uses the knowledge graph) enumerated every pair of columns in every pair of
+tables: 2,000 tables took 37 s, and the real corpus's 1,476-table
+dictionary 16 s. `relationship_candidates` now proposes only the column
+pairs `join_candidate` or `value_candidate` could accept, and those two
+stay the judges, so the output is byte-identical (checked on 855 fixture
+tables, the 1,476-table corpus dictionary, and three synthetic
+dictionaries) while 2,000 tables take 3.2 s and the corpus 1.6 s. The
+proposals are: the name signals (the graph's `name_candidates`, here with
+no cap on a name group), every pair of identifier columns of one kind
+(`join_candidate` links those on the domain alone, and the probability
+model keeps them), and for `value_candidate` a posting list over the
+sketch hashes of each table's own key. A column is inside a key only when
+`INCLUSION_MIN` of the hashes it shares a range with are found there, so
+one of its first few hashes is in the key: those are looked up, not all
+128. Two integer columns are paired through the table's name stems
+instead, since small integers are inside every key and the join needs the
+name to abbreviate the table anyway. A declared foreign key needs no
+proposal of its own. `relationship_candidates_miss_no_edge_a_scan_of_
+every_pair_finds` compares the result to a scan of every pair on 600
+random table sets (with every edge field, in both threshold modes), and
+mutating any part of the generator makes it fail: dropping the identifier
+pairs, the hash lookup, the integer path, either direction of the stem
+lookup, or looking up only the first hash (a case built so that a
+column's first hashes all miss the key). The cost that remains is the
+size of the output: a key-like name shared by N tables, or N identifier
+columns, is N(N-1)/2 edges whichever way they are found.
+
+**Not done, disclosed.** Julian-calendar CF time stays raw (an earlier
+item). The knowledge graph's own two caps (`MAX_HASH_POSTING`,
+`MAX_NAME_GROUP`) remain approximations; dictionary mode has none.
 
 ## Known limitations / roadmap
 

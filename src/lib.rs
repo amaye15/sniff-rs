@@ -87383,6 +87383,163 @@ fn detect_relationships_scored(
     tables: &BTreeMap<String, Vec<ColumnProfile>>,
     keep_all: bool,
 ) -> Vec<Relationship> {
+    detect_relationships_with(tables, keep_all, false)
+}
+
+/// Every column pair `(table, column)` x `(table, column)` in different
+/// tables that `join_candidate` or `value_candidate` could turn into an
+/// edge, each pair once, ordered by (first table, first column, second
+/// table, second column) - the order a scan of every pair visits them in.
+/// Those two functions stay the judges; this only decides which pairs they
+/// are asked about, so a table pair with nothing in common is never
+/// opened. A pair is proposed when:
+///
+/// - the names say so (`knowledge_graph::name_candidates`, with no cap on
+///   a name group: the same name, a bare key and the foreign key named
+///   for its table, a role-prefixed key, the same noun) - exactly the name
+///   signals `join_candidate` accepts;
+/// - both are identifiers of one kind (UUID, ULID, e-mail), under any
+///   names, since `join_candidate` links those on the domain alone;
+/// - one is a table's own key (its first column or named for the table,
+///   with nearly all distinct values) holding values the other also holds,
+///   which is the only way `value_candidate` finds a join. A value sketch
+///   keeps its smallest hashes in order, and a column sits inside a key
+///   only when `INCLUSION_MIN` of the hashes it shares a range with are
+///   found there, so the key holds at least one of the column's first few
+///   hashes: those are looked up, not every hash. Two integer columns need
+///   the name to abbreviate the key's table as well, so they are paired
+///   through the table's name stems instead (small integers are in every
+///   key);
+///
+/// A declared foreign key needs no proposal of its own: if the heuristics
+/// find an edge between the same two columns it is one of the above, and
+/// if they find none `apply_declared_keys` adds the edge itself.
+///
+/// Verified against a scan of every pair (`relationship_candidates_miss_
+/// no_edge_a_scan_of_every_pair_finds`) on random tables.
+fn relationship_candidates(
+    tables: &[(&String, &Vec<ColumnProfile>)],
+    idx: &LinkIndex,
+) -> Vec<((usize, u32), (usize, u32))> {
+    let mut found: Vec<((usize, u32), (usize, u32))> = Vec::new();
+    let named: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, (n, c))| (i, 0, n.as_str(), *c))
+        .collect();
+    let mut joinable: std::collections::BTreeSet<(u32, u32)> = std::collections::BTreeSet::new();
+    // Identifier columns by domain, key columns by sketch hash and by
+    // table-name stem, and the columns that might sit inside a key.
+    let mut identifiers: BTreeMap<String, Vec<(usize, u32)>> = BTreeMap::new();
+    let mut key_hashes: HashMap<u32, Vec<(usize, u32)>> = HashMap::new();
+    let mut int_keys: BTreeMap<String, Vec<(usize, u32)>> = BTreeMap::new();
+    for (ti, (table, cols)) in tables.iter().enumerate() {
+        for (ci, c) in cols.iter().enumerate() {
+            let Some(base) = join_base(&c.ideal_type) else {
+                continue;
+            };
+            let canon = canon_name(&c.name);
+            if !base.is_key_domain() || canon.is_empty() {
+                continue;
+            }
+            let at = (ti, ci as u32);
+            joinable.insert((ti as u32, ci as u32));
+            if base.is_identifier_domain() {
+                identifiers.entry(base.label()).or_default().push(at);
+            }
+            let is_key = c
+                .value_sketch
+                .as_ref()
+                .is_some_and(ValueSketch::looks_unique)
+                && (idx.leads(table, &c.name) || owns_key(table, &canon));
+            if is_key {
+                if base == JoinBase::Int {
+                    for stem in table_stems(table) {
+                        if stem.len() >= 3 {
+                            int_keys.entry(stem).or_default().push(at);
+                        }
+                    }
+                } else if let Some(sketch) = &c.value_sketch {
+                    for h in &sketch.hashes {
+                        key_hashes.entry(*h).or_default().push(at);
+                    }
+                }
+            }
+        }
+    }
+    found.extend(knowledge_graph::name_candidates(
+        &named,
+        &joinable,
+        idx,
+        usize::MAX,
+    ));
+    for group in identifiers.values() {
+        for (x, a) in group.iter().enumerate() {
+            for b in &group[x + 1..] {
+                found.push((*a, *b));
+            }
+        }
+    }
+    // A column sits inside a key when `INCLUSION_MIN` of the hashes it
+    // shares a range with are found there; the most it may miss among those
+    // is under `(1 - INCLUSION_MIN) * k`, so one of its first hashes is a
+    // hit (two more than that, against rounding).
+    let first = ((1.0 - INCLUSION_MIN) * VALUE_SKETCH_K as f64).floor() as usize + 2;
+    for (ti, (_, cols)) in tables.iter().enumerate() {
+        for (ci, c) in cols.iter().enumerate() {
+            let (Some(base), Some(sketch)) = (join_base(&c.ideal_type), &c.value_sketch) else {
+                continue;
+            };
+            let canon = canon_name(&c.name);
+            if !base.is_key_domain() || canon.is_empty() {
+                continue;
+            }
+            let at = (ti, ci as u32);
+            if base == JoinBase::Int {
+                let Some(head) = canon.split('_').next().filter(|h| h.len() >= 3) else {
+                    continue;
+                };
+                // A stem the head extends, then a stem that extends it.
+                for len in 3..=head.len() {
+                    if head.is_char_boundary(len)
+                        && let Some(keys) = int_keys.get(&head[..len])
+                    {
+                        found.extend(keys.iter().map(|k| (at, *k)));
+                    }
+                }
+                for (stem, keys) in int_keys.range(head.to_string()..) {
+                    if !stem.starts_with(head) {
+                        break;
+                    }
+                    found.extend(keys.iter().map(|k| (at, *k)));
+                }
+            } else {
+                for h in sketch.hashes.iter().take(first) {
+                    if let Some(keys) = key_hashes.get(h) {
+                        found.extend(keys.iter().map(|k| (at, *k)));
+                    }
+                }
+            }
+        }
+    }
+    for pair in &mut found {
+        if pair.0 > pair.1 {
+            *pair = (pair.1, pair.0);
+        }
+    }
+    found.retain(|(a, b)| a.0 != b.0);
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// `detect_relationships_scored`; `exhaustive` asks every pair of columns
+/// instead of only the candidates, which tests use to prove the two agree.
+fn detect_relationships_with(
+    tables: &BTreeMap<String, Vec<ColumnProfile>>,
+    keep_all: bool,
+    exhaustive: bool,
+) -> Vec<Relationship> {
     let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
     // Duplicate-schema groups, resolved once up front: every edge inside a
     // group is tagged `DuplicateSchema` below, so a ranking over incident
@@ -87392,8 +87549,9 @@ fn detect_relationships_scored(
     let (_, anchors) = schema_similarity(tables);
     let idx = LinkIndex::build(tables);
     // Tables grouped by anchor (a table outside every group is its own
-    // group of one), in name order. Pairs are then enumerated per group
-    // pair, so a group's copies are never even visited against each other.
+    // group of one), in name order. Pairs between groups are then proposed
+    // by `relationship_candidates`, so a group's copies are never even
+    // visited against each other.
     let position: HashMap<&String, usize> = tables_vec
         .iter()
         .enumerate()
@@ -87401,8 +87559,9 @@ fn detect_relationships_scored(
         .collect();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut group_of_anchor: HashMap<usize, usize> = HashMap::new();
+    let mut group_of = vec![0usize; tables_vec.len()];
     for (i, (t, _)) in tables_vec.iter().enumerate() {
-        match anchors.get(*t) {
+        let g = match anchors.get(*t) {
             Some(anchor) => {
                 let a = position[anchor];
                 let g = *group_of_anchor.entry(a).or_insert_with(|| {
@@ -87410,41 +87569,62 @@ fn detect_relationships_scored(
                     groups.len() - 1
                 });
                 groups[g].push(i);
+                g
             }
-            None => groups.push(vec![i]),
-        }
+            None => {
+                groups.push(vec![i]);
+                groups.len() - 1
+            }
+        };
+        group_of[i] = g;
     }
     let mut out = Vec::new();
-    let link = |i: usize, j: usize, duplicate: bool, out: &mut Vec<Relationship>| {
-        let (i, j) = if i < j { (i, j) } else { (j, i) };
+    let pair = |(i, ci): (usize, usize), (j, cj): (usize, usize), duplicate: bool| {
         let (t1, cols1) = tables_vec[i];
         let (t2, cols2) = tables_vec[j];
-        for c1 in cols1.iter() {
-            for c2 in cols2.iter() {
-                let found = join_candidate(t1, c1, t2, c2, duplicate, &idx).or_else(|| {
-                    (!duplicate)
-                        .then(|| value_candidate(t1, c1, t2, c2, &idx))
-                        .flatten()
-                });
-                if let Some(mut rel) = found {
-                    if duplicate {
-                        rel.context = EdgeContext::DuplicateSchema;
-                    }
-                    out.push(rel);
+        let (c1, c2) = (&cols1[ci], &cols2[cj]);
+        let found = join_candidate(t1, c1, t2, c2, duplicate, &idx).or_else(|| {
+            (!duplicate)
+                .then(|| value_candidate(t1, c1, t2, c2, &idx))
+                .flatten()
+        });
+        found.map(|mut rel| {
+            if duplicate {
+                rel.context = EdgeContext::DuplicateSchema;
+            }
+            rel
+        })
+    };
+    // Inside a group: the anchor (its first table) to each copy.
+    for group in &groups {
+        for &m in &group[1..] {
+            let (i, j) = (group[0].min(m), group[0].max(m));
+            for ci in 0..tables_vec[i].1.len() {
+                for cj in 0..tables_vec[j].1.len() {
+                    out.extend(pair((i, ci), (j, cj), true));
                 }
             }
         }
-    };
-    for (gi, group) in groups.iter().enumerate() {
-        // Inside a group: the anchor (its first table) to each copy.
-        for &m in &group[1..] {
-            link(group[0], m, true, &mut out);
-        }
-        for other in &groups[gi + 1..] {
-            for &a in group {
-                for &b in other {
-                    link(a, b, false, &mut out);
+    }
+    // Between groups: the pairs `relationship_candidates` proposes, or in
+    // an exhaustive run every pair.
+    if exhaustive {
+        for i in 0..tables_vec.len() {
+            for j in i + 1..tables_vec.len() {
+                if group_of[i] == group_of[j] {
+                    continue;
                 }
+                for ci in 0..tables_vec[i].1.len() {
+                    for cj in 0..tables_vec[j].1.len() {
+                        out.extend(pair((i, ci), (j, cj), false));
+                    }
+                }
+            }
+        }
+    } else {
+        for ((i, ci), (j, cj)) in relationship_candidates(&tables_vec, &idx) {
+            if group_of[i] != group_of[j] {
+                out.extend(pair((i, ci as usize), (j, cj as usize), false));
             }
         }
     }
@@ -113163,11 +113343,14 @@ mod knowledge_graph {
     }
 
     /// Who made the file, from its own properties: a PDF's information
-    /// dictionary, or the core properties of an office document.
+    /// dictionary, the core properties of an office document, or an
+    /// image's EXIF and XMP (its photographer and the camera).
     fn file_metadata(path: &Path, ext: &str) -> Vec<(String, String)> {
         let mut raw: Vec<(String, String)> = Vec::new();
         if ext == "pdf" {
             raw = pdf_document_info(path);
+        } else if image_meta::is_image_extension(ext) {
+            raw = image_meta::read(path);
         } else {
             raw.extend(package_metadata(path, ext));
         }
@@ -113176,6 +113359,7 @@ mod knowledge_graph {
             let kind = match k.as_str() {
                 "author" | "last_modified_by" | "creator" => "author",
                 "company" | "organization" => "organization",
+                "camera" => "camera",
                 _ => continue,
             };
             // A PDF's "creator" is the authoring program, not a person.
@@ -113252,6 +113436,447 @@ mod knowledge_graph {
     #[cfg(not(any(feature = "xlsx", feature = "npy")))]
     fn package_metadata(_path: &Path, _ext: &str) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    /// Who took a photo and with what, read from the file's own EXIF and
+    /// XMP: JPEG (APP1), PNG (`eXIf`, `tEXt`, `iTXt`), WebP (`EXIF`,
+    /// `XMP `) and TIFF and the TIFF-based raw formats (the first image's
+    /// directory). Found by the file's leading bytes, never its name. What
+    /// is read: the photographer (EXIF `Artist` and Windows `XPAuthor`, XMP
+    /// `dc:creator`, a PNG `Author` text) and the camera (EXIF `Make` and
+    /// `Model`, or the same two in XMP). Nothing else is read - in
+    /// particular not the GPS position or the capture time. Every length,
+    /// offset and count is checked against what is actually there, a
+    /// segment is capped at 1 MiB, and anything unreadable is left out, so
+    /// a damaged file gives fewer facts and never a failure.
+    mod image_meta {
+        use super::*;
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+
+        const MAX_SEGMENT: u64 = 1 << 20;
+        const MAX_CHUNKS: usize = 100_000;
+
+        /// File extensions whose content is looked at for EXIF/XMP.
+        pub(super) fn is_image_extension(ext: &str) -> bool {
+            matches!(
+                ext,
+                "jpg"
+                    | "jpeg"
+                    | "jpe"
+                    | "jfif"
+                    | "png"
+                    | "webp"
+                    | "tif"
+                    | "tiff"
+                    | "dng"
+                    | "nef"
+                    | "cr2"
+                    | "arw"
+            )
+        }
+
+        #[derive(Default)]
+        pub(super) struct Found {
+            authors: Vec<String>,
+            make: Option<String>,
+            model: Option<String>,
+        }
+
+        impl Found {
+            fn author(&mut self, name: &str) {
+                let name = name.trim();
+                if !name.is_empty() && !self.authors.iter().any(|a| a == name) {
+                    self.authors.push(name.to_string());
+                }
+            }
+
+            fn camera(&mut self, make: Option<String>, model: Option<String>) {
+                if self.make.is_none() {
+                    self.make = make.filter(|m| !m.is_empty());
+                }
+                if self.model.is_none() {
+                    self.model = model.filter(|m| !m.is_empty());
+                }
+            }
+
+            /// `author` and `camera` pairs. A camera is its make and model,
+            /// the make left out when the model already starts with it
+            /// (`Canon` and `Canon EOS R5` are one name).
+            pub(super) fn into_pairs(self) -> Vec<(String, String)> {
+                let mut out: Vec<(String, String)> = self
+                    .authors
+                    .into_iter()
+                    .map(|a| ("author".to_string(), a))
+                    .collect();
+                let camera = match (self.make, self.model) {
+                    (Some(make), Some(model)) => {
+                        if model.to_lowercase().starts_with(&make.to_lowercase()) {
+                            Some(model)
+                        } else {
+                            Some(format!("{make} {model}"))
+                        }
+                    }
+                    (Some(one), None) | (None, Some(one)) => Some(one),
+                    (None, None) => None,
+                };
+                if let Some(c) = camera {
+                    out.push(("camera".to_string(), c));
+                }
+                out
+            }
+        }
+
+        pub(super) fn read(path: &Path) -> Vec<(String, String)> {
+            let Ok(mut file) = fs::File::open(path) else {
+                return Vec::new();
+            };
+            scan(&mut file).into_pairs()
+        }
+
+        pub(super) fn scan<R: Read + Seek>(src: &mut R) -> Found {
+            let mut found = Found::default();
+            let mut head = [0u8; 12];
+            if src.read_exact(&mut head).is_err() {
+                return found;
+            }
+            let _ = src.seek(SeekFrom::Start(0));
+            if head[..3] == [0xFF, 0xD8, 0xFF] {
+                jpeg(src, &mut found);
+            } else if head[..8] == [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A] {
+                png(src, &mut found);
+            } else if &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+                webp(src, &mut found);
+            } else if head[..4] == [b'I', b'I', 42, 0] || head[..4] == [b'M', b'M', 0, 42] {
+                tiff(src, &mut found);
+            }
+            found
+        }
+
+        /// EXIF text is 7-bit ASCII by the standard, but cameras and
+        /// software write UTF-8 or a Western code page into it: UTF-8 when
+        /// the bytes are valid UTF-8, else Windows-1252 (the same rule a
+        /// text file gets), never a replacement character.
+        fn single_byte_text(bytes: &[u8]) -> String {
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => match codepage_support::table("windows-1252") {
+                    Some(t) => codepage_support::decode(t, bytes),
+                    None => bytes.iter().map(|b| char::from(*b)).collect(),
+                },
+            }
+        }
+
+        /// `len` bytes at the reader's position, if that many exist and the
+        /// length is within the cap.
+        fn take<R: Read>(src: &mut R, len: u64) -> Option<Vec<u8>> {
+            if len > MAX_SEGMENT {
+                return None;
+            }
+            let mut buf = Vec::new();
+            src.take(len).read_to_end(&mut buf).ok()?;
+            (buf.len() as u64 == len).then_some(buf)
+        }
+
+        fn skip<R: Seek>(src: &mut R, len: u64) -> Option<()> {
+            src.seek(SeekFrom::Current(i64::try_from(len).ok()?)).ok()?;
+            Some(())
+        }
+
+        fn jpeg<R: Read + Seek>(src: &mut R, found: &mut Found) {
+            if src.seek(SeekFrom::Start(2)).is_err() {
+                return;
+            }
+            for _ in 0..512 {
+                let mut b = [0u8; 1];
+                // A marker is 0xFF, any number of 0xFF fill bytes, then its
+                // code.
+                loop {
+                    if src.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    if b[0] == 0xFF {
+                        break;
+                    }
+                }
+                let mut code = 0xFF;
+                while code == 0xFF {
+                    if src.read_exact(&mut b).is_err() {
+                        return;
+                    }
+                    code = b[0];
+                }
+                match code {
+                    // Start of scan, end of image: the metadata is behind us.
+                    0xD9 | 0xDA => return,
+                    // Standalone markers carry no length.
+                    0x00 | 0x01 | 0xD0..=0xD8 => continue,
+                    _ => {}
+                }
+                let mut len = [0u8; 2];
+                if src.read_exact(&mut len).is_err() {
+                    return;
+                }
+                let len = u64::from(u16::from_be_bytes(len));
+                if len < 2 {
+                    return;
+                }
+                let payload = len - 2;
+                if code != 0xE1 {
+                    if skip(src, payload).is_none() {
+                        return;
+                    }
+                    continue;
+                }
+                let Some(data) = take(src, payload) else {
+                    return;
+                };
+                if let Some(tiff_bytes) = data.strip_prefix(b"Exif\0\0") {
+                    exif(tiff_bytes, found);
+                } else if let Some(xmp_bytes) = data.strip_prefix(b"http://ns.adobe.com/xap/1.0/\0")
+                {
+                    xmp(&String::from_utf8_lossy(xmp_bytes), found);
+                }
+            }
+        }
+
+        fn png<R: Read + Seek>(src: &mut R, found: &mut Found) {
+            if src.seek(SeekFrom::Start(8)).is_err() {
+                return;
+            }
+            for _ in 0..MAX_CHUNKS {
+                let mut h = [0u8; 8];
+                if src.read_exact(&mut h).is_err() {
+                    return;
+                }
+                let len = u64::from(u32::from_be_bytes([h[0], h[1], h[2], h[3]]));
+                let kind = [h[4], h[5], h[6], h[7]];
+                let wanted = matches!(&kind, b"eXIf" | b"tEXt" | b"iTXt");
+                if &kind == b"IEND" {
+                    return;
+                }
+                if !wanted || len > MAX_SEGMENT {
+                    if skip(src, len + 4).is_none() {
+                        return;
+                    }
+                    continue;
+                }
+                let Some(data) = take(src, len) else {
+                    return;
+                };
+                if skip(src, 4).is_none() {
+                    return;
+                }
+                match &kind {
+                    b"eXIf" => exif(&data, found),
+                    b"tEXt" => {
+                        if let Some(nul) = data.iter().position(|b| *b == 0) {
+                            let keyword = &data[..nul];
+                            if keyword.eq_ignore_ascii_case(b"author") {
+                                let text: String =
+                                    data[nul + 1..].iter().map(|b| char::from(*b)).collect();
+                                found.author(&text);
+                            }
+                        }
+                    }
+                    _ => {
+                        // iTXt: keyword, NUL, compression flag, method,
+                        // language tag, NUL, translated keyword, NUL, text.
+                        let Some(nul) = data.iter().position(|b| *b == 0) else {
+                            continue;
+                        };
+                        let keyword = &data[..nul];
+                        let rest = &data[nul + 1..];
+                        if rest.len() < 2 || rest[0] != 0 {
+                            continue;
+                        }
+                        let rest = &rest[2..];
+                        let Some(l) = rest.iter().position(|b| *b == 0) else {
+                            continue;
+                        };
+                        let rest = &rest[l + 1..];
+                        let Some(t) = rest.iter().position(|b| *b == 0) else {
+                            continue;
+                        };
+                        let text = String::from_utf8_lossy(&rest[t + 1..]).into_owned();
+                        if keyword == b"XML:com.adobe.xmp" {
+                            xmp(&text, found);
+                        } else if keyword.eq_ignore_ascii_case(b"author") {
+                            found.author(&text);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn webp<R: Read + Seek>(src: &mut R, found: &mut Found) {
+            if src.seek(SeekFrom::Start(12)).is_err() {
+                return;
+            }
+            for _ in 0..MAX_CHUNKS {
+                let mut h = [0u8; 8];
+                if src.read_exact(&mut h).is_err() {
+                    return;
+                }
+                let len = u64::from(u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
+                let padded = len + (len & 1);
+                let kind = [h[0], h[1], h[2], h[3]];
+                if !matches!(&kind, b"EXIF" | b"XMP ") || len > MAX_SEGMENT {
+                    if skip(src, padded).is_none() {
+                        return;
+                    }
+                    continue;
+                }
+                let Some(data) = take(src, len) else {
+                    return;
+                };
+                if skip(src, padded - len).is_none() {
+                    return;
+                }
+                if &kind == b"EXIF" {
+                    exif(data.strip_prefix(b"Exif\0\0").unwrap_or(&data), found);
+                } else {
+                    xmp(&String::from_utf8_lossy(&data), found);
+                }
+            }
+        }
+
+        fn tiff<R: Read + Seek>(src: &mut R, found: &mut Found) {
+            ifd0(src, found);
+        }
+
+        fn exif(data: &[u8], found: &mut Found) {
+            ifd0(&mut Cursor::new(data), found);
+        }
+
+        /// The first image directory of a TIFF stream: `Make`, `Model`,
+        /// `Artist` and the Windows `XPAuthor`. Offsets are from the start
+        /// of the stream.
+        fn ifd0<R: Read + Seek>(src: &mut R, found: &mut Found) {
+            if src.seek(SeekFrom::Start(0)).is_err() {
+                return;
+            }
+            let Some(head) = take(src, 8) else {
+                return;
+            };
+            let big = match &head[..2] {
+                b"II" => false,
+                b"MM" => true,
+                _ => return,
+            };
+            let u16_at = |b: &[u8]| {
+                let a = [b[0], b[1]];
+                if big {
+                    u16::from_be_bytes(a)
+                } else {
+                    u16::from_le_bytes(a)
+                }
+            };
+            let u32_at = |b: &[u8]| {
+                let a = [b[0], b[1], b[2], b[3]];
+                if big {
+                    u32::from_be_bytes(a)
+                } else {
+                    u32::from_le_bytes(a)
+                }
+            };
+            if u16_at(&head[2..4]) != 42 {
+                return;
+            }
+            let first = u64::from(u32_at(&head[4..8]));
+            if src.seek(SeekFrom::Start(first)).is_err() {
+                return;
+            }
+            let Some(count) = take(src, 2) else {
+                return;
+            };
+            let count = u64::from(u16_at(&count)).min(1024);
+            let Some(entries) = take(src, count * 12) else {
+                return;
+            };
+            let (mut make, mut model) = (None, None);
+            for i in 0..entries.len() / 12 {
+                let e = &entries[i * 12..i * 12 + 12];
+                let tag = u16_at(&e[0..2]);
+                if !matches!(tag, 0x010F | 0x0110 | 0x013B | 0x9C9D) {
+                    continue;
+                }
+                let kind = u16_at(&e[2..4]);
+                let n = u64::from(u32_at(&e[4..8]));
+                // ASCII, BYTE and UNDEFINED values are one byte each.
+                if !matches!(kind, 1 | 2 | 7) || n == 0 || n > 4096 {
+                    continue;
+                }
+                let value = if n <= 4 {
+                    e[8..8 + n as usize].to_vec()
+                } else {
+                    let at = u64::from(u32_at(&e[8..12]));
+                    if src.seek(SeekFrom::Start(at)).is_err() {
+                        continue;
+                    }
+                    match take(src, n) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                };
+                if tag == 0x9C9D {
+                    // UTF-16LE, whatever the file's byte order.
+                    let units: Vec<u16> = (0..value.len() / 2)
+                        .map(|i| u16::from_le_bytes([value[2 * i], value[2 * i + 1]]))
+                        .take_while(|u| *u != 0)
+                        .collect();
+                    // Windows separates several authors with semicolons.
+                    for name in String::from_utf16_lossy(&units).split(';') {
+                        found.author(name);
+                    }
+                    continue;
+                }
+                let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+                let text = single_byte_text(&value[..end]).trim().to_string();
+                match tag {
+                    0x010F => make = Some(text),
+                    0x0110 => model = Some(text),
+                    _ => found.author(&text),
+                }
+            }
+            found.camera(make, model);
+        }
+
+        /// `dc:creator` (a list of names) and the TIFF make and model, from
+        /// an XMP packet, whether written as elements or as attributes.
+        fn xmp(xml: &str, found: &mut Found) {
+            if let Some(a) = xml.find("<dc:creator")
+                && let Some(b) = xml[a..].find("</dc:creator>")
+            {
+                let block = &xml[a..a + b];
+                let mut rest = block;
+                while let Some(i) = rest.find("<rdf:li") {
+                    let after = &rest[i..];
+                    let Some(open) = after.find('>') else {
+                        break;
+                    };
+                    let body = &after[open + 1..];
+                    let Some(close) = body.find("</rdf:li>") else {
+                        break;
+                    };
+                    found.author(&xml_unescape_text(&body[..close]));
+                    rest = &body[close..];
+                }
+            }
+            let value = |name: &str| -> Option<String> {
+                let attr = format!("{name}=\"");
+                if let Some(a) = xml.find(&attr) {
+                    let tail = &xml[a + attr.len()..];
+                    let end = tail.find('"')?;
+                    return Some(xml_unescape_text(&tail[..end]).trim().to_string());
+                }
+                let open = format!("<{name}>");
+                let a = xml.find(&open)?;
+                let tail = &xml[a + open.len()..];
+                let end = tail.find(&format!("</{name}>"))?;
+                Some(xml_unescape_text(&tail[..end]).trim().to_string())
+            };
+            found.camera(value("tiff:Make"), value("tiff:Model"));
+        }
     }
 
     fn read_one_inner(
@@ -113524,7 +114149,6 @@ mod knowledge_graph {
         out
     }
 
-    #[cfg(any(feature = "xlsx", feature = "npy"))]
     /// XML character references and the five predefined entities.
     fn xml_unescape_text(s: &str) -> String {
         if !s.contains('&') {
@@ -115332,7 +115956,7 @@ mod knowledge_graph {
             i = j;
         }
         drop(entries);
-        for ((ta, ca), (tb, cb)) in name_candidates(tables, &joinable, idx) {
+        for ((ta, ca), (tb, cb)) in name_candidates(tables, &joinable, idx, MAX_NAME_GROUP) {
             if skip(ta, tb) {
                 continue;
             }
@@ -115365,10 +115989,11 @@ mod knowledge_graph {
     /// the same noun. The name signals `join_candidate` weighs, applied to
     /// every joinable column - only columns of a compatible kind (numbers
     /// with numbers, text and identifiers with each other) are paired.
-    fn name_candidates(
+    pub(crate) fn name_candidates(
         tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
         cols: &BTreeSet<(u32, u32)>,
         idx: &LinkIndex,
+        max_group: usize,
     ) -> Vec<((usize, u32), (usize, u32))> {
         if cols.is_empty() {
             return Vec::new();
@@ -115439,7 +116064,7 @@ mod knowledge_graph {
                 continue;
             }
             let marked = has_key_marker(name);
-            if marked && group.len() <= MAX_NAME_GROUP {
+            if marked && group.len() <= max_group {
                 for x in 0..group.len() {
                     for y in x + 1..group.len() {
                         out.push((at(group[x]), at(group[y])));
@@ -115472,7 +116097,7 @@ mod knowledge_graph {
             }
             let groups: Vec<&Vec<usize>> = names.values().collect();
             let total: usize = groups.iter().map(|g| g.len()).sum();
-            if total > MAX_NAME_GROUP {
+            if total > max_group {
                 continue;
             }
             for x in 0..groups.len() {
@@ -115492,7 +116117,7 @@ mod knowledge_graph {
             }
             for form in table_stem_forms(tables[c.table].2) {
                 if let Some(group) = by_fk.get(&(c.class, form.as_str())) {
-                    if group.len() > MAX_NAME_GROUP {
+                    if group.len() > max_group {
                         continue;
                     }
                     for &g in group {
@@ -115510,7 +116135,7 @@ mod knowledge_graph {
                     break;
                 }
                 if let Some(group) = by_canon.get(&(c.class, rest))
-                    && group.len() <= MAX_NAME_GROUP
+                    && group.len() <= max_group
                 {
                     for &g in group {
                         out.push(((c.table, c.col), at(g)));
@@ -119112,6 +119737,260 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     }
 
     #[cfg(test)]
+    mod image_meta_tests {
+        use super::image_meta::{Found, scan};
+        use std::io::Cursor;
+
+        /// A TIFF stream (either byte order) with `entries` of (tag, type,
+        /// bytes); a value over four bytes goes after the directory.
+        fn tiff(big: bool, entries: &[(u16, u16, &[u8])]) -> Vec<u8> {
+            let u16b = |v: u16| {
+                if big {
+                    v.to_be_bytes()
+                } else {
+                    v.to_le_bytes()
+                }
+            };
+            let u32b = |v: u32| {
+                if big {
+                    v.to_be_bytes()
+                } else {
+                    v.to_le_bytes()
+                }
+            };
+            let mut out = Vec::new();
+            out.extend_from_slice(if big { b"MM" } else { b"II" });
+            out.extend_from_slice(&u16b(42));
+            out.extend_from_slice(&u32b(8));
+            out.extend_from_slice(&u16b(entries.len() as u16));
+            let mut tail = Vec::new();
+            let data_start = 8 + 2 + 12 * entries.len() + 4;
+            for (tag, kind, value) in entries {
+                out.extend_from_slice(&u16b(*tag));
+                out.extend_from_slice(&u16b(*kind));
+                out.extend_from_slice(&u32b(value.len() as u32));
+                if value.len() <= 4 {
+                    let mut inline = value.to_vec();
+                    inline.resize(4, 0);
+                    out.extend_from_slice(&inline);
+                } else {
+                    out.extend_from_slice(&u32b((data_start + tail.len()) as u32));
+                    tail.extend_from_slice(value);
+                }
+            }
+            out.extend_from_slice(&u32b(0));
+            out.extend_from_slice(&tail);
+            out
+        }
+
+        fn pairs(bytes: &[u8]) -> Vec<(String, String)> {
+            scan(&mut Cursor::new(bytes.to_vec())).into_pairs()
+        }
+
+        fn kv(k: &str, v: &str) -> (String, String) {
+            (k.to_string(), v.to_string())
+        }
+
+        fn jpeg(app1: &[&[u8]]) -> Vec<u8> {
+            let mut out = vec![0xFF, 0xD8];
+            // An APP0 first, as a JFIF file has, then 0xFF fill bytes.
+            out.extend_from_slice(&[0xFF, 0xE0, 0, 7, b'J', b'F', b'I', b'F', 0]);
+            out.extend_from_slice(&[0xFF, 0xFF]);
+            for seg in app1 {
+                out.extend_from_slice(&[0xFF, 0xE1]);
+                out.extend_from_slice(&((seg.len() + 2) as u16).to_be_bytes());
+                out.extend_from_slice(seg);
+            }
+            out
+        }
+
+        #[test]
+        fn exif_reads_artist_make_and_model_in_either_byte_order() {
+            for big in [false, true] {
+                let t = tiff(
+                    big,
+                    &[
+                        (0x010F, 2, b"Canon\0"),
+                        (0x0110, 2, b"Canon EOS R5\0"),
+                        // Three bytes, so it sits inside the entry.
+                        (0x013B, 2, b"Al\0"),
+                        // The GPS pointer is skipped, not read.
+                        (0x8825, 4, &[1, 2, 3, 4]),
+                    ],
+                );
+                let mut app1 = b"Exif\0\0".to_vec();
+                app1.extend_from_slice(&t);
+                assert_eq!(
+                    pairs(&jpeg(&[&app1])),
+                    vec![kv("author", "Al"), kv("camera", "Canon EOS R5")],
+                    "big-endian {big}"
+                );
+                // A bare TIFF file reads the same way.
+                assert_eq!(pairs(&t), pairs(&jpeg(&[&app1])));
+            }
+        }
+
+        #[test]
+        fn camera_name_does_not_repeat_the_make() {
+            let make_only = tiff(false, &[(0x010F, 2, b"Leica\0")]);
+            assert_eq!(pairs(&make_only), vec![kv("camera", "Leica")]);
+            let both = tiff(
+                false,
+                &[(0x010F, 2, b"Apple\0"), (0x0110, 2, b"iPhone 13\0")],
+            );
+            assert_eq!(pairs(&both), vec![kv("camera", "Apple iPhone 13")]);
+            let same = tiff(
+                false,
+                &[
+                    (0x010F, 2, b"NIKON CORPORATION\0"),
+                    (0x0110, 2, b"NIKON D850\0"),
+                ],
+            );
+            assert_eq!(
+                pairs(&same),
+                vec![kv("camera", "NIKON CORPORATION NIKON D850")]
+            );
+        }
+
+        #[test]
+        fn exif_text_is_utf8_or_windows_1252_never_a_replacement_character() {
+            let latin = tiff(false, &[(0x013B, 2, b"\xd8rjan Bakke\0")]);
+            assert_eq!(pairs(&latin), vec![kv("author", "Ørjan Bakke")]);
+            let utf8 = tiff(false, &[(0x013B, 2, "Ørjan Bakke\0".as_bytes())]);
+            assert_eq!(pairs(&utf8), vec![kv("author", "Ørjan Bakke")]);
+        }
+
+        #[test]
+        fn xp_author_is_utf16_and_may_list_several_people() {
+            let units: Vec<u8> = "Ana Souza;李明"
+                .encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            for big in [false, true] {
+                let t = tiff(big, &[(0x9C9D, 1, &units)]);
+                assert_eq!(
+                    pairs(&t),
+                    vec![kv("author", "Ana Souza"), kv("author", "李明")]
+                );
+            }
+        }
+
+        #[test]
+        fn xmp_creators_and_camera_come_from_elements_or_attributes() {
+            let xml = "<x:xmpmeta><rdf:Description tiff:Make=\"Sony\">\
+                <tiff:Model>ILCE-7M3</tiff:Model>\
+                <dc:creator><rdf:Seq><rdf:li xml:lang=\"x-default\">Jane &amp; Co</rdf:li>\
+                <rdf:li>Bob Lee</rdf:li></rdf:Seq></dc:creator>\
+                </rdf:Description></x:xmpmeta>";
+            let mut seg = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+            seg.extend_from_slice(xml.as_bytes());
+            assert_eq!(
+                pairs(&jpeg(&[&seg])),
+                vec![
+                    kv("author", "Jane & Co"),
+                    kv("author", "Bob Lee"),
+                    kv("camera", "Sony ILCE-7M3")
+                ]
+            );
+        }
+
+        #[test]
+        fn nothing_after_the_start_of_scan_is_read() {
+            let t = tiff(false, &[(0x013B, 2, b"Early Bird\0")]);
+            let mut app1 = b"Exif\0\0".to_vec();
+            app1.extend_from_slice(&t);
+            let mut bytes = jpeg(&[]);
+            // Start of scan, then a segment that looks like an APP1.
+            bytes.extend_from_slice(&[0xFF, 0xDA, 0, 2]);
+            bytes.extend_from_slice(&[0xFF, 0xE1]);
+            bytes.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
+            bytes.extend_from_slice(&app1);
+            assert!(pairs(&bytes).is_empty());
+        }
+
+        #[test]
+        fn png_and_webp_carry_the_same_facts() {
+            let t = tiff(false, &[(0x013B, 2, b"Pat Doe\0")]);
+            let chunk = |kind: &[u8; 4], data: &[u8]| {
+                let mut c = (data.len() as u32).to_be_bytes().to_vec();
+                c.extend_from_slice(kind);
+                c.extend_from_slice(data);
+                c.extend_from_slice(&[0, 0, 0, 0]);
+                c
+            };
+            let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            png.extend(chunk(b"IHDR", &[0; 13]));
+            png.extend(chunk(b"eXIf", &t));
+            png.extend(chunk(b"tEXt", b"Author\0Sam Roe"));
+            png.extend(chunk(b"IEND", &[]));
+            assert_eq!(
+                pairs(&png),
+                vec![kv("author", "Pat Doe"), kv("author", "Sam Roe")]
+            );
+            let mut webp = b"RIFF".to_vec();
+            webp.extend_from_slice(&[0, 0, 0, 0]);
+            webp.extend_from_slice(b"WEBP");
+            let mut exif = b"Exif\0\0".to_vec();
+            exif.extend_from_slice(&t);
+            webp.extend_from_slice(b"EXIF");
+            webp.extend_from_slice(&(exif.len() as u32).to_le_bytes());
+            webp.extend_from_slice(&exif);
+            if exif.len() % 2 == 1 {
+                webp.push(0);
+            }
+            assert_eq!(pairs(&webp), vec![kv("author", "Pat Doe")]);
+        }
+
+        #[test]
+        fn damaged_images_give_fewer_facts_and_never_a_panic() {
+            let t = tiff(
+                false,
+                &[
+                    (0x010F, 2, b"Canon\0"),
+                    (0x0110, 2, b"Canon EOS R5\0"),
+                    (0x013B, 2, b"Jane Photographer\0"),
+                ],
+            );
+            let mut app1 = b"Exif\0\0".to_vec();
+            app1.extend_from_slice(&t);
+            let mut xmp = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+            xmp.extend_from_slice(
+                b"<dc:creator><rdf:Seq><rdf:li>Jane</rdf:li></rdf:Seq></dc:creator>",
+            );
+            let samples = vec![jpeg(&[&app1, &xmp]), t.clone(), {
+                let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+                png.extend_from_slice(&(t.len() as u32).to_be_bytes());
+                png.extend_from_slice(b"eXIf");
+                png.extend_from_slice(&t);
+                png.extend_from_slice(&[0; 4]);
+                png
+            }];
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            for sample in &samples {
+                for end in 0..=sample.len() {
+                    let _ = pairs(&sample[..end]);
+                }
+                for _ in 0..3000 {
+                    let mut bytes = sample.clone();
+                    for _ in 0..1 + next() % 4 {
+                        let at = (next() % bytes.len() as u64) as usize;
+                        bytes[at] ^= 1 << (next() % 8);
+                    }
+                    let _ = pairs(&bytes);
+                }
+            }
+            let _ = Found::default();
+        }
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
 
@@ -119703,8 +120582,9 @@ USAGE:
       similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED)
       same_name    files sharing a name stem (report.pdf / report.docx)
       duplicate_of byte-identical files (EXTRACTED, found by content hash)
-      metadata     an author or organization two or more files name in
-                   their own properties (INFERRED)
+      metadata     an author, organization or camera two or more files
+                   name in their own properties: a PDF's or office
+                   document's, or a photo's EXIF and XMP (INFERRED)
       in_folder    with --folders: a file and the folder it is kept in
 
     Every data format sniff-rs reads is profiled; any other text file (txt,
@@ -130680,6 +131560,269 @@ mod tests {
             promo.score,
             region.score
         );
+    }
+
+    /// Tables drawn from small pools of the names, types and values the
+    /// candidate rules care about: bare keys, foreign keys with and without
+    /// role prefixes, plurals and warehouse decoration, identifier domains,
+    /// integer ids that do and do not abbreviate a table, unique and
+    /// repeating values (so sketches contain each other), copies of one
+    /// schema, and declared keys.
+    fn random_relationship_tables(seed: u64) -> BTreeMap<String, Vec<ColumnProfile>> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        const TABLES: [&str; 12] = [
+            "customers",
+            "customer",
+            "dim_customer",
+            "orders",
+            "stg_orders",
+            "order_items",
+            "shippers",
+            "staff",
+            "people",
+            "a__customers",
+            "b__customers",
+            "categories",
+        ];
+        const NAMES: [&str; 26] = [
+            "id",
+            "uuid",
+            "customer_id",
+            "customerId",
+            "customer",
+            "customer_uuid",
+            "parent_customer_id",
+            "manager_staff_id",
+            "staff_id",
+            "order_id",
+            "ship_via",
+            "shipper_id",
+            "category_id",
+            "person_id",
+            "email",
+            "contact_email",
+            "owner_uuid",
+            "country_code",
+            "name",
+            "amount",
+            "active",
+            "code",
+            "sku",
+            "state_name",
+            "region",
+            "Unnamed: 0",
+        ];
+        const TYPES: [&str; 8] = [
+            "i64",
+            "i64",
+            "String",
+            "String",
+            "UUID",
+            "Email",
+            "enum / category",
+            "f64",
+        ];
+        let mut tables = BTreeMap::new();
+        let n_tables = 3 + next(8);
+        let mut schemas: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+        for _ in 0..n_tables {
+            let name = TABLES[next(TABLES.len())].to_string();
+            let name = if tables.contains_key(&name) {
+                format!("{name}_{}", next(1000))
+            } else {
+                name
+            };
+            // Now and then a table copies an earlier one's schema.
+            let shape: Vec<(usize, usize, usize)> = if !schemas.is_empty() && next(6) == 0 {
+                schemas[next(schemas.len())].clone()
+            } else {
+                (0..1 + next(5))
+                    .map(|_| (next(NAMES.len()), next(TYPES.len()), next(5)))
+                    .collect()
+            };
+            schemas.push(shape.clone());
+            let mut cols: Vec<ColumnProfile> = Vec::new();
+            for (n, t, v) in shape {
+                // Column names repeat inside a table now and then, as a
+                // header with duplicate names does.
+                let values: Vec<String> = match (TYPES[t], v) {
+                    ("UUID", _) => (0..1 + next(3))
+                        .map(|_| format!("00000000-0000-0000-0000-00000000000{}", next(4)))
+                        .collect(),
+                    ("Email", _) => (0..1 + next(3))
+                        .map(|_| format!("u{}@example.org", next(4)))
+                        .collect(),
+                    (_, 0) => (1..=1 + next(150)).map(|i| i.to_string()).collect(),
+                    (_, 1) => (0..3 + next(60)).map(|i| format!("AC-{:04}", i)).collect(),
+                    (_, 2) => (0..40).map(|_| format!("AC-{:04}", next(6))).collect(),
+                    (_, 3) => (0..200).map(|_| format!("AC-{:04}", next(300))).collect(),
+                    _ => Vec::new(),
+                };
+                let values = if TYPES[t] == "i64" && v == 4 {
+                    // Repeating ids drawn from a range: a foreign key's shape.
+                    (0..60).map(|_| (1 + next(40)).to_string()).collect()
+                } else if TYPES[t] == "i64" && v >= 1 {
+                    (1..=1 + next(150)).map(|i| i.to_string()).collect()
+                } else if TYPES[t] == "f64" || TYPES[t] == "enum / category" {
+                    (0..3).map(|i| format!("{i}.5")).collect()
+                } else {
+                    values
+                };
+                let mut col = sketched(NAMES[n], TYPES[t], &values);
+                if values.is_empty() {
+                    col.value_sketch = None;
+                }
+                cols.push(col);
+            }
+            tables.insert(name, cols);
+        }
+        // A few declared keys between existing columns.
+        let names: Vec<String> = tables.keys().cloned().collect();
+        for _ in 0..next(3) {
+            let (from, to) = (&names[next(names.len())], &names[next(names.len())]);
+            if from == to {
+                continue;
+            }
+            let target_cols = tables[to].clone();
+            if target_cols.is_empty() {
+                continue;
+            }
+            let target = target_cols[next(target_cols.len())].name.clone();
+            let cols = tables.get_mut(from).unwrap();
+            let i = next(cols.len().max(1)).min(cols.len().saturating_sub(1));
+            if let Some(c) = cols.get_mut(i) {
+                c.references.push(ColumnRef {
+                    table: to.clone(),
+                    column: target,
+                    composite: Vec::new(),
+                });
+            }
+        }
+        tables
+    }
+
+    fn relationship_fingerprint(edges: &[Relationship]) -> Vec<String> {
+        edges
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}.{}|{}.{}|{:?}|{:?}|{}|{:.6}|{:.3}|{:?}|{}",
+                    e.from_table,
+                    e.from_column,
+                    e.to_table,
+                    e.to_column,
+                    e.confidence,
+                    e.context,
+                    e.reference.as_ref().map_or(String::new(), |r| format!(
+                        "{}.{}>{}.{}",
+                        r.referencing_table,
+                        r.referencing_column,
+                        r.referenced_table,
+                        r.referenced_column
+                    )),
+                    e.probability,
+                    e.score,
+                    e.evidence,
+                    e.reason
+                )
+            })
+            .collect()
+    }
+
+    fn assert_candidates_match_a_scan(tables: &BTreeMap<String, Vec<ColumnProfile>>) -> usize {
+        let fast = detect_relationships_with(tables, true, false);
+        let scan = detect_relationships_with(tables, true, true);
+        assert_eq!(
+            relationship_fingerprint(&fast),
+            relationship_fingerprint(&scan)
+        );
+        scan.len()
+    }
+
+    #[test]
+    fn candidates_find_a_value_join_whose_first_hashes_all_miss() {
+        // `ref_code` holds `key_code`'s values plus three that sort before
+        // every one of them: its first three hashes are not in the key,
+        // yet 125 of its 128 are, so it is still inside (95% or more).
+        let key: Vec<String> = (0..1000).map(|i| format!("K{i:05}")).collect();
+        let key_sketch = {
+            let mut s = ValueSketch::default();
+            for v in &key {
+                s.push(v);
+            }
+            s
+        };
+        let mut extras: Vec<(u32, String)> = (0..40_000)
+            .map(|i| format!("X{i:05}"))
+            .map(|v| {
+                let mut s = ValueSketch::default();
+                s.push(&v);
+                (s.hashes[0], v)
+            })
+            .collect();
+        extras.sort();
+        let mut values = key.clone();
+        values.extend(extras.iter().take(3).map(|(_, v)| v.clone()));
+        let repeated: Vec<String> = values.iter().chain(values.iter()).cloned().collect();
+        let mut referencing = sketched("legacy_ref", "String", &repeated);
+        referencing.sample_values.clear();
+        let mut owner = sketched("key_code", "String", &key);
+        owner.sample_values.clear();
+        assert!(key_sketch.looks_unique());
+        let tables = rel_tables(&[
+            ("zeta", vec![rel_col("filler", "i64", &[]), referencing]),
+            ("alpha", vec![owner]),
+        ]);
+        let n = assert_candidates_match_a_scan(&tables);
+        assert!(n >= 1, "the join was not found at all");
+    }
+
+    #[test]
+    fn candidates_find_an_integer_join_through_an_abbreviated_table_name() {
+        let ids: Vec<String> = (1..=60).map(|i| i.to_string()).collect();
+        let repeating: Vec<String> = (0..120).map(|i| (1 + i % 40).to_string()).collect();
+        let tables = rel_tables(&[
+            ("shippers", vec![sketched("code", "i64", &ids)]),
+            ("orders", vec![sketched("ship_via", "i64", &repeating)]),
+            ("noise", vec![sketched("total", "i64", &repeating)]),
+        ]);
+        let n = assert_candidates_match_a_scan(&tables);
+        assert!(n >= 1, "the join was not found at all");
+        // The other way round: the column's head is the longer word
+        // (`orders_ref` against a table called `ord`).
+        let tables = rel_tables(&[
+            ("ord", vec![sketched("code", "i64", &ids)]),
+            ("lines", vec![sketched("orders_ref", "i64", &repeating)]),
+        ]);
+        let n = assert_candidates_match_a_scan(&tables);
+        assert!(n >= 1, "the join was not found at all");
+    }
+
+    #[test]
+    fn relationship_candidates_miss_no_edge_a_scan_of_every_pair_finds() {
+        let mut edges_seen = 0;
+        for seed in 1..=600u64 {
+            let tables = random_relationship_tables(seed);
+            for keep_all in [false, true] {
+                let fast = detect_relationships_with(&tables, keep_all, false);
+                let scan = detect_relationships_with(&tables, keep_all, true);
+                edges_seen += scan.len();
+                assert_eq!(
+                    relationship_fingerprint(&fast),
+                    relationship_fingerprint(&scan),
+                    "seed {seed}, keep_all {keep_all}"
+                );
+            }
+        }
+        // The generator has to produce edges of every sort, or agreeing
+        // proves nothing.
+        assert!(edges_seen > 3_000, "only {edges_seen} edges");
     }
 
     #[test]

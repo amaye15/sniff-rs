@@ -18,6 +18,11 @@ All notable changes to sniff-rs are documented here. Format follows
   `in_folder`. A SQLite database's declared foreign keys become joins.
   Communities get distinctive labels (folder plus the words that set them
   apart) and `--resolution` sets how fine they are.
+- Graph `metadata` links also come from photos: the photographer (EXIF
+  `Artist` and `XPAuthor`, XMP `dc:creator`, a PNG `Author` text) and the
+  camera (`Make` and `Model`) of a JPEG, PNG, WebP or TIFF-based file, read
+  from the file's own EXIF and XMP. GPS position and capture time are not
+  read.
 - Graph exports (`--export graphml,dot,cypher,html`, or `--output-format`
   with output `-`): GraphML, Graphviz DOT, Neo4j Cypher and a
   self-contained HTML viewer.
@@ -137,6 +142,10 @@ All notable changes to sniff-rs are documented here. Format follows
   GEOS and GDAL on 8,500 values.
 
 ### Changed
+- `explain`, `path`, `rank` and `--combine` on a dictionary propose only the
+  column pairs that could join instead of comparing every pair, with
+  byte-identical output: 2,000 tables 37 s to 3.2 s, a 1,476-table real
+  dictionary 16 s to 1.6 s.
 - A Delta Lake or Iceberg table inside a directory is one table in
   directory mode, `--combine` and `graph`, instead of a pile of its data
   files.
