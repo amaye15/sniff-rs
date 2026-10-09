@@ -1,0 +1,27 @@
+BEGIN:VCARD
+VERSION:3.0
+EMAIL;TYPE=WORK:jane.smith@acme-corp.com
+EMAIL;TYPE=WORK:jsmith@gmail.com
+FN:Jane Smith
+N:Smith;Jane;;;
+ORG:Acme Corp
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+EMAIL;TYPE=WORK:tom@acme-corp.com
+FN:Tom Brown
+N:Brown;Tom;;;
+ORG:Acme Corp
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+EMAIL;TYPE=WORK:jmuller@uni.edu.au
+FN:Jürgen Müller
+N:Müller;Jürgen;;;
+ORG:Uni
+END:VCARD
+BEGIN:VCARD
+VERSION:3.0
+FN:Pat Lee
+N:Lee;Pat;;;
+END:VCARD

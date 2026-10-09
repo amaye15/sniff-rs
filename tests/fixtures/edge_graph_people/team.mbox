@@ -1,0 +1,61 @@
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: status
+From: Jane Smith <jane.smith@acme-corp.com>
+To: Tom Brown <tom@acme-corp.com>, =?utf-8?q?M=C3=BCller=2C_J=C3=BCrgen?= <jmuller@uni.edu.au>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: status
+From: Tom Brown <tom@acme-corp.com>
+To: Jane Smith <jane.smith@acme-corp.com>
+Cc: =?utf-8?q?M=C3=BCller=2C_J=C3=BCrgen?= <jmuller@uni.edu.au>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: status
+From: =?utf-8?q?M=C3=BCller=2C_J=C3=BCrgen?= <jmuller@uni.edu.au>
+To: Jane Smith <jane.smith@acme-corp.com>, Tom Brown <tom@acme-corp.com>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: status
+From: Jane Smith <jsmith@othercorp.io>
+To: Tom Brown <tom@acme-corp.com>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: digest
+From: noreply@acme-corp.com
+To: Jane Smith <jane.smith@acme-corp.com>, Tom Brown <tom@acme-corp.com>, =?utf-8?q?M=C3=BCller=2C_J=C3=BCrgen?= <jmuller@uni.edu.au>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+
+From MAILER-DAEMON Fri Oct  9 19:14:28 2026
+Subject: status
+From: Tom Brown <tom@acme-corp.com>
+To: Jane Smith <jsmith@othercorp.io>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 7bit
+MIME-Version: 1.0
+
+see attached plan
+

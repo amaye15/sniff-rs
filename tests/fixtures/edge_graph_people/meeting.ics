@@ -1,0 +1,13 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//x//
+BEGIN:VEVENT
+SUMMARY:kickoff
+DTSTART:20240501T090000
+UID:a@x
+ATTENDEE;CN="Jane Smith":mailto:jane.smith@acme-corp.com
+ATTENDEE;CN="Müller, Jürgen":mailto:jmuller@uni.edu.au
+ATTENDEE;CN="Jane Smith":mailto:jsmith@othercorp.io
+ORGANIZER;CN="Tom Brown":mailto:tom@acme-corp.com
+END:VEVENT
+END:VCALENDAR

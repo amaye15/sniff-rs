@@ -65521,6 +65521,70 @@ mod vcard_support {
     /// established, just reached here via a genuinely different pooling
     /// mechanism instead of a JSON array literal. `sink.done` reproduces
     /// `columns_from_vcard`'s own real-I/O-bounding early stop.
+    /// The people of an address book: one person per card, named by `FN`
+    /// (else `N`), with every `EMAIL` the card has and its `ORG`.
+    pub(crate) fn people(path: &Path) -> Result<Vec<super::people_facts::PersonRef>> {
+        use super::people_facts::{PeopleAcc, name_from_n};
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut acc = PeopleAcc::default();
+        let mut card: Option<Vec<(String, String)>> = None;
+        let mut group = 0u32;
+        for line in UnfoldingLines::new(reader) {
+            let line = line?;
+            if line.eq_ignore_ascii_case("BEGIN:VCARD") {
+                card = Some(Vec::new());
+            } else if line.eq_ignore_ascii_case("END:VCARD") {
+                let Some(props) = card.take() else { continue };
+                group += 1;
+                let get = |n: &str| props.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+                let name = get("FN")
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| get("N").and_then(name_from_n));
+                let org = get("ORG")
+                    .and_then(|o| o.split(';').next())
+                    .map(str::trim)
+                    .filter(|o| !o.is_empty());
+                let emails: Vec<String> = props
+                    .iter()
+                    .filter(|(k, _)| k == "EMAIL")
+                    .map(|(_, v)| {
+                        let v = v.trim();
+                        let v = v
+                            .get(..7)
+                            .filter(|p| p.eq_ignore_ascii_case("mailto:"))
+                            .map_or(v, |_| &v[7..]);
+                        v.to_lowercase()
+                    })
+                    .filter(|e| e.contains('@') && !e.contains(char::is_whitespace))
+                    .collect::<std::collections::BTreeSet<String>>()
+                    .into_iter()
+                    .collect();
+                if emails.is_empty() {
+                    acc.add(group, None, name.as_deref(), "card", org);
+                }
+                for e in &emails {
+                    acc.add(group, Some(e), name.as_deref(), "card", org);
+                }
+            } else if let Some(props) = card.as_mut() {
+                let prop = parse_property_line(&line)?;
+                // Grouped properties (`item1.EMAIL`) are the property.
+                let name = prop
+                    .name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&prop.name)
+                    .to_string();
+                if matches!(name.as_str(), "FN" | "N" | "EMAIL" | "ORG") {
+                    props.push((name, unescape_value(&prop.value)));
+                }
+            }
+        }
+        Ok(acc.finish())
+    }
+
     pub(crate) fn stream_vcard_rows_for_sql(
         path: &Path,
         columns: &[(String, bool)],
@@ -65611,6 +65675,58 @@ mod ical_support {
     enum Frame {
         Record(json_support::Map),
         Other(String),
+    }
+
+    /// The organizers and attendees of the events and to-dos of a
+    /// calendar, each counted once per component and role, with the
+    /// `CN` name when the property gives one.
+    pub(crate) fn people(path: &Path) -> Result<Vec<super::people_facts::PersonRef>> {
+        use super::people_facts::{PeopleAcc, property_param};
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut acc = PeopleAcc::default();
+        let mut stack: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, &'static str)> =
+            std::collections::BTreeSet::new();
+        for line in UnfoldingLines::new(reader) {
+            let line = line?;
+            let upper = line.to_ascii_uppercase();
+            if let Some(name) = upper.strip_prefix("BEGIN:") {
+                stack.push(name.trim().to_string());
+                seen.clear();
+                continue;
+            }
+            if upper.starts_with("END:") {
+                stack.pop();
+                continue;
+            }
+            if !matches!(stack.last().map(String::as_str), Some("VEVENT" | "VTODO")) {
+                continue;
+            }
+            let prop = parse_property_line(&line)?;
+            let role = match prop.name.as_str() {
+                "ORGANIZER" => "organizer",
+                "ATTENDEE" => "attendee",
+                _ => continue,
+            };
+            let v = prop.value.trim();
+            let email = v
+                .get(..7)
+                .filter(|p| p.eq_ignore_ascii_case("mailto:"))
+                .map_or(v, |_| &v[7..])
+                .to_lowercase();
+            if !email.contains('@') || email.contains(char::is_whitespace) {
+                continue;
+            }
+            if !seen.insert((email.clone(), role)) {
+                continue;
+            }
+            let name = property_param(&line, "CN")
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty());
+            acc.add(0, Some(&email), name.as_deref(), role, None);
+        }
+        Ok(acc.finish())
     }
 
     /// Streams the file a line at a time via `UnfoldingLines`, folding
@@ -78471,6 +78587,70 @@ Content-Transfer-Encoding: base64\n\nJVBERg==\n--XX--\nepilogue\n";
     /// the line loop the instant enough messages have been kept rather
     /// than continuing to scan (and discard) the rest of a real,
     /// potentially gigabyte-sized mail export.
+    /// The people a mailbox names in its address headers (From, Sender,
+    /// To, Cc, Bcc, Reply-To), each counted once per message and role.
+    pub(crate) fn people(path: &Path) -> Result<Vec<super::people_facts::PersonRef>> {
+        use super::people_facts::{PeopleAcc, address_list};
+        fn add_message(acc: &mut PeopleAcc, headers: &[(String, String)]) {
+            // Once per address and role; the first display name given wins
+            // (`a@x, Ann <a@x>` is Ann).
+            let mut seen: std::collections::BTreeMap<(String, &'static str), Option<String>> =
+                std::collections::BTreeMap::new();
+            for (name, value) in headers {
+                let role = match name.to_ascii_lowercase().as_str() {
+                    "from" => "from",
+                    "sender" => "sender",
+                    "to" => "to",
+                    "cc" => "cc",
+                    "bcc" => "bcc",
+                    "reply-to" => "reply-to",
+                    _ => continue,
+                };
+                for a in address_list(value) {
+                    let name = a
+                        .name
+                        .map(|n| mime::decode_encoded_words(&n))
+                        .filter(|n| !n.trim().is_empty());
+                    let slot = seen.entry((a.email, role)).or_insert(None);
+                    if slot.is_none() {
+                        *slot = name;
+                    }
+                }
+            }
+            for ((email, role), name) in seen {
+                acc.add(0, Some(&email), name.as_deref(), role, None);
+            }
+        }
+        let file = fs::File::open(path).with_context(|| format!("failed to open {path:?}"))?;
+        let reader = std::io::BufReader::with_capacity(STREAM_CHUNK_SIZE, file);
+        let mut acc = PeopleAcc::default();
+        let mut current: Option<MessageBuilder> = None;
+        let mut prev_blank = true;
+        let mut lines = ByteLines::new(reader);
+        while let Some(line) = lines.next_line(path)? {
+            if prev_blank && line.starts_with(b"From ") {
+                if let Some(builder) = current.take() {
+                    add_message(&mut acc, &builder.headers);
+                }
+                current = Some(MessageBuilder::new(&String::from_utf8_lossy(line)));
+                prev_blank = false;
+                continue;
+            }
+            prev_blank = line.is_empty();
+            if let Some(builder) = current.as_mut()
+                && builder.in_headers
+            {
+                builder
+                    .add_line(line)
+                    .with_context(|| format!("{path:?}: malformed message"))?;
+            }
+        }
+        if let Some(builder) = current.take() {
+            add_message(&mut acc, &builder.headers);
+        }
+        Ok(acc.finish())
+    }
+
     pub(crate) fn stream_mbox_rows_for_sql(
         path: &Path,
         columns: &[(String, bool)],
@@ -78531,6 +78711,23 @@ Content-Transfer-Encoding: base64\n\nJVBERg==\n--XX--\nepilogue\n";
         Ok(())
     }
 } // mod mbox_support
+
+/// The people a mailbox, address book or calendar names; empty for every
+/// other format (and for these when their feature is not compiled in).
+fn people_of(format: &InputFormat, path: &Path) -> Vec<people_facts::PersonRef> {
+    match format {
+        #[cfg(feature = "mbox")]
+        InputFormat::Mbox => mbox_support::people(path).unwrap_or_default(),
+        #[cfg(feature = "vcard")]
+        InputFormat::Vcard => vcard_support::people(path).unwrap_or_default(),
+        #[cfg(feature = "icalendar")]
+        InputFormat::Ical => ical_support::people(path).unwrap_or_default(),
+        _ => {
+            let _ = path;
+            Vec::new()
+        }
+    }
+}
 
 #[cfg(feature = "mbox")]
 fn columns_from_mbox(
@@ -114554,6 +114751,557 @@ y <- read_excel(path = 'book.xlsx', sheet = "Sheet.1")
     }
 }
 
+// --- People in mail, contacts, calendars and document properties ---
+//
+// `sniff-rs graph --people` turns the names and addresses that mailboxes,
+// address books and calendars are made of into person nodes. This module
+// reads them: RFC 5322 address lists (From/To/Cc/Bcc/Reply-To headers),
+// vCard cards, iCalendar organizers and attendees. A person is whoever has
+// an address; the graph joins the addresses of one vCard card into one
+// person and matches a document's author name to a person by name.
+mod people_facts {
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    use std::collections::BTreeMap;
+
+    /// One person (or address) a file names, in one role.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct PersonRef {
+        /// Refs with the same non-zero group within a file are one person
+        /// (the addresses of one vCard card).
+        pub(crate) group: u32,
+        pub(crate) email: Option<String>,
+        pub(crate) name: Option<String>,
+        /// `from`, `to`, `cc`, `bcc`, `reply-to`, `sender`, `organizer`,
+        /// `attendee` or `card`.
+        pub(crate) role: String,
+        /// Messages or events in that role.
+        pub(crate) count: u32,
+        pub(crate) org: Option<String>,
+    }
+
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    /// Most people kept per file (the busiest first).
+    pub(crate) const MAX_PEOPLE_PER_FILE: usize = 400;
+
+    /// One address in an address list.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Addr {
+        pub(crate) name: Option<String>,
+        pub(crate) email: String,
+    }
+
+    /// Splits `s` at the commas that are not inside quotes, comments or
+    /// angle brackets.
+    fn split_top_level(s: &str) -> Vec<&str> {
+        let b = s.as_bytes();
+        let (mut out, mut start) = (Vec::new(), 0);
+        let (mut quote, mut comment, mut angle) = (false, 0usize, false);
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if quote || comment > 0 => i += 1,
+                b'"' if comment == 0 => quote = !quote,
+                b'(' if !quote => comment += 1,
+                b')' if !quote && comment > 0 => comment -= 1,
+                b'<' if !quote && comment == 0 => angle = true,
+                b'>' if !quote && comment == 0 => angle = false,
+                // A group (`undisclosed-recipients:;`, `team: a@x, b@y;`)
+                // is a name and a list: read the list's members alone.
+                b':' if !quote && comment == 0 && !angle => {
+                    start = i + 1;
+                }
+                b';' if !quote && comment == 0 && !angle => {
+                    if start < i {
+                        out.push(&s[start..i]);
+                    }
+                    start = i + 1;
+                }
+                b',' if !quote && comment == 0 && !angle => {
+                    out.push(&s[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if start < s.len() {
+            out.push(&s[start..]);
+        }
+        out
+    }
+
+    /// `"Smith\, Jane"` / `Jane (the boss)` text with quotes and comment
+    /// parentheses removed and quoted-pairs resolved.
+    fn unquote_phrase(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.trim().chars().peekable();
+        let (mut quote, mut comment) = (false, 0usize);
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if quote || comment > 0 => {
+                    if let Some(n) = chars.next() {
+                        out.push(n);
+                    }
+                }
+                '"' if comment == 0 => quote = !quote,
+                '(' if !quote => comment += 1,
+                ')' if !quote && comment > 0 => comment -= 1,
+                _ if comment > 0 => {}
+                c => out.push(c),
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// The text of the first parenthesized comment outside quotes.
+    fn first_comment(s: &str) -> Option<String> {
+        let b = s.as_bytes();
+        let (mut quote, mut depth, mut start) = (false, 0usize, 0);
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\\' if quote || depth > 0 => i += 1,
+                b'"' if depth == 0 => quote = !quote,
+                b'(' if !quote => {
+                    if depth == 0 {
+                        start = i + 1;
+                    }
+                    depth += 1;
+                }
+                b')' if !quote && depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(unquote_phrase(&s[start..i]));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn valid_email(e: &str) -> bool {
+        let Some((local, domain)) = e.split_once('@') else {
+            return false;
+        };
+        !local.is_empty()
+            && domain.contains('.')
+            && !domain.contains('@')
+            && !e
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';'))
+    }
+
+    /// The addresses of an RFC 5322 address list: `Name <a@x>`,
+    /// `"Last, First" <a@x>`, `a@x (Name)`, `a@x`, groups. An item with
+    /// no usable address is skipped. Display names are returned as
+    /// written (RFC 2047 words not decoded).
+    pub(crate) fn address_list(raw: &str) -> Vec<Addr> {
+        let mut out = Vec::new();
+        for item in split_top_level(raw) {
+            let item = item.trim();
+            let (email, name) = match (item.rfind('<'), item.rfind('>')) {
+                (Some(open), Some(close)) if open < close && !in_quotes(item, open) => {
+                    let inside = item[open + 1..close].trim();
+                    // A source route (`@a,@b:user@c`) before the address.
+                    let addr = inside.rsplit(':').next().unwrap_or(inside).trim();
+                    (addr.to_string(), unquote_phrase(&item[..open]))
+                }
+                _ => {
+                    // A bare address, with or without a comment as its name.
+                    let comment = first_comment(item);
+                    let bare = unquote_phrase_keep_at(item);
+                    (bare, comment.unwrap_or_default())
+                }
+            };
+            let email = email.trim().trim_matches(|c| c == '"').to_lowercase();
+            if !valid_email(&email) {
+                continue;
+            }
+            let name = Some(name).filter(|n| !n.is_empty() && !n.eq_ignore_ascii_case(&email));
+            out.push(Addr { name, email });
+        }
+        out
+    }
+
+    /// Whether byte `at` of `s` is inside a quoted string.
+    fn in_quotes(s: &str, at: usize) -> bool {
+        let b = s.as_bytes();
+        let mut quote = false;
+        let mut i = 0;
+        while i < at.min(b.len()) {
+            match b[i] {
+                b'\\' if quote => i += 1,
+                b'"' => quote = !quote,
+                _ => {}
+            }
+            i += 1;
+        }
+        quote
+    }
+
+    /// The address-looking token of a bare item, comments dropped.
+    fn unquote_phrase_keep_at(s: &str) -> String {
+        unquote_phrase(s)
+            .split_whitespace()
+            .find(|t| t.contains('@'))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// A person's name made comparable: lower case, `Last, First` turned
+    /// round, punctuation dropped, spaces collapsed. `None` below two
+    /// words (a first name alone matches too many people).
+    pub(crate) fn name_key(name: &str) -> Option<String> {
+        let name = name.trim();
+        let ordered = match name.split_once(',') {
+            Some((last, first)) if !first.contains(',') && !first.trim().is_empty() => {
+                format!("{} {}", first.trim(), last.trim())
+            }
+            _ => name.to_string(),
+        };
+        let cleaned: String = ordered
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '\'' {
+                    c.to_lowercase().collect::<String>()
+                } else {
+                    " ".to_string()
+                }
+            })
+            .collect();
+        let words: Vec<&str> = cleaned.split_whitespace().collect();
+        (words.len() >= 2 && cleaned.len() >= 5).then(|| words.join(" "))
+    }
+
+    /// Mailboxes that belong to a function, not a person.
+    pub(crate) fn is_role_mailbox(email: &str) -> bool {
+        let local: String = email
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        matches!(
+            local.as_str(),
+            "noreply"
+                | "donotreply"
+                | "notifications"
+                | "notification"
+                | "newsletter"
+                | "mailerdaemon"
+                | "postmaster"
+                | "root"
+                | "admin"
+                | "administrator"
+                | "support"
+                | "info"
+                | "contact"
+                | "sales"
+                | "hello"
+                | "team"
+                | "billing"
+                | "bounce"
+                | "bounces"
+                | "alerts"
+                | "alert"
+                | "news"
+                | "marketing"
+                | "press"
+                | "help"
+                | "service"
+                | "orders"
+                | "order"
+                | "accounts"
+                | "account"
+                | "security"
+                | "privacy"
+                | "webmaster"
+                | "abuse"
+                | "office"
+                | "enquiries"
+                | "enquiry"
+                | "feedback"
+                | "mail"
+                | "email"
+                | "hr"
+                | "jobs"
+                | "careers"
+                | "recruiting"
+                | "reply"
+                | "replies"
+                | "updates"
+                | "update"
+                | "digest"
+                | "system"
+                | "daemon"
+                | "robot"
+                | "bot"
+                | "automated"
+                | "calendar"
+                | "invites"
+                | "invite"
+                | "mailer"
+        )
+    }
+
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    /// Collects refs, adding up the same person in the same role.
+    #[derive(Default)]
+    pub(crate) struct PeopleAcc {
+        refs: BTreeMap<(u32, String, String, String), PersonRef>,
+    }
+
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    impl PeopleAcc {
+        pub(crate) fn add(
+            &mut self,
+            group: u32,
+            email: Option<&str>,
+            name: Option<&str>,
+            role: &str,
+            org: Option<&str>,
+        ) {
+            if email.is_none() && name.is_none() {
+                return;
+            }
+            let key = (
+                group,
+                email.unwrap_or("").to_string(),
+                name.map(str::to_lowercase).unwrap_or_default(),
+                role.to_string(),
+            );
+            let r = self.refs.entry(key).or_insert_with(|| PersonRef {
+                group,
+                email: email.map(str::to_string),
+                name: name.map(str::to_string),
+                role: role.to_string(),
+                count: 0,
+                org: org.map(str::to_string),
+            });
+            r.count += 1;
+        }
+
+        /// The busiest refs first, ties in key order.
+        pub(crate) fn finish(self) -> Vec<PersonRef> {
+            let mut v: Vec<PersonRef> = self.refs.into_values().collect();
+            v.sort_by_key(|r| std::cmp::Reverse(r.count));
+            v.truncate(MAX_PEOPLE_PER_FILE);
+            v
+        }
+    }
+
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    /// The value of parameter `name` in a content line's parameter list
+    /// (`ATTENDEE;CN="Smith, Jane";ROLE=REQ:mailto:...`).
+    pub(crate) fn property_param(line: &str, name: &str) -> Option<String> {
+        let b = line.as_bytes();
+        // Parameters run from the first `;` to the first unquoted `:`.
+        let mut i = 0;
+        while i < b.len() && b[i] != b';' && b[i] != b':' {
+            i += 1;
+        }
+        let mut quote = false;
+        let mut end = i;
+        while end < b.len() {
+            match b[end] {
+                b'"' => quote = !quote,
+                b':' if !quote => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        let params = line.get(i..end)?;
+        let mut rest = params;
+        while let Some(stripped) = rest.strip_prefix(';') {
+            let (key, after) = stripped.split_once('=')?;
+            let (value, next) = if let Some(q) = after.strip_prefix('"') {
+                let close = q.find('"')?;
+                (&q[..close], &q[close + 1..])
+            } else {
+                let stop = after.find([';', ':']).unwrap_or(after.len());
+                (&after[..stop], &after[stop..])
+            };
+            if key.eq_ignore_ascii_case(name) {
+                return Some(value.to_string());
+            }
+            rest = next;
+        }
+        None
+    }
+
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    /// `N` property value `family;given;additional;prefix;suffix` as
+    /// "Given Additional Family".
+    pub(crate) fn name_from_n(n: &str) -> Option<String> {
+        let parts: Vec<&str> = n.split(';').collect();
+        let get = |i: usize| parts.get(i).map(|p| p.trim()).unwrap_or("");
+        let joined = [get(1), get(2), get(0)]
+            .iter()
+            .filter(|p| !p.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!joined.is_empty()).then_some(joined)
+    }
+}
+
+#[cfg(test)]
+mod people_facts_tests {
+    use super::json_support;
+    use super::people_facts::*;
+
+    /// Address lists against Python's `email.utils.getaddresses`
+    /// (tools/gen_address_vectors.py).
+    fn check_address_vectors(text: &str, limit: usize) -> (usize, Vec<String>) {
+        let (mut checked, mut bad) = (0, Vec::new());
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let raw = v.get("raw").and_then(|x| x.as_str()).unwrap();
+            let want: Vec<(Option<String>, String)> = v
+                .get("addrs")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    let a = a.as_array().unwrap();
+                    (
+                        a[0].as_str().map(str::to_string),
+                        a[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let got: Vec<(Option<String>, String)> = address_list(raw)
+                .into_iter()
+                .map(|a| (a.name, a.email))
+                .collect();
+            checked += 1;
+            if got != want && bad.len() < limit {
+                bad.push(format!("{raw:?}\n   want {want:?}\n   got  {got:?}"));
+            }
+        }
+        (checked, bad)
+    }
+
+    /// Mailboxes, address books and calendars against Python's mailbox/
+    /// email, vobject and icalendar (tools/gen_people_vectors.py).
+    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    #[test]
+    fn people_in_mail_contacts_and_calendars_match_python() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/people_vectors.jsonl"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let dir = std::env::temp_dir().join(format!("sniff-people-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut checked, mut bad) = (
+            std::collections::BTreeMap::<String, usize>::new(),
+            Vec::new(),
+        );
+        for (n, line) in text.lines().enumerate() {
+            let v = json_support::from_str(line).unwrap();
+            let format = v
+                .get("format")
+                .and_then(|x| x.as_str())
+                .unwrap()
+                .to_string();
+            let body = v.get("text").and_then(|x| x.as_str()).unwrap();
+            let file = dir.join(format!("{n}.{format}"));
+            std::fs::write(&file, body).unwrap();
+            let got = match format.as_str() {
+                #[cfg(feature = "mbox")]
+                "mbox" => super::mbox_support::people(&file),
+                #[cfg(feature = "vcard")]
+                "vcard" => super::vcard_support::people(&file),
+                #[cfg(feature = "icalendar")]
+                "ical" => super::ical_support::people(&file),
+                _ => continue,
+            };
+            let mut got: Vec<(String, Option<String>, String, u32, u32)> = got
+                .unwrap()
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.email.unwrap_or_default(),
+                        r.name,
+                        r.role,
+                        r.count,
+                        r.group,
+                    )
+                })
+                .collect();
+            got.sort_by(|a, b| (&a.0, &a.2, &a.4, &a.1).cmp(&(&b.0, &b.2, &b.4, &b.1)));
+            let mut want: Vec<(String, Option<String>, String, u32, u32)> = v
+                .get("people")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let p = p.as_array().unwrap();
+                    (
+                        p[0].as_str().unwrap().to_string(),
+                        p[1].as_str().map(str::to_string),
+                        p[2].as_str().unwrap().to_string(),
+                        p[3].as_u64().unwrap() as u32,
+                        p[4].as_u64().unwrap() as u32,
+                    )
+                })
+                .collect();
+            want.sort_by(|a, b| (&a.0, &a.2, &a.4, &a.1).cmp(&(&b.0, &b.2, &b.4, &b.1)));
+            *checked.entry(format).or_default() += 1;
+            if got != want && bad.len() < 4 {
+                bad.push(format!("{body}\n   want {want:?}\n   got  {got:?}"));
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(bad.is_empty(), "differ:\n{}", bad.join("\n\n"));
+        #[cfg(feature = "mbox")]
+        assert!(
+            checked.get("mbox").copied().unwrap_or(0) >= 50,
+            "{checked:?}"
+        );
+        #[cfg(feature = "vcard")]
+        assert!(
+            checked.get("vcard").copied().unwrap_or(0) >= 50,
+            "{checked:?}"
+        );
+        #[cfg(feature = "icalendar")]
+        assert!(
+            checked.get("ical").copied().unwrap_or(0) >= 50,
+            "{checked:?}"
+        );
+    }
+
+    #[test]
+    fn address_lists_match_python_on_committed_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/address_vectors.jsonl"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let (checked, bad) = check_address_vectors(&text, 6);
+        assert!(checked >= 1000, "{checked}");
+        assert!(bad.is_empty(), "{} shown:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    /// SNIFF_ADDRESS_VECTORS=<jsonl>: any vectors file.
+    #[test]
+    #[ignore]
+    fn address_lists_match_python_on_a_corpus() {
+        let Ok(path) = std::env::var("SNIFF_ADDRESS_VECTORS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let (checked, bad) = check_address_vectors(&text, 15);
+        eprintln!("checked {checked}");
+        assert!(bad.is_empty(), "differ:\n{}", bad.join("\n"));
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -115338,6 +116086,11 @@ mod content_scan {
         }
     }
 
+    /// Whether `domain` is a generic webmail provider.
+    pub(crate) fn is_webmail_domain(domain: &str) -> bool {
+        WEBMAIL_DOMAINS.contains(&domain)
+    }
+
     /// Generic webmail providers: an address there says nothing about an
     /// organization, so it links as an email but not as a domain.
     const WEBMAIL_DOMAINS: [&str; 24] = [
@@ -116104,6 +116857,7 @@ mod knowledge_graph {
         self, ColumnContent, CustomPattern, EntityKind, KnownFiles, Normalize, ScanGuard,
         register_custom_kind,
     };
+    use super::people_facts::{self, PersonRef};
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -116194,6 +116948,9 @@ mod knowledge_graph {
         /// What source code or SQL says about files and tables: what it
         /// imports, reads and writes.
         pub(crate) code: Option<CodeFacts>,
+        /// The people a mailbox, address book or calendar names (only
+        /// read with `--people`).
+        pub(crate) people: Vec<PersonRef>,
     }
 
     pub(crate) struct CollectOptions {
@@ -116211,6 +116968,8 @@ mod knowledge_graph {
         pub(crate) patterns: Vec<CustomPattern>,
         /// Stands for `patterns` in the cache key.
         pub(crate) patterns_fingerprint: u64,
+        /// Read the people mail, contacts and calendars name.
+        pub(crate) people: bool,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -116297,6 +117056,7 @@ mod knowledge_graph {
         // refer to. A file added, removed or renamed re-reads everything.
         let names = {
             let mut h = fnv64_extend(FNV_OFFSET, &opts.patterns_fingerprint.to_le_bytes());
+            h = fnv64_extend(h, &[u8::from(opts.people)]);
             for p in &paths {
                 if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
                     h = fnv64_extend(h, n.as_bytes());
@@ -116365,7 +117125,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 3;
+    const CACHE_FORMAT: u64 = 4;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -116874,7 +117634,54 @@ mod knowledge_graph {
         if let Some(c) = &f.code {
             o.insert("code".to_string(), code_to_json(c));
         }
+        if !f.people.is_empty() {
+            o.insert(
+                "people".to_string(),
+                JsonValue::Array(
+                    f.people
+                        .iter()
+                        .map(|p| {
+                            let opt = |v: &Option<String>| {
+                                v.clone().map_or(JsonValue::Null, JsonValue::from)
+                            };
+                            JsonValue::Array(vec![
+                                JsonValue::from(u64::from(p.group)),
+                                opt(&p.email),
+                                opt(&p.name),
+                                JsonValue::from(p.role.clone()),
+                                JsonValue::from(u64::from(p.count)),
+                                opt(&p.org),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+        }
         JsonValue::Object(o)
+    }
+
+    fn people_from_json(v: &JsonValue) -> Option<Vec<PersonRef>> {
+        let text = |x: &JsonValue| -> Option<Option<String>> {
+            if x.is_null() {
+                Some(None)
+            } else {
+                Some(Some(x.as_str()?.to_string()))
+            }
+        };
+        v.as_array()?
+            .iter()
+            .map(|p| {
+                let p = p.as_array()?;
+                Some(PersonRef {
+                    group: u32::try_from(p.first()?.as_u64()?).ok()?,
+                    email: text(p.get(1)?)?,
+                    name: text(p.get(2)?)?,
+                    role: p.get(3)?.as_str()?.to_string(),
+                    count: u32::try_from(p.get(4)?.as_u64()?).ok()?,
+                    org: text(p.get(5)?)?,
+                })
+            })
+            .collect()
     }
 
     fn code_to_json(c: &CodeFacts) -> JsonValue {
@@ -117047,6 +117854,10 @@ mod knowledge_graph {
             code: match v.get("code") {
                 None => None,
                 Some(c) => Some(code_from_json(c)?),
+            },
+            people: match v.get("people") {
+                None => Vec::new(),
+                Some(p) => people_from_json(p)?,
             },
         })
     }
@@ -117733,6 +118544,7 @@ mod knowledge_graph {
             hash: None,
             meta: Vec::new(),
             code: None,
+            people: Vec::new(),
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -117758,6 +118570,9 @@ mod knowledge_graph {
             file.fixed_schema = has_fixed_schema(&format);
             let args = graph_args(path, opts.samples);
             let _scan = ScanGuard::new(Some(known.clone()));
+            if opts.people {
+                file.people = people_of(&format, &read_path);
+            }
             match dispatch_reader(&read_path, &logical_path, format, &args) {
                 Ok((tables, _)) => {
                     file.kind = FileKind::Data;
@@ -118116,6 +118931,9 @@ mod knowledge_graph {
         /// A column shared by tables, or one a query uses (only with
         /// `--columns`).
         Column,
+        /// Someone mail, contacts, calendars or document properties name
+        /// (only with `--people`).
+        Person,
     }
 
     impl NodeType {
@@ -118127,6 +118945,7 @@ mod knowledge_graph {
                 NodeType::Schema => "schema",
                 NodeType::Folder => "folder",
                 NodeType::Column => "column",
+                NodeType::Person => "person",
             }
         }
 
@@ -118138,6 +118957,7 @@ mod knowledge_graph {
                 "schema" => Some(NodeType::Schema),
                 "folder" => Some(NodeType::Folder),
                 "column" => Some(NodeType::Column),
+                "person" => Some(NodeType::Person),
                 _ => None,
             }
         }
@@ -118182,10 +119002,22 @@ mod knowledge_graph {
         TypeDrift,
         /// A program or query to a column it uses (`--columns`).
         UsesColumn,
+        /// A file to a person named in it - a mailbox's sender or
+        /// recipient, an address book's card, a calendar's organizer or
+        /// attendee (`--people`).
+        Involves,
+        /// A document to the person its properties name as author, found
+        /// by address or by name (`--people`).
+        AuthoredBy,
+        /// Two person nodes that bear the same name (`--people`).
+        SamePerson,
+        /// A person to the organization their address belongs to
+        /// (`--people`).
+        MemberOf,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 20] = [
+        pub(crate) const ALL: [Relation; 24] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -118206,6 +119038,10 @@ mod knowledge_graph {
             Relation::SameColumn,
             Relation::TypeDrift,
             Relation::UsesColumn,
+            Relation::Involves,
+            Relation::AuthoredBy,
+            Relation::SamePerson,
+            Relation::MemberOf,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -118230,6 +119066,10 @@ mod knowledge_graph {
                 Relation::SameColumn => "same_column",
                 Relation::TypeDrift => "type_drift",
                 Relation::UsesColumn => "uses_column",
+                Relation::Involves => "involves",
+                Relation::AuthoredBy => "authored_by",
+                Relation::SamePerson => "same_person",
+                Relation::MemberOf => "member_of",
             }
         }
 
@@ -118564,6 +119404,8 @@ mod knowledge_graph {
         pub(crate) resolution: f64,
         /// Column nodes for the columns tables share or queries use.
         pub(crate) columns: bool,
+        /// Person nodes for the people mail, contacts and calendars name.
+        pub(crate) people: bool,
         /// Links from outside, rejects, aliases and ignored identifiers.
         pub(crate) overrides: Overrides,
     }
@@ -118574,6 +119416,7 @@ mod knowledge_graph {
                 folders: false,
                 resolution: 1.0,
                 columns: false,
+                people: false,
                 overrides: Overrides::default(),
             }
         }
@@ -118687,6 +119530,9 @@ mod knowledge_graph {
         link_metadata(&mut b, &files, &file_node);
         if opts.folders {
             link_folders(&mut b, &files, &file_node);
+        }
+        if opts.people {
+            link_people(&mut b, &files, &file_node);
         }
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
         let column_ctx = link_schemas_and_joins(&mut b, &files, &table_nodes);
@@ -119900,6 +120746,385 @@ mod knowledge_graph {
                 vec![evidence],
             );
             b.edges.last_mut().expect("just pushed").directed = true;
+        }
+    }
+
+    // ---- People ----
+
+    /// A mailbox's, address book's or calendar's role for a person, as words.
+    fn role_phrase(role: &str, n: u32) -> String {
+        let plural = |what: &str| format!("{what}{}", if n == 1 { "" } else { "s" });
+        match role {
+            "from" => format!("sender of {n} {}", plural("message")),
+            "sender" => format!("Sender: header on {n} {}", plural("message")),
+            "to" => format!("recipient of {n} {}", plural("message")),
+            "cc" => format!("cc'd on {n} {}", plural("message")),
+            "bcc" => format!("bcc'd on {n} {}", plural("message")),
+            "reply-to" => format!("reply-to on {n} {}", plural("message")),
+            "organizer" => format!("organizer of {n} {}", plural("event")),
+            "attendee" => format!("attendee of {n} {}", plural("event")),
+            "card" => "has a contact card".to_string(),
+            other => format!("{other} ×{n}"),
+        }
+    }
+
+    /// Roles in the order a reader expects them.
+    const ROLE_ORDER: [&str; 9] = [
+        "from",
+        "sender",
+        "to",
+        "cc",
+        "bcc",
+        "reply-to",
+        "organizer",
+        "attendee",
+        "card",
+    ];
+
+    #[derive(Default)]
+    struct Identity {
+        emails: BTreeSet<String>,
+        /// Lower-cased name -> (as written, times seen).
+        names: BTreeMap<String, (String, u32)>,
+        /// File -> role -> count.
+        files: BTreeMap<usize, BTreeMap<String, u32>>,
+        /// Files whose author property names this person: (file, how, why).
+        authored: Vec<(usize, Conf, String)>,
+        card: bool,
+        org: Option<String>,
+    }
+
+    /// A name as people write it: spaces collapsed, `Last, First` turned
+    /// round (but not `Smith, Jr.`).
+    fn tidy_name(name: &str) -> String {
+        let n = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some((last, first)) = n.split_once(',') {
+            let (last, first) = (last.trim(), first.trim());
+            let suffix = first.trim_end_matches('.').to_ascii_lowercase();
+            if !last.is_empty()
+                && !first.is_empty()
+                && !first.contains(',')
+                && !matches!(
+                    suffix.as_str(),
+                    "jr" | "sr" | "ii" | "iii" | "iv" | "phd" | "md" | "esq"
+                )
+            {
+                return format!("{first} {last}");
+            }
+        }
+        n
+    }
+
+    fn find_root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+
+    /// `--people`: a node for each person that two or more files name
+    /// (a mailbox, an address book, a calendar, a document's author) or
+    /// that an address book has a card for. A person is an address; the
+    /// addresses of one vCard card are one person. Role mailboxes
+    /// (`noreply@`, `info@`) are not people.
+    ///
+    /// `involves` joins a mailbox, address book or calendar to a person
+    /// with their role. `authored_by` joins a document to the person its
+    /// author property names - EXTRACTED when the property holds an
+    /// address, INFERRED when a name matches one person, AMBIGUOUS when it
+    /// matches several. `same_person` joins people who share a name under
+    /// different addresses (AMBIGUOUS, up to five). `member_of` joins a
+    /// person to the organization domain of their address when that is
+    /// already a node.
+    fn link_people(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        // Identities: an address, or the name of a contact with none.
+        let mut key_of: HashMap<String, usize> = HashMap::new();
+        let mut keys: Vec<String> = Vec::new();
+        let mut parent: Vec<usize> = Vec::new();
+        let key_index = |key: String,
+                         key_of: &mut HashMap<String, usize>,
+                         keys: &mut Vec<String>,
+                         parent: &mut Vec<usize>|
+         -> usize {
+            *key_of.entry(key.clone()).or_insert_with(|| {
+                keys.push(key);
+                parent.push(parent.len());
+                parent.len() - 1
+            })
+        };
+        // (file, identity index, ref)
+        let mut refs: Vec<(usize, usize, &PersonRef)> = Vec::new();
+        for (fi, f) in files.iter().enumerate() {
+            let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+            for r in &f.people {
+                let key = match (&r.email, &r.name) {
+                    (Some(e), _) if people_facts::is_role_mailbox(e) => continue,
+                    (Some(e), _) => e.clone(),
+                    (None, Some(n)) if r.role == "card" => match people_facts::name_key(n) {
+                        Some(k) => format!("name:{k}"),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let idx = key_index(key, &mut key_of, &mut keys, &mut parent);
+                if r.group > 0 {
+                    groups.entry(r.group).or_default().push(idx);
+                }
+                refs.push((fi, idx, r));
+            }
+            for members in groups.values() {
+                for w in members.windows(2) {
+                    let (a, c) = (find_root(&mut parent, w[0]), find_root(&mut parent, w[1]));
+                    if a != c {
+                        parent[c.max(a)] = c.min(a);
+                    }
+                }
+            }
+        }
+        if refs.is_empty() && files.iter().all(|f| f.meta.is_empty()) {
+            return;
+        }
+        let mut idents: BTreeMap<usize, Identity> = BTreeMap::new();
+        for (fi, idx, r) in &refs {
+            let root = find_root(&mut parent, *idx);
+            let id = idents.entry(root).or_default();
+            if keys[*idx].contains('@') && !keys[*idx].starts_with("name:") {
+                id.emails.insert(keys[*idx].clone());
+            }
+            if let Some(n) = &r.name {
+                let n = tidy_name(n);
+                let e = id.names.entry(n.to_lowercase()).or_insert((n, 0));
+                e.1 += r.count;
+            }
+            *id.files
+                .entry(*fi)
+                .or_default()
+                .entry(r.role.clone())
+                .or_default() += r.count;
+            if r.role == "card" {
+                id.card = true;
+            }
+            if id.org.is_none() {
+                id.org = r.org.clone();
+            }
+        }
+        // Names -> identities, for matching a document's author.
+        let mut by_name: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for (root, id) in &idents {
+            for (display, _) in id.names.values() {
+                if let Some(k) = people_facts::name_key(display) {
+                    by_name.entry(k).or_default().insert(*root);
+                }
+            }
+        }
+        let by_email: HashMap<String, usize> = idents
+            .iter()
+            .flat_map(|(root, id)| id.emails.iter().map(|e| (e.clone(), *root)))
+            .collect();
+        for (fi, f) in files.iter().enumerate() {
+            for (kind, value) in &f.meta {
+                if kind != "author" {
+                    continue;
+                }
+                let mut matched = false;
+                for a in people_facts::address_list(value) {
+                    if let Some(&root) = by_email.get(&a.email) {
+                        idents.get_mut(&root).expect("known").authored.push((
+                            fi,
+                            Conf::Extracted,
+                            format!("author {value:?}"),
+                        ));
+                        matched = true;
+                    }
+                }
+                if matched {
+                    continue;
+                }
+                if let Some(roots) = people_facts::name_key(value).and_then(|k| by_name.get(&k)) {
+                    let conf = if roots.len() == 1 {
+                        Conf::Inferred
+                    } else {
+                        Conf::Ambiguous
+                    };
+                    if roots.len() <= 5 {
+                        for &root in roots {
+                            idents.get_mut(&root).expect("known").authored.push((
+                                fi,
+                                conf,
+                                format!("author {value:?} matches by name"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Which identities become nodes, in a stable order.
+        let mut people: Vec<(String, usize)> = Vec::new();
+        for (root, id) in &idents {
+            let mut all: BTreeSet<usize> = id.files.keys().copied().collect();
+            all.extend(id.authored.iter().map(|a| a.0));
+            if all.len() >= 2 || id.card {
+                let primary = id
+                    .emails
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| keys[*root].clone());
+                people.push((primary, *root));
+            }
+        }
+        people.sort();
+        let mut node_of: BTreeMap<usize, usize> = BTreeMap::new();
+        for (primary, root) in &people {
+            let id = &idents[root];
+            let label = id
+                .names
+                .values()
+                .max_by(|a, b| {
+                    a.1.cmp(&b.1)
+                        .then_with(|| a.0.chars().count().cmp(&b.0.chars().count()))
+                        .then_with(|| b.0.cmp(&a.0))
+                })
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| primary.trim_start_matches("name:").to_string());
+            let mut all_files: BTreeSet<usize> = id.files.keys().copied().collect();
+            all_files.extend(id.authored.iter().map(|a| a.0));
+            let mut attrs = json_support::Map::new();
+            attrs.insert("files".to_string(), JsonValue::from(all_files.len()));
+            if !id.emails.is_empty() {
+                attrs.insert(
+                    "emails".to_string(),
+                    JsonValue::Array(
+                        id.emails
+                            .iter()
+                            .take(10)
+                            .cloned()
+                            .map(JsonValue::from)
+                            .collect(),
+                    ),
+                );
+            }
+            if id.names.len() > 1 {
+                attrs.insert(
+                    "names".to_string(),
+                    JsonValue::Array(
+                        id.names
+                            .values()
+                            .take(6)
+                            .map(|(n, _)| JsonValue::from(n.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            let mut roles: BTreeMap<&str, u32> = BTreeMap::new();
+            for per_file in id.files.values() {
+                for (role, n) in per_file {
+                    *roles.entry(role.as_str()).or_default() += n;
+                }
+            }
+            let mut rm = json_support::Map::new();
+            for r in ROLE_ORDER {
+                if let Some(n) = roles.get(r) {
+                    rm.insert(r.to_string(), JsonValue::from(*n));
+                }
+            }
+            if !rm.is_empty() {
+                attrs.insert("roles".to_string(), JsonValue::Object(rm));
+            }
+            if let Some(o) = &id.org {
+                attrs.insert("org".to_string(), JsonValue::from(o.clone()));
+            }
+            let node = b.add_node(
+                format!("person:{primary}"),
+                label,
+                NodeType::Person,
+                "person".to_string(),
+                None,
+                attrs,
+            );
+            node_of.insert(*root, node);
+            for (fi, per_file) in &id.files {
+                let phrases: Vec<String> = ROLE_ORDER
+                    .iter()
+                    .filter_map(|r| per_file.get(*r).map(|n| role_phrase(r, *n)))
+                    .collect();
+                add_directed(
+                    b,
+                    file_node[*fi],
+                    node,
+                    Relation::Involves,
+                    Conf::Extracted,
+                    vec![phrases.join(", ")],
+                );
+            }
+            let mut seen: BTreeSet<usize> = BTreeSet::new();
+            let mut authored = id.authored.clone();
+            authored.sort_by(|a, c| a.0.cmp(&c.0).then_with(|| a.1.cmp(&c.1)));
+            for (fi, conf, why) in authored {
+                if seen.insert(fi) {
+                    add_directed(
+                        b,
+                        file_node[fi],
+                        node,
+                        Relation::AuthoredBy,
+                        conf,
+                        vec![why],
+                    );
+                }
+            }
+            // The organization behind the address, when it is a node.
+            if let Some(domain) = id
+                .emails
+                .iter()
+                .filter_map(|e| e.rsplit_once('@').map(|(_, d)| d))
+                .find(|d| !content_scan::is_webmail_domain(d))
+                && let Some(&dn) = b.node_index.get(&entity_id(EntityKind::Domain, domain))
+            {
+                add_directed(
+                    b,
+                    node,
+                    dn,
+                    Relation::MemberOf,
+                    Conf::Inferred,
+                    vec![format!("address at {domain}")],
+                );
+            }
+        }
+        // The same name under different addresses.
+        let mut by_key: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (_, root) in &people {
+            for (display, _) in idents[root].names.values() {
+                if let Some(k) = people_facts::name_key(display) {
+                    let v = by_key.entry(k).or_default();
+                    if !v.contains(root) {
+                        v.push(*root);
+                    }
+                }
+            }
+        }
+        let mut paired: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (key, roots) in by_key {
+            if roots.len() < 2 || roots.len() > 5 {
+                continue;
+            }
+            for (i, &x) in roots.iter().enumerate() {
+                for &y in &roots[i + 1..] {
+                    let (nx, ny) = (node_of[&x], node_of[&y]);
+                    if paired.insert((nx.min(ny), nx.max(ny))) {
+                        b.add_edge(
+                            nx,
+                            ny,
+                            Relation::SamePerson,
+                            Conf::Ambiguous,
+                            0.5,
+                            1.0,
+                            vec![format!("both are named {key:?}")],
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -121848,6 +123073,7 @@ mod knowledge_graph {
                 NodeType::Schema => "schema",
                 NodeType::Folder => "folder",
                 NodeType::Column => "column",
+                NodeType::Person => "person",
             }
         }))
     }
@@ -122750,6 +123976,7 @@ mod knowledge_graph {
             pub(crate) exclude: Vec<String>,
             pub(crate) folders: Option<bool>,
             pub(crate) columns: Option<bool>,
+            pub(crate) people: Option<bool>,
             pub(crate) resolution: Option<f64>,
             pub(crate) samples: Option<usize>,
             pub(crate) jobs: Option<usize>,
@@ -122881,6 +124108,7 @@ mod knowledge_graph {
                         "exclude",
                         "folders",
                         "columns",
+                        "people",
                         "resolution",
                         "samples",
                         "jobs",
@@ -122898,6 +124126,11 @@ mod knowledge_graph {
                 if let Some(c) = g.get("columns") {
                     cfg.columns = Some(c.as_bool().ok_or_else(|| {
                         anyhow!("{origin}: [graph] columns must be true or false")
+                    })?);
+                }
+                if let Some(c) = g.get("people") {
+                    cfg.people = Some(c.as_bool().ok_or_else(|| {
+                        anyhow!("{origin}: [graph] people must be true or false")
                     })?);
                 }
                 if let Some(r) = g.get("resolution") {
@@ -123077,6 +124310,7 @@ mod knowledge_graph {
             NodeType::Schema => format!("`{}`", md(&n.label)),
             NodeType::Folder => format!("`{}` (folder)", md(&n.label)),
             NodeType::Column => format!("`{}` (column)", md(&n.label)),
+            NodeType::Person => format!("`{}` (person)", md(&n.label)),
         }
     }
 
@@ -123572,6 +124806,10 @@ mod knowledge_graph {
                     "columns/{}",
                     sanitize_component(n.id.strip_prefix("column:").unwrap_or(&n.id))
                 ),
+                NodeType::Person => format!(
+                    "people/{}",
+                    sanitize_component(n.id.strip_prefix("person:").unwrap_or(&n.id))
+                ),
                 NodeType::Folder => {
                     let parts: Vec<String> =
                         n.id.trim_start_matches("folder:")
@@ -123676,6 +124914,7 @@ mod knowledge_graph {
                 NodeType::Schema => note.push_str("  - schema\n"),
                 NodeType::Folder => note.push_str("  - folder\n"),
                 NodeType::Column => note.push_str("  - column\n"),
+                NodeType::Person => note.push_str("  - person\n"),
             }
             note.push_str(&format!("  - node/{}\n", n.node_type.as_str()));
             note.push_str(&format!("  - community/{}\n", n.community));
@@ -123717,6 +124956,11 @@ mod knowledge_graph {
                         facts.push(format!("in {t} tables"));
                     }
                 }
+                NodeType::Person => {
+                    if let Some(t) = n.attrs.get("files").and_then(JsonValue::as_u64) {
+                        facts.push(format!("named in {t} files"));
+                    }
+                }
                 NodeType::Folder => {
                     if let Some(t) = n.attrs.get("files").and_then(JsonValue::as_u64) {
                         facts.push(format!("holds {t} files"));
@@ -123756,6 +125000,8 @@ mod knowledge_graph {
                     (Relation::Imports, false) => "imported by ",
                     (Relation::Reads, false) => "read by ",
                     (Relation::Writes, false) => "written by ",
+                    (Relation::Involves, false) => "names ",
+                    (Relation::AuthoredBy, false) => "author of ",
                     (Relation::Contains, false) => "part of ",
                     _ => "",
                 };
@@ -124109,6 +125355,7 @@ mod knowledge_graph {
                 NodeType::Schema => "hexagon",
                 NodeType::Folder => "folder",
                 NodeType::Column => "note",
+                NodeType::Person => "oval",
             };
             out.push_str(&format!(
                 "  n{i} [label=\"{}\", shape={shape}, fillcolor=\"{}\"];\n",
@@ -124163,6 +125410,7 @@ mod knowledge_graph {
                 NodeType::Schema => "Schema",
                 NodeType::Folder => "Folder",
                 NodeType::Column => "Column",
+                NodeType::Person => "Person",
             };
             out.push_str(&format!(
                 "CREATE (n{i}:{label} {{id: {}, label: {}, file_type: {}, community: {}, degree: {}}})\n",
@@ -125624,6 +126872,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 hash: None,
                 meta: Vec::new(),
                 code: None,
+                people: Vec::new(),
             }
         }
 
@@ -127131,6 +128380,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 hash: None,
                 meta: Vec::new(),
                 code: None,
+                people: Vec::new(),
             }
         }
 
@@ -127264,6 +128514,15 @@ USAGE:
                    name in their own properties: a PDF's or office
                    document's, or a photo's EXIF and XMP (INFERRED)
       in_folder    with --folders: a file and the folder it is kept in
+      involves     with --people: a mailbox, address book or calendar
+                   to a person it names, with their role (sender,
+                   recipient, card, organizer, attendee)
+      authored_by  with --people: a document to the person its author
+                   property names (by address, or by name - INFERRED)
+      same_person  with --people: two people with the same name but
+                   different addresses (AMBIGUOUS)
+      member_of    with --people: a person to the organization their
+                   address belongs to
       has_column   with --columns: a table (or a schema shared by several)
                    to a column node it has; the column is shared by two or
                    more tables or used by a query; generic names (id,
@@ -127338,6 +128597,11 @@ OPTIONS:
         --folders               Add a node per directory, so files kept in
                                 one folder pull together when nothing else
                                 links them
+        --people                Add a node for each person that mailboxes,
+                                address books, calendars and document
+                                authors name, joined across files by
+                                address (involves, authored_by,
+                                same_person, member_of)
         --columns               Add a node for each column that tables
                                 share or a query uses, so "which tables
                                 hold customer_id" and "which columns
@@ -127435,6 +128699,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut no_cache = false;
     let mut folders: Option<bool> = None;
     let mut columns: Option<bool> = None;
+    let mut people: Option<bool> = None;
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
     let mut link_files: Vec<PathBuf> = Vec::new();
@@ -127501,6 +128766,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--columns takes no value");
                     }
                     columns = Some(true);
+                }
+                "people" => {
+                    if inline_value.is_some() {
+                        bail!("--people takes no value");
+                    }
+                    people = Some(true);
                 }
                 "resolution" => {
                     let v = value(&mut i)?;
@@ -127627,6 +128898,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let jobs = jobs.or(cfg.jobs);
     let folders = folders.or(cfg.folders).unwrap_or(false);
     let columns = columns.or(cfg.columns).unwrap_or(false);
+    let people = people.or(cfg.people).unwrap_or(false);
     let resolution = resolution.or(cfg.resolution).unwrap_or(1.0);
     let patterns = cfg.patterns()?;
     let patterns_fingerprint = cfg.fingerprint();
@@ -127643,6 +128915,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             cache_dir,
             patterns,
             patterns_fingerprint,
+            people,
         },
     )?;
     if files.is_empty() {
@@ -127655,6 +128928,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             folders,
             resolution,
             columns,
+            people,
             overrides,
         },
     )?;
@@ -127897,6 +129171,7 @@ fn load_knowledge_graph_input(
                 cache_dir: None,
                 patterns,
                 patterns_fingerprint,
+                people: cfg.people.unwrap_or(false),
             },
         )?;
         if files.is_empty() {
@@ -127910,6 +129185,7 @@ fn load_knowledge_graph_input(
                 folders: cfg.folders.unwrap_or(false),
                 resolution: cfg.resolution.unwrap_or(1.0),
                 columns: cfg.columns.unwrap_or(false),
+                people: cfg.people.unwrap_or(false),
                 overrides: std::mem::take(&mut cfg.overrides),
             },
         )?));

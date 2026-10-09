@@ -20186,3 +20186,149 @@ fn graph_columns_adds_column_nodes_for_what_tables_share_and_queries_use() {
     let again = graph_doc(&["graph", &input, "-", "--no-cache", "--columns"]);
     assert_eq!(doc, again, "the same input gives the same graph");
 }
+
+#[cfg(all(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+#[test]
+fn graph_people_links_mail_contacts_calendars_and_authors() {
+    let tmp = TempDir::new();
+    let input = format!(
+        "{}/tests/fixtures/edge_graph_people",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let plain = graph_doc(&["graph", &input, "-", "--no-cache"]);
+    assert!(
+        !plain["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == "person"),
+        "people are opt-in"
+    );
+    let doc = graph_doc(&["graph", &input, "-", "--no-cache", "--people"]);
+    let people: Vec<&str> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "person")
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    // The address is the identity. The role mailbox (the digest's noreply)
+    // and the one-file orphan author get no node; a contact card with no
+    // address is keyed by name.
+    assert_eq!(
+        people,
+        [
+            "person:jane.smith@acme-corp.com",
+            "person:jmuller@uni.edu.au",
+            "person:jsmith@othercorp.io",
+            "person:name:pat lee",
+            "person:tom@acme-corp.com",
+        ]
+    );
+    let node = |id: &str| {
+        doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id)
+            .unwrap()
+    };
+    // One card holds two addresses, so they are one person.
+    let jane = node("person:jane.smith@acme-corp.com");
+    assert_eq!(jane["files"], 4);
+    assert_eq!(jane["emails"][1], "jsmith@gmail.com");
+    assert_eq!(jane["org"], "Acme Corp");
+    let link = |relation: &str, from: &str, to: &str| -> Option<&serde_json::Value> {
+        doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["relation"] == relation && l["source"] == from && l["target"] == to)
+    };
+    let sent =
+        link("involves", "team.mbox", "person:tom@acme-corp.com").expect("tom is in the mailbox");
+    assert_eq!(sent["confidence"], "EXTRACTED");
+    assert_eq!(
+        sent["evidence"][0],
+        "sender of 2 messages, recipient of 4 messages"
+    );
+    assert!(link("involves", "contacts.vcf", "person:name:pat lee").is_some());
+    assert_eq!(
+        link("involves", "meeting.ics", "person:tom@acme-corp.com").unwrap()["evidence"][0],
+        "organizer of 1 event"
+    );
+    // A document's author is matched by name: one match is INFERRED, a name
+    // two people share is AMBIGUOUS, and neither is EXTRACTED.
+    let one = link("authored_by", "minutes.docx", "person:tom@acme-corp.com").expect("Tom Brown");
+    assert_eq!(one["confidence"], "INFERRED");
+    assert_eq!(one["directed"], true);
+    assert!(
+        link("authored_by", "minutes.docx", "person:jmuller@uni.edu.au").is_some(),
+        "\"Müller, Jürgen\" is Jürgen Müller"
+    );
+    for jane in [
+        "person:jane.smith@acme-corp.com",
+        "person:jsmith@othercorp.io",
+    ] {
+        assert_eq!(
+            link("authored_by", "proposal.docx", jane).unwrap()["confidence"],
+            "AMBIGUOUS",
+            "{jane}"
+        );
+    }
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["source"] == "orphan.docx" && l["relation"] == "authored_by"),
+        "an author nobody else is named like links to no one"
+    );
+    // Two addresses behind one name are not asserted to be one person.
+    let same = link(
+        "same_person",
+        "person:jane.smith@acme-corp.com",
+        "person:jsmith@othercorp.io",
+    )
+    .expect("two Jane Smiths");
+    assert_eq!(same["confidence"], "AMBIGUOUS");
+    // An address at a company that has a domain node belongs to it.
+    assert_eq!(
+        link(
+            "member_of",
+            "person:tom@acme-corp.com",
+            "domain:acme-corp.com"
+        )
+        .unwrap()["confidence"],
+        "INFERRED"
+    );
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "member_of" && l["target"] == "domain:gmail.com"),
+        "a webmail provider is not an organization"
+    );
+    // The settings file can ask for it, and a second run is the same graph.
+    let data = tmp.path().join("copy");
+    std::fs::create_dir_all(&data).unwrap();
+    for f in ["team.mbox", "contacts.vcf"] {
+        std::fs::copy(format!("{input}/{f}"), data.join(f)).unwrap();
+    }
+    std::fs::write(
+        data.join(".sniff-rs.json"),
+        r#"{"graph": {"people": true}}"#,
+    )
+    .unwrap();
+    let via_config = graph_doc(&["graph", data.to_str().unwrap(), "-", "--no-cache"]);
+    assert!(
+        via_config["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == "person:tom@acme-corp.com")
+    );
+    let again = graph_doc(&["graph", &input, "-", "--no-cache", "--people"]);
+    assert_eq!(doc, again, "the same input gives the same graph");
+}

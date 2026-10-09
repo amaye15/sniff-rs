@@ -7,6 +7,15 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph --people` (or `people = true` in the config file): a
+  `person` node for each address that two or more files name, or that a
+  contact card holds, with `involves` (a mailbox, address book or calendar
+  to the person, with role counts), `authored_by` (a document's author,
+  matched by name: INFERRED for one match, AMBIGUOUS for several),
+  `same_person` (AMBIGUOUS, one name behind several addresses) and
+  `member_of` (a person to the organization of their address; never a
+  webmail provider). Reads mbox, vCard and iCalendar. Off by default.
+  Checked against Python's `email`, `mailbox`, `vobject` and `icalendar`.
 - `sniff-rs graph --columns` (or `columns = true` in the config file): a node
   for each column that tables share, that a join matches under two names, or
   that a query uses, with `has_column` (a table, or the schema of identical

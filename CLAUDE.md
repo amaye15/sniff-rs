@@ -18692,6 +18692,71 @@ node - the node says "tables have this", the `joins` links say which tables
 relate. Type drift uses this tool's value-derived types, so an integer column
 with a text value in one table is drift because it is.
 
+### Phase 4: people (`--people`)
+
+People are the thing a mailbox, an address book, a calendar and a
+document's author line have in common, and they are in no table. `sniff-rs
+graph --people` (or `people = true` under `[graph]` in the config file; the
+setting is part of the cache key) adds a `person` node per identity and four
+relations. Off by default: without it the graph is byte-identical to before
+(checked on the fixture tree, with and without `--columns`, and on the
+1,340-file corpus).
+
+**Identity is the address.** A person is the lower-cased e-mail. A contact
+card with no address is `name:<name_key>`. The addresses of one vCard card
+are one person (the card says so). `address_list` parses `To`/`Cc`/`From`
+the way Python's `email.utils.getaddresses` does (quoted names, comments,
+groups, RFC 2047 words in mbox); `name_key` needs two words and five
+characters, so a first name alone never names anyone. Role mailboxes
+(`noreply`, `info`, `support`, ...) are not people. A person needs two files
+or a contact card; one file that merely mentions an address makes no node.
+The display name is the first non-empty one seen for the address in a
+message; `tidy_name` turns "Last, First" round, except for Jr./Sr./II.
+
+- **`involves`** (a file to a person, EXTRACTED): the file names the
+  address. The evidence is the role count (`sender of 2 messages,
+  recipient of 4 messages`, `organizer of 1 event`, `has a contact card`).
+- **`authored_by`** (a document to a person, directed): a document's
+  author is a name, not an address, so it is matched by `name_key`.
+  EXTRACTED when the author property holds an address; INFERRED when the
+  name matches one person; AMBIGUOUS (up to five links) when it matches
+  several. An author nobody else is named like links to no one.
+- **`same_person`** (AMBIGUOUS): two to five identities with one
+  `name_key`. This is a suggestion, never a merge.
+- **`member_of`** (a person to an existing `domain:` entity, INFERRED).
+  Webmail providers are never an organization.
+
+**Sources.** mbox (`From`, `To`, `Cc`, `Bcc`), vCard (`FN`, `N`, `EMAIL`,
+`ORG`), iCalendar (`ORGANIZER`, `ATTENDEE`) and the author/last-modified-by
+metadata the graph already reads from documents. Each reader gives a
+`PersonRef` per (address, role) with a count; the list is capped at 400 per
+file (the busiest first) and cached with the file (`CACHE_FORMAT` 4).
+
+**Verified** with three independent oracles (generators and checker in
+`tools/`, committed vectors in `tests/fixtures/`):
+`gen_address_vectors.py` makes address lists and Python's own parser gives
+the answer (1,500 committed, 11,000 in the ignored corpus run, 0
+differences); `gen_people_vectors.py` writes mailboxes, cards and calendars
+and compares each reader with Python's `mailbox`/`email`, `vobject` and
+`icalendar` (240 committed, 1,740 in the stress run, 0 differences);
+`check_people.py` builds 100 random folders and recomputes the people,
+roles, `same_person` pairs and ambiguity classes with a union-find over the
+same libraries (100 seeds, all agree). The first run of `check_people.py`
+found that a message naming one address first bare and then with a display
+name must keep the later name; the mbox reader and the generator now use the
+same "first non-empty name" rule. The committed test is
+`graph_people_links_mail_contacts_calendars_and_authors` on
+`tests/fixtures/edge_graph_people`. The real corpus has no mail, contact or
+calendar file, so it adds no people (the run is identical to before, 23 s).
+
+**Disclosed.** Names in prose are not read (no entity recognition; a later
+phase may add it behind a flag, as AMBIGUOUS). `.eml`, `.msg` and git
+authors come with the new sources of phase 5. RFC 2047 display names are
+decoded for mbox only. The role-mailbox list is a heuristic list of local
+parts. A document author is matched by name only, so two people with one
+name give AMBIGUOUS links, not a guess. A card with no address and a
+common name can join a stranger's `same_person` group; it stays AMBIGUOUS.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
