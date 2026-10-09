@@ -116853,6 +116853,282 @@ mod sql_ddl_tests {
     }
 }
 
+// --- Git history (for `sniff-rs graph --git`) ---
+//
+// Who changed a file, and which files change together, from the repository
+// the graphed folder sits in. This runs the `git` program (as `--load-into`
+// runs `sqlite3` or `psql`) rather than reading the repository's format.
+mod git_history {
+    use super::*;
+    use std::process::Command;
+
+    /// Most commits read, newest first.
+    pub(crate) const MAX_COMMITS: usize = 20_000;
+    /// A commit that touches more files than this (a mass rename, a
+    /// reformat) says nothing about which of them belong together.
+    const MAX_FILES_PER_COMMIT: usize = 60;
+    /// Fewest commits two files must share to be linked.
+    const MIN_TOGETHER: u32 = 3;
+    /// Smallest share of the less-changed file's commits that the other
+    /// file is in.
+    const MIN_RATIO: f64 = 0.5;
+    /// Partners kept for each file.
+    const MAX_PARTNERS: usize = 8;
+    /// Authors kept for each file (the busiest).
+    const MAX_AUTHORS: usize = 20;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct Commit {
+        pub name: String,
+        pub email: String,
+        pub files: Vec<String>,
+    }
+
+    /// One author of one file.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct Author {
+        pub name: String,
+        pub email: String,
+        pub commits: u32,
+    }
+
+    #[derive(Debug, Default, PartialEq)]
+    pub(crate) struct Facts {
+        /// File -> its authors, the busiest first.
+        pub authors: BTreeMap<String, Vec<Author>>,
+        /// (file, other file, commits both are in, the file's own commits,
+        /// the other's), with the file the one that sorts first.
+        pub together: Vec<(String, String, u32, u32, u32)>,
+    }
+
+    /// The history of the files under `dir`: names relative to `dir`,
+    /// newest commit first, merges left out.
+    pub(crate) fn read(dir: &Path, max_commits: usize) -> Result<Vec<Commit>> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "core.quotepath=off",
+                "log",
+                "--no-merges",
+                "--relative",
+                "--name-only",
+                "--format=%x01%aN%x1f%aE",
+            ])
+            .arg(format!("--max-count={max_commits}"))
+            .args(["--", "."])
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!("--git needs the `git` program, which isn't on PATH")
+                } else {
+                    anyhow!("failed to run git: {e}")
+                }
+            })?;
+        if !output.status.success() {
+            let why = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "--git needs {dir:?} to be inside a git repository with commits: {}",
+                why.trim()
+            );
+        }
+        Ok(parse_log(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    /// `git log --name-only --format=%x01%aN%x1f%aE` output.
+    pub(crate) fn parse_log(text: &str) -> Vec<Commit> {
+        let mut out: Vec<Commit> = Vec::new();
+        for line in text.lines() {
+            if let Some(header) = line.strip_prefix('\u{1}') {
+                let (name, email) = header.split_once('\u{1f}').unwrap_or((header, ""));
+                out.push(Commit {
+                    name: name.trim().to_string(),
+                    email: email.trim().to_string(),
+                    files: Vec::new(),
+                });
+            } else if !line.is_empty()
+                // A name git had to quote (a quote or a newline in it).
+                && !line.starts_with('"')
+                && let Some(c) = out.last_mut()
+            {
+                c.files.push(line.to_string());
+            }
+        }
+        out
+    }
+
+    /// Authors and files that change together, for the files in `known`.
+    pub(crate) fn analyze(commits: &[Commit], known: &HashSet<String>) -> Facts {
+        let mut own: HashMap<&str, u32> = HashMap::new();
+        let mut authors: BTreeMap<&str, HashMap<String, (String, u32)>> = BTreeMap::new();
+        let mut pairs: HashMap<(&str, &str), u32> = HashMap::new();
+        for c in commits {
+            let mut files: Vec<&str> = c
+                .files
+                .iter()
+                .map(String::as_str)
+                .filter(|f| known.contains(*f))
+                .collect();
+            files.sort_unstable();
+            files.dedup();
+            let email = c.email.to_lowercase();
+            for f in &files {
+                *own.entry(f).or_insert(0) += 1;
+                if email.contains('@') {
+                    let e = authors
+                        .entry(f)
+                        .or_default()
+                        .entry(email.clone())
+                        .or_insert_with(|| (c.name.clone(), 0));
+                    e.1 += 1;
+                    // The newest name an address was used with is first
+                    // seen, as the log runs newest first.
+                }
+            }
+            if (2..=MAX_FILES_PER_COMMIT).contains(&files.len()) {
+                for (i, a) in files.iter().enumerate() {
+                    for b in &files[i + 1..] {
+                        *pairs.entry((a, b)).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut facts = Facts::default();
+        for (file, by_email) in authors {
+            let mut list: Vec<Author> = by_email
+                .into_iter()
+                .map(|(email, (name, commits))| Author {
+                    name,
+                    email,
+                    commits,
+                })
+                .collect();
+            list.sort_by(|a, b| {
+                b.commits
+                    .cmp(&a.commits)
+                    .then_with(|| a.email.cmp(&b.email))
+            });
+            list.truncate(MAX_AUTHORS);
+            facts.authors.insert(file.to_string(), list);
+        }
+        // Pairs that clear the bar, then each file's best partners.
+        let mut kept: Vec<(&str, &str, u32, u32, u32)> = pairs
+            .into_iter()
+            .filter_map(|((a, b), together)| {
+                let (oa, ob) = (own[a], own[b]);
+                (together >= MIN_TOGETHER
+                    && f64::from(together) / f64::from(oa.min(ob)) >= MIN_RATIO)
+                    .then_some((a, b, together, oa, ob))
+            })
+            .collect();
+        kept.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(y.0)).then(x.1.cmp(y.1)));
+        let mut taken: HashMap<&str, usize> = HashMap::new();
+        for (a, b, together, oa, ob) in kept {
+            let (ca, cb) = (
+                taken.get(a).copied().unwrap_or(0),
+                taken.get(b).copied().unwrap_or(0),
+            );
+            // A pair is kept while either file still has room for a partner.
+            if ca >= MAX_PARTNERS && cb >= MAX_PARTNERS {
+                continue;
+            }
+            *taken.entry(a).or_insert(0) += 1;
+            *taken.entry(b).or_insert(0) += 1;
+            facts
+                .together
+                .push((a.to_string(), b.to_string(), together, oa, ob));
+        }
+        facts.together.sort();
+        facts
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn commit(who: &str, files: &[&str]) -> Commit {
+            Commit {
+                name: who.to_string(),
+                email: format!("{who}@example.org"),
+                files: files.iter().map(|f| f.to_string()).collect(),
+            }
+        }
+
+        fn known(files: &[&str]) -> HashSet<String> {
+            files.iter().map(|f| f.to_string()).collect()
+        }
+
+        #[test]
+        fn the_log_is_split_into_commits_and_files() {
+            let log = "\u{1}Ann Ng\u{1f}ann@example.org\na.txt\nsub/b.txt\n\n\
+                       \u{1}Bo\u{1f}bo@example.org\n\"quoted\\tname.txt\"\nc.txt\n";
+            let commits = parse_log(log);
+            assert_eq!(commits.len(), 2);
+            assert_eq!(commits[0].name, "Ann Ng");
+            assert_eq!(commits[0].files, ["a.txt", "sub/b.txt"]);
+            // A name git had to quote is left out.
+            assert_eq!(commits[1].files, ["c.txt"]);
+        }
+
+        #[test]
+        fn files_link_after_three_commits_and_half_of_the_smaller_history() {
+            let mut commits = Vec::new();
+            // a and b change together 3 times; a also changes alone 3 times
+            // (3 of its 6, and all 3 of b's: ratio 1.0).
+            for _ in 0..3 {
+                commits.push(commit("ann", &["a", "b"]));
+                commits.push(commit("bo", &["a"]));
+            }
+            // c and d: 2 times only.
+            commits.push(commit("ann", &["c", "d"]));
+            commits.push(commit("ann", &["c", "d"]));
+            // e and f: 3 times together, but e changes alone 7 more times
+            // and f too: 3 of 10 each is under half.
+            for _ in 0..3 {
+                commits.push(commit("ann", &["e", "f"]));
+            }
+            for _ in 0..7 {
+                commits.push(commit("ann", &["e"]));
+                commits.push(commit("ann", &["f"]));
+            }
+            // A mass commit says nothing.
+            let many: Vec<String> = (0..80).map(|i| format!("m{i}")).collect();
+            for _ in 0..3 {
+                commits.push(Commit {
+                    name: "x".into(),
+                    email: "x@example.org".into(),
+                    files: many.clone(),
+                });
+            }
+            let all: Vec<&str> = ["a", "b", "c", "d", "e", "f"].to_vec();
+            let mut names: HashSet<String> = known(&all);
+            names.extend(many.iter().cloned());
+            let facts = analyze(&commits, &names);
+            assert_eq!(
+                facts.together,
+                [("a".to_string(), "b".to_string(), 3, 6, 3)]
+            );
+            // Authors are counted per file, busiest first.
+            let a = &facts.authors["a"];
+            assert_eq!((a[0].email.as_str(), a[0].commits), ("ann@example.org", 3));
+            assert_eq!((a[1].email.as_str(), a[1].commits), ("bo@example.org", 3));
+        }
+
+        #[test]
+        fn a_file_the_graph_does_not_hold_is_ignored() {
+            let commits = vec![
+                commit("ann", &["a", "gone"]),
+                commit("ann", &["a", "gone"]),
+                commit("ann", &["a", "gone"]),
+            ];
+            let facts = analyze(&commits, &known(&["a"]));
+            assert!(facts.together.is_empty());
+            assert!(facts.authors.contains_key("a") && !facts.authors.contains_key("gone"));
+        }
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -118505,6 +118781,10 @@ mod knowledge_graph {
         /// Which sheets of a workbook its formulas reach (other sheets, or
         /// sheets of other workbooks).
         pub(crate) sheet_refs: Vec<doc_text::SheetRef>,
+        /// Files that change in the same commits (only with `--git`; not
+        /// cached, as it depends on the repository, not on this file):
+        /// (other file, commits both are in, this file's, the other's).
+        pub(crate) changes_with: Vec<(String, u32, u32, u32)>,
     }
 
     pub(crate) struct CollectOptions {
@@ -118524,6 +118804,9 @@ mod knowledge_graph {
         pub(crate) patterns_fingerprint: u64,
         /// Read the people mail, contacts and calendars name.
         pub(crate) people: bool,
+        /// Read the git history of the folder: who changed each file and
+        /// which files change together.
+        pub(crate) git: bool,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -118658,11 +118941,63 @@ mod knowledge_graph {
                 .collect();
             prune_cache(dir, &keep);
         }
+        if opts.git {
+            attach_git_history(input, &mut out)?;
+        }
         let name = input
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| input.display().to_string());
         Ok((name, out))
+    }
+
+    /// Reads the git history of the graphed folder and gives each file its
+    /// authors (as people, role `git-author`) and the files that change
+    /// with it. Run after the per-file cache, since the history belongs to
+    /// the repository, not to a file.
+    fn attach_git_history(input: &Path, files: &mut [KgFile]) -> Result<()> {
+        let dir = if input.is_dir() {
+            input
+        } else {
+            input.parent().unwrap_or_else(|| Path::new("."))
+        };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let commits = git_history::read(dir, git_history::MAX_COMMITS)?;
+        let known: HashSet<String> = files.iter().map(|f| f.rel.clone()).collect();
+        let facts = git_history::analyze(&commits, &known);
+        for f in files.iter_mut() {
+            if let Some(authors) = facts.authors.get(&f.rel) {
+                for a in authors {
+                    f.people.push(PersonRef {
+                        group: 0,
+                        email: Some(a.email.clone()),
+                        name: Some(a.name.clone()).filter(|n| !n.is_empty()),
+                        role: "git-author".to_string(),
+                        count: a.commits,
+                        org: None,
+                    });
+                }
+            }
+        }
+        let index: HashMap<&str, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.rel.as_str(), i))
+            .collect();
+        let mut placed: Vec<(usize, (String, u32, u32, u32))> = Vec::new();
+        for (a, b, together, own_a, own_b) in &facts.together {
+            if let Some(&ai) = index.get(a.as_str()) {
+                placed.push((ai, (b.clone(), *together, *own_a, *own_b)));
+            }
+        }
+        for (ai, entry) in placed {
+            files[ai].changes_with.push(entry);
+        }
+        Ok(())
     }
 
     // ---- Per-file cache ----
@@ -119453,6 +119788,7 @@ mod knowledge_graph {
                 None => Vec::new(),
                 Some(p) => sheet_refs_from_json(p)?,
             },
+            changes_with: Vec::new(),
         })
     }
 
@@ -120141,6 +120477,7 @@ mod knowledge_graph {
             code: None,
             people: Vec::new(),
             sheet_refs: Vec::new(),
+            changes_with: Vec::new(),
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -121848,10 +122185,12 @@ mod knowledge_graph {
         /// A person to the organization their address belongs to
         /// (`--people`).
         MemberOf,
+        /// Two files that change in the same commits (`--git`).
+        ChangesWith,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 24] = [
+        pub(crate) const ALL: [Relation; 25] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -121876,6 +122215,7 @@ mod knowledge_graph {
             Relation::AuthoredBy,
             Relation::SamePerson,
             Relation::MemberOf,
+            Relation::ChangesWith,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -121904,6 +122244,7 @@ mod knowledge_graph {
                 Relation::AuthoredBy => "authored_by",
                 Relation::SamePerson => "same_person",
                 Relation::MemberOf => "member_of",
+                Relation::ChangesWith => "changes_with",
             }
         }
 
@@ -122360,6 +122701,7 @@ mod knowledge_graph {
         let code_links = link_code(&mut b, &files, &file_node, &table_nodes);
         let unresolved = link_references(&mut b, &files, &contents, &file_node, &code_links.typed);
         link_sheet_refs(&mut b, &files, &file_node, &table_nodes);
+        link_changes_with(&mut b, &files, &file_node);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
@@ -123598,13 +123940,14 @@ mod knowledge_graph {
             "reply-to" => format!("reply-to on {n} {}", plural("message")),
             "organizer" => format!("organizer of {n} {}", plural("event")),
             "attendee" => format!("attendee of {n} {}", plural("event")),
+            "git-author" => format!("author of {n} {}", plural("commit")),
             "card" => "has a contact card".to_string(),
             other => format!("{other} ×{n}"),
         }
     }
 
     /// Roles in the order a reader expects them.
-    const ROLE_ORDER: [&str; 9] = [
+    const ROLE_ORDER: [&str; 10] = [
         "from",
         "sender",
         "to",
@@ -123613,6 +123956,7 @@ mod knowledge_graph {
         "reply-to",
         "organizer",
         "attendee",
+        "git-author",
         "card",
     ];
 
@@ -123672,6 +124016,36 @@ mod knowledge_graph {
     /// different addresses (AMBIGUOUS, up to five). `member_of` joins a
     /// person to the organization domain of their address when that is
     /// already a node.
+    /// Files that change in the same commits (`--git`): an undirected
+    /// `changes_with` link, INFERRED, scored by the share of the
+    /// less-changed file's commits the other is in.
+    fn link_changes_with(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let index: HashMap<&str, usize> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.rel.as_str(), i))
+            .collect();
+        for (fi, f) in files.iter().enumerate() {
+            for (other, together, own, other_own) in &f.changes_with {
+                let Some(&oi) = index.get(other.as_str()) else {
+                    continue;
+                };
+                let ratio = f64::from(*together) / f64::from((*own).min(*other_own)).max(1.0);
+                b.add_edge(
+                    file_node[fi],
+                    file_node[oi],
+                    Relation::ChangesWith,
+                    Conf::Inferred,
+                    ratio.min(1.0),
+                    1.0 + ratio.min(1.0),
+                    vec![format!(
+                        "changed together in {together} commits ({own} and {other_own} commits each)"
+                    )],
+                );
+            }
+        }
+    }
+
     /// A workbook's formulas that read another sheet become a directed
     /// `references` link from the sheet to the one it reads; formulas that
     /// reach into another workbook link to that workbook's sheet (or the
@@ -126882,6 +127256,7 @@ mod knowledge_graph {
             pub(crate) folders: Option<bool>,
             pub(crate) columns: Option<bool>,
             pub(crate) people: Option<bool>,
+            pub(crate) git: Option<bool>,
             pub(crate) resolution: Option<f64>,
             pub(crate) samples: Option<usize>,
             pub(crate) jobs: Option<usize>,
@@ -127014,6 +127389,7 @@ mod knowledge_graph {
                         "folders",
                         "columns",
                         "people",
+                        "git",
                         "resolution",
                         "samples",
                         "jobs",
@@ -127037,6 +127413,12 @@ mod knowledge_graph {
                     cfg.people = Some(c.as_bool().ok_or_else(|| {
                         anyhow!("{origin}: [graph] people must be true or false")
                     })?);
+                }
+                if let Some(c) = g.get("git") {
+                    cfg.git =
+                        Some(c.as_bool().ok_or_else(|| {
+                            anyhow!("{origin}: [graph] git must be true or false")
+                        })?);
                 }
                 if let Some(r) = g.get("resolution") {
                     cfg.resolution = Some(
@@ -129779,6 +130161,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 code: None,
                 people: Vec::new(),
                 sheet_refs: Vec::new(),
+                changes_with: Vec::new(),
             }
         }
 
@@ -131288,6 +131671,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 code: None,
                 people: Vec::new(),
                 sheet_refs: Vec::new(),
+                changes_with: Vec::new(),
             }
         }
 
@@ -131430,6 +131814,8 @@ USAGE:
                    different addresses (AMBIGUOUS)
       member_of    with --people: a person to the organization their
                    address belongs to
+      changes_with with --git: two files that change in the same commits
+                   (INFERRED, scored by how often)
       has_column   with --columns: a table (or a schema shared by several)
                    to a column node it has; the column is shared by two or
                    more tables or used by a query; generic names (id,
@@ -131509,6 +131895,11 @@ OPTIONS:
                                 authors name, joined across files by
                                 address (involves, authored_by,
                                 same_person, member_of)
+        --git                   Read the folder's git history (runs git):
+                                each file's authors become people (role
+                                git-author) and files that change in the
+                                same commits are linked (changes_with).
+                                Implies --people
         --columns               Add a node for each column that tables
                                 share or a query uses, so "which tables
                                 hold customer_id" and "which columns
@@ -131607,6 +131998,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut folders: Option<bool> = None;
     let mut columns: Option<bool> = None;
     let mut people: Option<bool> = None;
+    let mut git: Option<bool> = None;
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
     let mut link_files: Vec<PathBuf> = Vec::new();
@@ -131679,6 +132071,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--people takes no value");
                     }
                     people = Some(true);
+                }
+                "git" => {
+                    if inline_value.is_some() {
+                        bail!("--git takes no value");
+                    }
+                    git = Some(true);
                 }
                 "resolution" => {
                     let v = value(&mut i)?;
@@ -131805,7 +132203,9 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let jobs = jobs.or(cfg.jobs);
     let folders = folders.or(cfg.folders).unwrap_or(false);
     let columns = columns.or(cfg.columns).unwrap_or(false);
-    let people = people.or(cfg.people).unwrap_or(false);
+    let git = git.or(cfg.git).unwrap_or(false);
+    // The authors in the history are people, so `--git` reads people too.
+    let people = people.or(cfg.people).unwrap_or(false) || git;
     let resolution = resolution.or(cfg.resolution).unwrap_or(1.0);
     let patterns = cfg.patterns()?;
     let patterns_fingerprint = cfg.fingerprint();
@@ -131823,6 +132223,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             patterns,
             patterns_fingerprint,
             people,
+            git,
         },
     )?;
     if files.is_empty() {
@@ -132078,7 +132479,8 @@ fn load_knowledge_graph_input(
                 cache_dir: None,
                 patterns,
                 patterns_fingerprint,
-                people: cfg.people.unwrap_or(false),
+                people: cfg.people.unwrap_or(false) || cfg.git.unwrap_or(false),
+                git: cfg.git.unwrap_or(false),
             },
         )?;
         if files.is_empty() {
@@ -132092,7 +132494,7 @@ fn load_knowledge_graph_input(
                 folders: cfg.folders.unwrap_or(false),
                 resolution: cfg.resolution.unwrap_or(1.0),
                 columns: cfg.columns.unwrap_or(false),
-                people: cfg.people.unwrap_or(false),
+                people: cfg.people.unwrap_or(false) || cfg.git.unwrap_or(false),
                 overrides: std::mem::take(&mut cfg.overrides),
             },
         )?));
