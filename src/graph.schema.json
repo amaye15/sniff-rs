@@ -1,0 +1,80 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/amaye15/sniff-rs/graph.schema.json",
+  "title": "sniff-rs graph.json",
+  "description": "A knowledge graph written by `sniff-rs graph`, in networkx node-link form. Version 1. Fields may be added within a version; a field that changes meaning or goes away bumps `graph.version`.",
+  "type": "object",
+  "required": ["directed", "multigraph", "graph", "nodes", "links"],
+  "properties": {
+    "directed": { "type": "boolean", "description": "Always false: a link's own `directed` flag says when it has a direction." },
+    "multigraph": { "type": "boolean" },
+    "graph": {
+      "type": "object",
+      "required": ["generator", "version", "input", "files", "relations", "communities"],
+      "properties": {
+        "generator": { "type": "string", "description": "`sniff-rs <version>`." },
+        "version": { "type": "integer", "minimum": 1, "description": "The graph.json format version." },
+        "input": { "type": "string" },
+        "files": { "type": "integer", "minimum": 0 },
+        "file_types": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "relations": { "type": "object", "additionalProperties": { "type": "integer" } },
+        "unresolved_references": { "type": "integer", "minimum": 0 },
+        "communities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "label", "size"],
+            "properties": {
+              "id": { "type": "integer", "minimum": 0 },
+              "label": { "type": "string" },
+              "size": { "type": "integer", "minimum": 1 },
+              "composition": { "type": "object", "additionalProperties": { "type": "integer" } }
+            }
+          }
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "type", "file_type", "community"],
+        "properties": {
+          "id": { "type": "string", "description": "A relative path, `file#table`, or `kind:value` for an entity." },
+          "label": { "type": "string" },
+          "type": { "enum": ["file", "table", "entity", "schema", "folder"] },
+          "file_type": { "type": "string", "description": "The data type (csv, pdf, png, ...), or an entity's kind (email, doi, ...)." },
+          "source_file": { "type": "string" },
+          "community": { "type": "integer", "minimum": 0 },
+          "degree": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["source", "target", "relation", "confidence", "confidence_score", "weight", "evidence"],
+        "properties": {
+          "source": { "type": "string", "description": "A node id." },
+          "target": { "type": "string", "description": "A node id." },
+          "relation": {
+            "enum": [
+              "contains", "has_schema", "joins", "references", "mentions", "shares_identifiers",
+              "similar_to", "same_name", "shares_key", "duplicate_of", "metadata", "in_folder",
+              "related_to"
+            ]
+          },
+          "confidence": { "enum": ["EXTRACTED", "INFERRED", "AMBIGUOUS"] },
+          "confidence_score": { "type": "number" },
+          "weight": { "type": "number" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "directed": { "type": "boolean", "description": "Present and true when the link points from source to target." },
+          "provenance": { "enum": ["external", "manual"], "description": "Absent for a link this tool found itself." },
+          "by": { "type": "string", "description": "Who asserted an external or manual link." },
+          "label": { "type": "string", "description": "The relation's own name on a related_to link." }
+        }
+      }
+    }
+  }
+}

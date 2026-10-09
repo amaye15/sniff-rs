@@ -111002,6 +111002,843 @@ fn run_rank(raw: &[String]) -> Result<()> {
     )
 }
 
+// --- A small regular-expression engine (custom identifier patterns) ---
+//
+// `sniff-rs graph` lets a project name its own identifiers (a ticket
+// number, an invoice number, an employee id) with a pattern. This project
+// has no regex dependency, so this is a small hand-rolled engine: the
+// pattern is parsed to a program and run as a Pike VM (a simulation of all
+// the ways a pattern can match at once), so a match takes time in
+// proportion to the text however the pattern is written - no pattern can
+// make it backtrack without end. Matches are leftmost-first, as in Perl
+// and Python. What it reads: literals and `\` escapes (`\. \\ \n \t \r`
+// and any escaped punctuation), `.` (any character but a newline),
+// classes (`[a-z0-9_]`, `[^...]`, with `\d \w \s` and their negations
+// inside), `\d \w \s \D \W \S` (ASCII), `\b \B`, `^` and `$` (the start
+// and end of the whole text), groups `( )` and `(?: )`, alternation `|`,
+// the quantifiers `* + ? {n} {n,} {n,m}` and their lazy forms, and an
+// `(?i)` at the very start for ASCII case folding. Not read: backreferences,
+// lookaround, named groups, Unicode classes. A pattern may not be longer
+// than 512 characters, nest deeper than 64 groups, repeat more than 100
+// times, or compile to more than 20,000 instructions.
+mod regex_lite {
+    use std::fmt;
+
+    #[derive(Debug)]
+    pub(crate) struct RegexError(pub(crate) String);
+
+    impl fmt::Display for RegexError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    const MAX_PATTERN: usize = 512;
+    const MAX_DEPTH: usize = 64;
+    const MAX_REPEAT: u32 = 100;
+    const MAX_PROGRAM: usize = 20_000;
+
+    #[derive(Clone, Debug)]
+    enum ClassItem {
+        Range(char, char),
+        Digit(bool),
+        Word(bool),
+        Space(bool),
+    }
+
+    #[derive(Clone, Debug)]
+    struct Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    }
+
+    fn is_word(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    fn is_space(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+    }
+
+    impl Class {
+        fn item_matches(item: &ClassItem, c: char) -> bool {
+            match item {
+                ClassItem::Range(a, b) => *a <= c && c <= *b,
+                ClassItem::Digit(neg) => c.is_ascii_digit() != *neg,
+                ClassItem::Word(neg) => is_word(c) != *neg,
+                ClassItem::Space(neg) => is_space(c) != *neg,
+            }
+        }
+
+        fn matches(&self, c: char, fold: bool) -> bool {
+            let hit = |x: char| self.items.iter().any(|i| Class::item_matches(i, x));
+            let found = hit(c)
+                || (fold && c.is_ascii_alphabetic() && {
+                    let other = if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c.to_ascii_lowercase()
+                    };
+                    hit(other)
+                });
+            found != self.negated
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Assert {
+        Start,
+        End,
+        WordBoundary,
+        NotWordBoundary,
+    }
+
+    #[derive(Clone, Debug)]
+    enum Node {
+        Empty,
+        Char(char),
+        Any,
+        Class(Class),
+        Assert(Assert),
+        Cat(Vec<Node>),
+        Alt(Vec<Node>),
+        Repeat {
+            node: Box<Node>,
+            min: u32,
+            max: Option<u32>,
+            greedy: bool,
+        },
+    }
+
+    struct Parser<'a> {
+        chars: Vec<char>,
+        pos: usize,
+        _src: &'a str,
+    }
+
+    impl Parser<'_> {
+        fn peek(&self) -> Option<char> {
+            self.chars.get(self.pos).copied()
+        }
+
+        fn eat(&mut self, c: char) -> bool {
+            if self.peek() == Some(c) {
+                self.pos += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn err<T>(&self, msg: &str) -> Result<T, RegexError> {
+            Err(RegexError(format!("{msg} (at character {})", self.pos + 1)))
+        }
+
+        fn alternation(&mut self, depth: usize) -> Result<Node, RegexError> {
+            if depth > MAX_DEPTH {
+                return self.err("pattern is nested too deeply");
+            }
+            let mut branches = vec![self.concat(depth)?];
+            while self.eat('|') {
+                branches.push(self.concat(depth)?);
+            }
+            Ok(if branches.len() == 1 {
+                branches.pop().expect("one branch")
+            } else {
+                Node::Alt(branches)
+            })
+        }
+
+        fn concat(&mut self, depth: usize) -> Result<Node, RegexError> {
+            let mut items = Vec::new();
+            while let Some(c) = self.peek() {
+                if c == '|' || c == ')' {
+                    break;
+                }
+                let atom = self.atom(depth)?;
+                items.push(self.quantified(atom)?);
+            }
+            Ok(match items.len() {
+                0 => Node::Empty,
+                1 => items.pop().expect("one item"),
+                _ => Node::Cat(items),
+            })
+        }
+
+        fn number(&mut self) -> Option<u32> {
+            let start = self.pos;
+            while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                self.pos += 1;
+            }
+            if self.pos == start {
+                return None;
+            }
+            self.chars[start..self.pos]
+                .iter()
+                .collect::<String>()
+                .parse()
+                .ok()
+        }
+
+        fn quantified(&mut self, atom: Node) -> Result<Node, RegexError> {
+            let node = atom;
+            {
+                let (min, max) = match self.peek() {
+                    Some('*') => (0, None),
+                    Some('+') => (1, None),
+                    Some('?') => (0, Some(1)),
+                    Some('{') => {
+                        let save = self.pos;
+                        self.pos += 1;
+                        let Some(lo) = self.number() else {
+                            self.pos = save;
+                            // Not a counted repeat: a literal `{`.
+                            return Ok(node);
+                        };
+                        let hi = if self.eat(',') {
+                            if self.peek() == Some('}') {
+                                None
+                            } else {
+                                match self.number() {
+                                    Some(h) => Some(h),
+                                    None => {
+                                        self.pos = save;
+                                        return Ok(node);
+                                    }
+                                }
+                            }
+                        } else {
+                            Some(lo)
+                        };
+                        if self.peek() != Some('}') {
+                            self.pos = save;
+                            return Ok(node);
+                        }
+                        if lo > MAX_REPEAT || hi.is_some_and(|h| h > MAX_REPEAT) {
+                            return self.err("a repeat count is over 100");
+                        }
+                        if hi.is_some_and(|h| h < lo) {
+                            return self.err("a repeat's maximum is below its minimum");
+                        }
+                        // Leave the `}` for the common advance below.
+                        (lo, hi)
+                    }
+                    _ => return Ok(node),
+                };
+                self.pos += 1;
+                let greedy = !self.eat('?');
+                if matches!(node, Node::Assert(_)) {
+                    return self.err("a quantifier cannot follow an assertion");
+                }
+                if matches!(self.peek(), Some('*' | '+' | '?')) {
+                    return self.err("a quantifier follows another quantifier");
+                }
+                Ok(Node::Repeat {
+                    node: Box::new(node),
+                    min,
+                    max,
+                    greedy,
+                })
+            }
+        }
+
+        fn escape_class(c: char) -> Option<ClassItem> {
+            Some(match c {
+                'd' => ClassItem::Digit(false),
+                'D' => ClassItem::Digit(true),
+                'w' => ClassItem::Word(false),
+                'W' => ClassItem::Word(true),
+                's' => ClassItem::Space(false),
+                'S' => ClassItem::Space(true),
+                _ => return None,
+            })
+        }
+
+        fn escaped_char(&mut self, c: char) -> Result<char, RegexError> {
+            Ok(match c {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'f' => '\x0c',
+                'v' => '\x0b',
+                c if c.is_ascii_alphanumeric() => {
+                    return self.err("an unknown escape (only \\d \\w \\s \\D \\W \\S \\b \\B \\n \\t \\r \\f \\v and escaped punctuation are read)");
+                }
+                c => c,
+            })
+        }
+
+        fn atom(&mut self, depth: usize) -> Result<Node, RegexError> {
+            let c = self.peek().expect("caller checked");
+            self.pos += 1;
+            match c {
+                '(' => {
+                    if self.eat('?') && !self.eat(':') {
+                        return self.err("only (?: ) groups are read");
+                    }
+                    let inner = self.alternation(depth + 1)?;
+                    if !self.eat(')') {
+                        return self.err("a group is not closed");
+                    }
+                    Ok(inner)
+                }
+                '[' => self.class(),
+                '.' => Ok(Node::Any),
+                '^' => Ok(Node::Assert(Assert::Start)),
+                '$' => Ok(Node::Assert(Assert::End)),
+                '*' | '+' | '?' => {
+                    self.pos -= 1;
+                    self.err("a quantifier has nothing before it")
+                }
+                '\\' => {
+                    let Some(e) = self.peek() else {
+                        return self.err("a pattern cannot end with a backslash");
+                    };
+                    self.pos += 1;
+                    if let Some(item) = Parser::escape_class(e) {
+                        return Ok(Node::Class(Class {
+                            negated: false,
+                            items: vec![item],
+                        }));
+                    }
+                    match e {
+                        'b' => Ok(Node::Assert(Assert::WordBoundary)),
+                        'B' => Ok(Node::Assert(Assert::NotWordBoundary)),
+                        e => Ok(Node::Char(self.escaped_char(e)?)),
+                    }
+                }
+                c => Ok(Node::Char(c)),
+            }
+        }
+
+        fn class(&mut self) -> Result<Node, RegexError> {
+            let negated = self.eat('^');
+            let mut items: Vec<ClassItem> = Vec::new();
+            let mut first = true;
+            loop {
+                let Some(c) = self.peek() else {
+                    return self.err("a class is not closed");
+                };
+                self.pos += 1;
+                if c == ']' && !first {
+                    break;
+                }
+                first = false;
+                let lo = if c == '\\' {
+                    let Some(e) = self.peek() else {
+                        return self.err("a pattern cannot end with a backslash");
+                    };
+                    self.pos += 1;
+                    if let Some(item) = Parser::escape_class(e) {
+                        items.push(item);
+                        continue;
+                    }
+                    if e == 'b' {
+                        '\x08'
+                    } else {
+                        self.escaped_char(e)?
+                    }
+                } else {
+                    c
+                };
+                // A range `a-z`, unless the `-` is last or first.
+                if self.peek() == Some('-')
+                    && self.chars.get(self.pos + 1).is_some_and(|n| *n != ']')
+                {
+                    self.pos += 1;
+                    let hc = self.peek().expect("checked");
+                    self.pos += 1;
+                    let hi = if hc == '\\' {
+                        let Some(e) = self.peek() else {
+                            return self.err("a pattern cannot end with a backslash");
+                        };
+                        self.pos += 1;
+                        if Parser::escape_class(e).is_some() {
+                            return self.err("a class range cannot end in a class escape");
+                        }
+                        self.escaped_char(e)?
+                    } else {
+                        hc
+                    };
+                    if hi < lo {
+                        return self.err("a class range is backwards");
+                    }
+                    items.push(ClassItem::Range(lo, hi));
+                } else {
+                    items.push(ClassItem::Range(lo, lo));
+                }
+            }
+            Ok(Node::Class(Class { negated, items }))
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Inst {
+        Char(char),
+        Any,
+        Class(usize),
+        Assert(Assert),
+        /// Try the first target, then the second.
+        Split(usize, usize),
+        Jmp(usize),
+        Match,
+    }
+
+    /// A compiled pattern.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Regex {
+        prog: Vec<Inst>,
+        classes: Vec<Class>,
+        fold: bool,
+    }
+
+    struct Compiler {
+        prog: Vec<Inst>,
+        classes: Vec<Class>,
+    }
+
+    impl Compiler {
+        fn push(&mut self, i: Inst) -> Result<usize, RegexError> {
+            if self.prog.len() >= MAX_PROGRAM {
+                return Err(RegexError(
+                    "the pattern is too large (over 20,000 instructions)".to_string(),
+                ));
+            }
+            self.prog.push(i);
+            Ok(self.prog.len() - 1)
+        }
+
+        fn emit(&mut self, node: &Node) -> Result<(), RegexError> {
+            match node {
+                Node::Empty => {}
+                Node::Char(c) => {
+                    self.push(Inst::Char(*c))?;
+                }
+                Node::Any => {
+                    self.push(Inst::Any)?;
+                }
+                Node::Class(c) => {
+                    self.classes.push(c.clone());
+                    let idx = self.classes.len() - 1;
+                    self.push(Inst::Class(idx))?;
+                }
+                Node::Assert(a) => {
+                    self.push(Inst::Assert(*a))?;
+                }
+                Node::Cat(items) => {
+                    for i in items {
+                        self.emit(i)?;
+                    }
+                }
+                Node::Alt(branches) => {
+                    let mut jumps = Vec::new();
+                    for (i, b) in branches.iter().enumerate() {
+                        if i + 1 < branches.len() {
+                            let split = self.push(Inst::Split(0, 0))?;
+                            self.emit(b)?;
+                            jumps.push(self.push(Inst::Jmp(0))?);
+                            let next = self.prog.len();
+                            self.prog[split] = Inst::Split(split + 1, next);
+                        } else {
+                            self.emit(b)?;
+                        }
+                    }
+                    let end = self.prog.len();
+                    for j in jumps {
+                        self.prog[j] = Inst::Jmp(end);
+                    }
+                }
+                Node::Repeat {
+                    node,
+                    min,
+                    max,
+                    greedy,
+                } => {
+                    for _ in 0..*min {
+                        self.emit(node)?;
+                    }
+                    let pick = |body: usize, exit: usize| {
+                        if *greedy {
+                            Inst::Split(body, exit)
+                        } else {
+                            Inst::Split(exit, body)
+                        }
+                    };
+                    match max {
+                        None => {
+                            // x* after the required copies.
+                            let split = self.push(Inst::Split(0, 0))?;
+                            self.emit(node)?;
+                            self.push(Inst::Jmp(split))?;
+                            let exit = self.prog.len();
+                            self.prog[split] = pick(split + 1, exit);
+                        }
+                        Some(max) => {
+                            // (x(x(x)?)?)? for the optional copies.
+                            let mut splits = Vec::new();
+                            for _ in *min..*max {
+                                splits.push(self.push(Inst::Split(0, 0))?);
+                                self.emit(node)?;
+                            }
+                            let exit = self.prog.len();
+                            for s in splits {
+                                self.prog[s] = pick(s + 1, exit);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// The threads alive at one position, in priority order, and which
+    /// instructions already have one (so a position holds each once).
+    struct ThreadList {
+        items: Vec<(usize, usize)>,
+        seen: Vec<u32>,
+        epoch: u32,
+    }
+
+    impl ThreadList {
+        fn new(n: usize) -> ThreadList {
+            ThreadList {
+                items: Vec::new(),
+                seen: vec![0; n],
+                epoch: 0,
+            }
+        }
+
+        /// Starts a new position: empty, nothing seen.
+        fn begin(&mut self) {
+            self.items.clear();
+            self.epoch += 1;
+        }
+    }
+
+    impl Regex {
+        pub(crate) fn new(pattern: &str) -> Result<Regex, RegexError> {
+            if pattern.chars().count() > MAX_PATTERN {
+                return Err(RegexError(
+                    "a pattern is limited to 512 characters".to_string(),
+                ));
+            }
+            let (fold, body) = match pattern.strip_prefix("(?i)") {
+                Some(rest) => (true, rest),
+                None => (false, pattern),
+            };
+            let mut p = Parser {
+                chars: body.chars().collect(),
+                pos: 0,
+                _src: body,
+            };
+            let ast = p.alternation(0)?;
+            if p.pos < p.chars.len() {
+                return p.err("an unmatched )");
+            }
+            let mut c = Compiler {
+                prog: Vec::new(),
+                classes: Vec::new(),
+            };
+            c.emit(&ast)?;
+            c.push(Inst::Match)?;
+            Ok(Regex {
+                prog: c.prog,
+                classes: c.classes,
+                fold,
+            })
+        }
+
+        fn assert_holds(a: Assert, text: &str, pos: usize) -> bool {
+            let before = text[..pos].chars().next_back();
+            let after = text[pos..].chars().next();
+            match a {
+                Assert::Start => pos == 0,
+                Assert::End => pos == text.len(),
+                Assert::WordBoundary | Assert::NotWordBoundary => {
+                    let b = before.is_some_and(is_word) != after.is_some_and(is_word);
+                    b == (a == Assert::WordBoundary)
+                }
+            }
+        }
+
+        /// Adds the threads reachable from `pc` without consuming input,
+        /// in priority order.
+        fn add_thread(&self, tl: &mut ThreadList, pc: usize, start: usize, text: &str, pos: usize) {
+            let mut stack = vec![pc];
+            while let Some(pc) = stack.pop() {
+                if tl.seen[pc] == tl.epoch {
+                    continue;
+                }
+                tl.seen[pc] = tl.epoch;
+                match &self.prog[pc] {
+                    Inst::Jmp(t) => stack.push(*t),
+                    Inst::Split(a, b) => {
+                        // The first target is tried first, so it is popped
+                        // first.
+                        stack.push(*b);
+                        stack.push(*a);
+                    }
+                    Inst::Assert(a) => {
+                        if Regex::assert_holds(*a, text, pos) {
+                            stack.push(pc + 1);
+                        }
+                    }
+                    _ => tl.items.push((pc, start)),
+                }
+            }
+        }
+
+        /// The leftmost-first match starting at or after byte `from`.
+        fn find_at(&self, text: &str, from: usize) -> Option<(usize, usize)> {
+            let n = self.prog.len();
+            let mut clist = ThreadList::new(n);
+            let mut nlist = ThreadList::new(n);
+            clist.begin();
+            let mut matched: Option<(usize, usize)> = None;
+            let mut pos = from;
+            loop {
+                if matched.is_none() {
+                    self.add_thread(&mut clist, 0, pos, text, pos);
+                }
+                if clist.items.is_empty() {
+                    // Nothing alive here (an assertion failed, say): a match
+                    // may still start further on.
+                    match text[pos..].chars().next() {
+                        Some(c) if matched.is_none() => {
+                            pos += c.len_utf8();
+                            clist.begin();
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
+                let ch = text[pos..].chars().next();
+                let width = ch.map_or(0, char::len_utf8);
+                nlist.begin();
+                for &(pc, start) in &clist.items {
+                    let advance = match &self.prog[pc] {
+                        Inst::Match => {
+                            matched = Some((start, pos));
+                            break;
+                        }
+                        Inst::Char(c) => ch.is_some_and(|x| {
+                            x == *c
+                                || (self.fold
+                                    && x.is_ascii_alphabetic()
+                                    && c.is_ascii_alphabetic()
+                                    && x.eq_ignore_ascii_case(c))
+                        }),
+                        Inst::Any => ch.is_some_and(|x| x != '\n'),
+                        Inst::Class(i) => {
+                            ch.is_some_and(|x| self.classes[*i].matches(x, self.fold))
+                        }
+                        _ => false,
+                    };
+                    if advance {
+                        self.add_thread(&mut nlist, pc + 1, start, text, pos + width);
+                    }
+                }
+                std::mem::swap(&mut clist, &mut nlist);
+                if ch.is_none() {
+                    break;
+                }
+                pos += width;
+            }
+            matched
+        }
+
+        /// Whether the pattern matches the empty string (such a pattern
+        /// finds nothing useful: empty matches are skipped).
+        pub(crate) fn matches_empty(&self) -> bool {
+            self.find_at("", 0).is_some()
+        }
+
+        /// Every non-overlapping, non-empty match, leftmost-first, as byte
+        /// ranges.
+        pub(crate) fn find_all(&self, text: &str) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while from <= text.len() {
+                let Some((s, e)) = self.find_at(text, from) else {
+                    break;
+                };
+                if e > s {
+                    out.push((s, e));
+                    from = e;
+                } else {
+                    // An empty match: step over one character.
+                    match text[s..].chars().next() {
+                        Some(c) => from = s + c.len_utf8(),
+                        None => break,
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod regex_lite_tests {
+    use super::json_support;
+    use super::regex_lite::Regex;
+
+    fn spans(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+        Regex::new(pattern).unwrap().find_all(text)
+    }
+
+    fn found<'a>(pattern: &str, text: &'a str) -> Vec<&'a str> {
+        spans(pattern, text)
+            .into_iter()
+            .map(|(a, b)| &text[a..b])
+            .collect()
+    }
+
+    #[test]
+    fn matches_python_re() {
+        // Every line is [pattern, text, [[start, end], ...]] in characters,
+        // from `tools/gen_regex_vectors.py` (Python's `re`, ASCII mode).
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/regex_vectors.jsonl"
+        );
+        let data = std::fs::read_to_string(path).unwrap();
+        let mut checked = 0;
+        let mut with_matches = 0;
+        for line in data.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let a = v.as_array().unwrap();
+            let (pattern, text) = (a[0].as_str().unwrap(), a[1].as_str().unwrap());
+            let want: Vec<(usize, usize)> = a[2]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    let p = p.as_array().unwrap();
+                    (
+                        p[0].as_u64().unwrap() as usize,
+                        p[1].as_u64().unwrap() as usize,
+                    )
+                })
+                .collect();
+            let re = Regex::new(pattern).unwrap_or_else(|e| panic!("{pattern:?}: {e}"));
+            let got: Vec<(usize, usize)> = re
+                .find_all(text)
+                .into_iter()
+                .map(|(s, e)| (text[..s].chars().count(), text[..e].chars().count()))
+                .collect();
+            assert_eq!(got, want, "pattern {pattern:?} on {text:?}");
+            checked += 1;
+            with_matches += usize::from(!want.is_empty());
+        }
+        assert_eq!(checked, 3000);
+        assert!(
+            with_matches > 1500,
+            "only {with_matches} cases have a match"
+        );
+    }
+
+    #[test]
+    fn leftmost_first_not_longest() {
+        assert_eq!(found("a|ab", "ab"), vec!["a"]);
+        assert_eq!(found("ab|a", "ab"), vec!["ab"]);
+        assert_eq!(found("a+?", "aaa"), vec!["a", "a", "a"]);
+        assert_eq!(found("a+", "baaac aa"), vec!["aaa", "aa"]);
+    }
+
+    #[test]
+    fn identifier_shapes_people_actually_write() {
+        assert_eq!(
+            found(
+                r"\b[A-Z]{2,5}-\d{1,6}\b",
+                "see PROJ-123, ab-12 and XYZABC-9 plus QA-7."
+            ),
+            vec!["PROJ-123", "QA-7"]
+        );
+        assert_eq!(
+            found(r"INV-\d{4}-\d{5}", "INV-2024-00123 INV-24-1"),
+            vec!["INV-2024-00123"]
+        );
+        assert_eq!(
+            found(r"(?i)emp[_-]?\d+", "EMP_42 emp-7 Emp9 empx"),
+            vec!["EMP_42", "emp-7", "Emp9"]
+        );
+        assert_eq!(
+            found(
+                r"[^\s,;]+@acme\.com",
+                "a@acme.com,b.c@acme.com; d@other.com"
+            ),
+            vec!["a@acme.com", "b.c@acme.com"]
+        );
+    }
+
+    #[test]
+    fn unicode_text_is_matched_by_character() {
+        assert_eq!(found(r"\d+", "日本語 123 café 45"), vec!["123", "45"]);
+        assert_eq!(found(r"caf.", "un café"), vec!["café"]);
+        assert_eq!(found(r"[^a-z ]+", "ab ñandú cd"), vec!["ñ", "ú"]);
+    }
+
+    #[test]
+    fn bad_patterns_are_refused_with_a_reason() {
+        for bad in [
+            "(", "a)", "[a", "*a", "a**", "a{3,2}", "a{200}", r"\q", "a\\", "(?=a)", "[z-a]", "^*",
+        ] {
+            assert!(Regex::new(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(Regex::new(&"a".repeat(513)).is_err());
+        assert!(Regex::new(&format!("{}a{}", "(".repeat(70), ")".repeat(70))).is_err());
+        // A `{` that is not a repeat is a literal.
+        assert_eq!(found("a{x}", "a{x} a"), vec!["a{x}"]);
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_is_detected() {
+        assert!(Regex::new("a*").unwrap().matches_empty());
+        assert!(Regex::new("(x|)").unwrap().matches_empty());
+        assert!(!Regex::new("a+").unwrap().matches_empty());
+        assert!(!Regex::new(r"\d{3}").unwrap().matches_empty());
+    }
+
+    #[test]
+    fn time_is_linear_in_the_text_whatever_the_pattern() {
+        // A backtracking engine takes exponential time on these.
+        let text = format!("{}c", "a".repeat(50_000));
+        let start = std::time::Instant::now();
+        assert!(spans("(a*)*b", &text).is_empty());
+        assert!(spans("(a|aa)+$", &text).is_empty());
+        assert!(spans("(a+)+b", &text).is_empty());
+        assert!(spans(&format!("{}b", "a?".repeat(100)), &text).is_empty());
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn random_patterns_and_texts_never_panic() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let atoms = [
+            "a", "b", ".", "\\d", "\\w", "[a-c]", "[^b]", "(", ")", "|", "*", "+", "?", "{2}",
+            "{1,3}", "^", "$", "\\b", "\\", "[", "]", "é", "(?i)",
+        ];
+        for _ in 0..4000 {
+            let pattern: String = (0..1 + next(8)).map(|_| atoms[next(atoms.len())]).collect();
+            let text: String = (0..next(20))
+                .map(|_| ["a", "b", "é", " ", "1", "\n"][next(6)])
+                .collect();
+            if let Ok(re) = Regex::new(&pattern) {
+                let _ = re.find_all(&text);
+                let _ = re.matches_empty();
+            }
+        }
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -111055,9 +111892,34 @@ mod content_scan {
     pub(crate) struct KnownFiles {
         names: HashSet<String>,
         by_last_word: HashMap<String, Vec<String>>,
+        /// The project's own identifier patterns (see `CustomPattern`).
+        patterns: Vec<CustomPattern>,
+    }
+
+    /// How a custom identifier's match is written into the graph.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Normalize {
+        /// As matched.
+        None,
+        Lower,
+        Upper,
+    }
+
+    /// A `[[identifier]]` from the config file: matches of `regex` in any
+    /// scanned text are identifiers of `kind`.
+    #[derive(Clone)]
+    pub(crate) struct CustomPattern {
+        pub(crate) kind: EntityKind,
+        pub(crate) regex: regex_lite::Regex,
+        pub(crate) normalize: Normalize,
     }
 
     impl KnownFiles {
+        pub(crate) fn with_patterns(mut self, patterns: Vec<CustomPattern>) -> Self {
+            self.patterns = patterns;
+            self
+        }
+
         pub(crate) fn new<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
             let mut known = KnownFiles::default();
             for name in names {
@@ -111124,11 +111986,39 @@ mod content_scan {
         Card,
         Code,
         Id,
+        /// An identifier the project named itself (`[[identifier]]` in the
+        /// config file): an index into the registry of such names.
+        Custom(u16),
+    }
+
+    /// Names of the custom identifier kinds, by `EntityKind::Custom` index.
+    /// Names are registered once per process, before any file is read, and
+    /// live as long as it does.
+    static CUSTOM_KINDS: std::sync::RwLock<Vec<&'static str>> = std::sync::RwLock::new(Vec::new());
+
+    /// The kind for a custom identifier name, registering it on first use.
+    /// At most 256 custom kinds.
+    pub(crate) fn register_custom_kind(name: &str) -> Result<EntityKind> {
+        let mut kinds = CUSTOM_KINDS.write().expect("kind registry poisoned");
+        if let Some(i) = kinds.iter().position(|k| *k == name) {
+            return Ok(EntityKind::Custom(i as u16));
+        }
+        if kinds.len() >= 256 {
+            bail!("at most 256 custom identifier kinds are supported");
+        }
+        kinds.push(Box::leak(name.to_string().into_boxed_str()));
+        Ok(EntityKind::Custom((kinds.len() - 1) as u16))
     }
 
     impl EntityKind {
         pub(crate) fn as_str(self) -> &'static str {
             match self {
+                EntityKind::Custom(i) => CUSTOM_KINDS
+                    .read()
+                    .expect("kind registry poisoned")
+                    .get(i as usize)
+                    .copied()
+                    .unwrap_or("custom"),
                 EntityKind::Email => "email",
                 EntityKind::Domain => "domain",
                 EntityKind::Url => "url",
@@ -111145,7 +112035,7 @@ mod content_scan {
         }
 
         pub(crate) fn parse(s: &str) -> Option<EntityKind> {
-            [
+            let builtin = [
                 EntityKind::Email,
                 EntityKind::Domain,
                 EntityKind::Url,
@@ -111160,7 +112050,14 @@ mod content_scan {
                 EntityKind::Id,
             ]
             .into_iter()
-            .find(|k| k.as_str() == s)
+            .find(|k| k.as_str() == s);
+            builtin.or_else(|| {
+                let kinds = CUSTOM_KINDS.read().expect("kind registry poisoned");
+                kinds
+                    .iter()
+                    .position(|k| *k == s)
+                    .map(|i| EntityKind::Custom(i as u16))
+            })
         }
 
         /// Recognized by a grammar or checksum, not a shape guess.
@@ -111382,8 +112279,27 @@ mod content_scan {
         /// tag-stripped text (where the words live) separately.
         pub(crate) fn scan(&mut self, raw: &str, words: &str) {
             self.scan_entities(raw);
+            self.scan_custom(raw);
             self.scan_refs(raw);
             self.scan_terms(words);
+        }
+
+        /// The project's own identifier patterns, over the raw text.
+        fn scan_custom(&mut self, raw: &str) {
+            let Some(known) = self.known.clone() else {
+                return;
+            };
+            for pat in &known.patterns {
+                for (a, b) in pat.regex.find_all(raw) {
+                    let m = &raw[a..b];
+                    let value = match pat.normalize {
+                        Normalize::None => m.to_string(),
+                        Normalize::Lower => m.to_lowercase(),
+                        Normalize::Upper => m.to_uppercase(),
+                    };
+                    self.emit(pat.kind, value);
+                }
+            }
         }
 
         fn sketch_insert(&mut self, h: u64) {
@@ -112465,7 +113381,10 @@ mod content_scan {
 // instead. Communities come from Louvain modularity (deterministic node
 // order and tie-breaks), labelled by the words their files share.
 mod knowledge_graph {
-    use super::content_scan::{self, ColumnContent, EntityKind, KnownFiles, ScanGuard};
+    use super::content_scan::{
+        self, ColumnContent, CustomPattern, EntityKind, KnownFiles, Normalize, ScanGuard,
+        register_custom_kind,
+    };
     use super::*;
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -112492,7 +113411,13 @@ mod knowledge_graph {
     ];
 
     /// Operating-system clutter files.
-    const SKIP_FILES: [&str; 3] = [".DS_Store", "Thumbs.db", "desktop.ini"];
+    const SKIP_FILES: [&str; 5] = [
+        ".DS_Store",
+        "Thumbs.db",
+        "desktop.ini",
+        ".sniff-rs.toml",
+        ".sniff-rs.json",
+    ];
 
     /// Largest text file scanned for content; anything past this is left
     /// unread (and the file's node says so).
@@ -112560,6 +113485,10 @@ mod knowledge_graph {
         /// Where per-file results are cached between runs; `None` reads
         /// every file every time.
         pub(crate) cache_dir: Option<PathBuf>,
+        /// The project's own identifier patterns, matched in every text.
+        pub(crate) patterns: Vec<CustomPattern>,
+        /// Stands for `patterns` in the cache key.
+        pub(crate) patterns_fingerprint: u64,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -112634,15 +113563,18 @@ mod knowledge_graph {
         } else {
             bail!("{input:?} doesn't exist");
         };
-        let known = Arc::new(KnownFiles::new(
-            paths
-                .iter()
-                .filter_map(|p| p.file_name().and_then(|n| n.to_str())),
-        ));
+        let known = Arc::new(
+            KnownFiles::new(
+                paths
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str())),
+            )
+            .with_patterns(opts.patterns.clone()),
+        );
         // What a cached result also depends on: the file names a text may
         // refer to. A file added, removed or renamed re-reads everything.
         let names = {
-            let mut h = FNV_OFFSET;
+            let mut h = fnv64_extend(FNV_OFFSET, &opts.patterns_fingerprint.to_le_bytes());
             for p in &paths {
                 if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
                     h = fnv64_extend(h, n.as_bytes());
@@ -114335,10 +115267,14 @@ mod knowledge_graph {
         Metadata,
         /// A file or folder sitting in a folder (only with `--folders`).
         InFolder,
+        /// A link someone else asserted (an agent, a person, a config
+        /// file) under a name this tool has no relation for; the name rides
+        /// on the link as its `label`.
+        RelatedTo,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 12] = [
+        pub(crate) const ALL: [Relation; 13] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -114351,6 +115287,7 @@ mod knowledge_graph {
             Relation::DuplicateOf,
             Relation::Metadata,
             Relation::InFolder,
+            Relation::RelatedTo,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -114367,6 +115304,7 @@ mod knowledge_graph {
                 Relation::DuplicateOf => "duplicate_of",
                 Relation::Metadata => "metadata",
                 Relation::InFolder => "in_folder",
+                Relation::RelatedTo => "related_to",
             }
         }
 
@@ -114428,6 +115366,35 @@ mod knowledge_graph {
         pub(crate) community: usize,
     }
 
+    /// Who a link comes from: this tool's own reading of the input, a
+    /// link handed in from outside (`--links`, `graph merge`), or one a
+    /// person wrote into the config file.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(crate) enum Provenance {
+        Extracted,
+        External,
+        Manual,
+    }
+
+    impl Provenance {
+        pub(crate) fn as_str(self) -> &'static str {
+            match self {
+                Provenance::Extracted => "extracted",
+                Provenance::External => "external",
+                Provenance::Manual => "manual",
+            }
+        }
+
+        pub(crate) fn parse(s: &str) -> Option<Provenance> {
+            match s {
+                "extracted" => Some(Provenance::Extracted),
+                "external" => Some(Provenance::External),
+                "manual" => Some(Provenance::Manual),
+                _ => None,
+            }
+        }
+    }
+
     pub(crate) struct KgEdge {
         pub(crate) source: usize,
         pub(crate) target: usize,
@@ -114440,6 +115407,12 @@ mod knowledge_graph {
         /// the referencing table to the referenced one); every other link
         /// is undirected.
         pub(crate) directed: bool,
+        pub(crate) provenance: Provenance,
+        /// Who asserted an external or manual link, as they named
+        /// themselves.
+        pub(crate) by: Option<String>,
+        /// The relation's own name when it is a `related_to` link.
+        pub(crate) label: Option<String>,
     }
 
     pub(crate) struct Community {
@@ -114613,6 +115586,9 @@ mod knowledge_graph {
                 weight,
                 evidence,
                 directed: false,
+                provenance: Provenance::Extracted,
+                by: None,
+                label: None,
             });
         }
     }
@@ -114646,8 +115622,10 @@ mod knowledge_graph {
     /// Build the graph from read files. Deterministic: the same files in
     /// the same order always produce the same nodes, links, and
     /// communities.
+    #[cfg(test)]
     pub(crate) fn build(input: String, files: Vec<KgFile>) -> KnowledgeGraph {
         build_with(input, files, &BuildOptions::default())
+            .expect("a build with no overrides cannot fail")
     }
 
     /// What a build adds beyond the content links.
@@ -114656,6 +115634,8 @@ mod knowledge_graph {
         pub(crate) folders: bool,
         /// Community resolution (see `louvain`); 1.0 is standard.
         pub(crate) resolution: f64,
+        /// Links from outside, rejects, aliases and ignored identifiers.
+        pub(crate) overrides: Overrides,
     }
 
     impl Default for BuildOptions {
@@ -114663,6 +115643,7 @@ mod knowledge_graph {
             BuildOptions {
                 folders: false,
                 resolution: 1.0,
+                overrides: Overrides::default(),
             }
         }
     }
@@ -114671,7 +115652,7 @@ mod knowledge_graph {
         input: String,
         files: Vec<KgFile>,
         opts: &BuildOptions,
-    ) -> KnowledgeGraph {
+    ) -> Result<KnowledgeGraph> {
         let mut b = Builder {
             nodes: Vec::new(),
             edges: Vec::new(),
@@ -114761,7 +115742,7 @@ mod knowledge_graph {
             }
         }
 
-        link_entities(&mut b, &files, &contents, &file_node);
+        link_entities(&mut b, &files, &contents, &file_node, &opts.overrides);
         let unresolved = link_references(&mut b, &files, &contents, &file_node);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
@@ -114771,6 +115752,7 @@ mod knowledge_graph {
         }
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
         link_schemas_and_joins(&mut b, &files, &table_nodes);
+        apply_overrides(&mut b.nodes, &mut b.edges, &opts.overrides)?;
 
         // Top terms on each file node, for labels and notes.
         for (fi, terms) in doc_terms.iter().enumerate() {
@@ -114810,7 +115792,7 @@ mod knowledge_graph {
         for (node, d) in graph.nodes.iter_mut().zip(degrees) {
             node.attrs.insert("degree".to_string(), JsonValue::from(d));
         }
-        graph
+        Ok(graph)
     }
 
     /// One file's mention of an identifier: (file index, occurrences, the
@@ -114824,20 +115806,22 @@ mod knowledge_graph {
     /// Which shared identifiers become nodes first when a set of files
     /// shares more than `ENTITY_NODES_PER_FILE_SET`: the most specific
     /// kinds first.
-    fn kind_priority(kind: EntityKind) -> u8 {
+    fn kind_priority(kind: EntityKind) -> u16 {
         match kind {
-            EntityKind::Email => 0,
-            EntityKind::Iban => 1,
-            EntityKind::Doi => 2,
-            EntityKind::Isbn => 3,
-            EntityKind::Vin => 4,
-            EntityKind::Uuid => 5,
-            EntityKind::Url => 6,
-            EntityKind::Card => 7,
-            EntityKind::Code => 8,
-            EntityKind::Domain => 9,
-            EntityKind::Ip => 10,
-            EntityKind::Id => 11,
+            // What a project names itself is what it cares about most.
+            EntityKind::Custom(i) => i,
+            EntityKind::Email => 256,
+            EntityKind::Iban => 257,
+            EntityKind::Doi => 258,
+            EntityKind::Isbn => 259,
+            EntityKind::Vin => 260,
+            EntityKind::Uuid => 261,
+            EntityKind::Url => 262,
+            EntityKind::Card => 263,
+            EntityKind::Code => 264,
+            EntityKind::Domain => 265,
+            EntityKind::Ip => 266,
+            EntityKind::Id => 267,
         }
     }
 
@@ -114857,15 +115841,30 @@ mod knowledge_graph {
         files: &[KgFile],
         contents: &[FileContent],
         file_node: &[usize],
+        ov: &Overrides,
     ) {
         let mut by_entity: BTreeMap<(EntityKind, String), Vec<Mention>> = BTreeMap::new();
         for (fi, fc) in contents.iter().enumerate() {
             for ((kind, value), (count, column)) in &fc.entities {
-                by_entity.entry((*kind, value.clone())).or_default().push((
-                    fi,
-                    *count,
-                    column.clone(),
-                ));
+                let (mut kind, mut value) = (*kind, value.clone());
+                if !ov.aliases.is_empty()
+                    && let Some(to) = ov.alias_of(&entity_id(kind, &value).to_lowercase())
+                    && let Some((k, v)) = to.split_once(':')
+                    && let Some(k) = EntityKind::parse(k)
+                {
+                    (kind, value) = (k, v.to_string());
+                }
+                if ov.ignores(&entity_id(kind, &value).to_lowercase()) {
+                    continue;
+                }
+                let slot = by_entity.entry((kind, value)).or_default();
+                // Two spellings aliased to one identifier from the same
+                // file are one mention.
+                if let Some(m) = slot.iter_mut().find(|m| m.0 == fi) {
+                    m.1 += *count;
+                } else {
+                    slot.push((fi, *count, column.clone()));
+                }
             }
         }
         let mut by_set: BTreeMap<Vec<usize>, Vec<(EntityKind, String)>> = BTreeMap::new();
@@ -114882,7 +115881,7 @@ mod knowledge_graph {
             }
             shared.sort_by(|x, y| (kind_priority(x.0), &x.1).cmp(&(kind_priority(y.0), &y.1)));
             let rest = &shared[ENTITY_NODES_PER_FILE_SET..];
-            let mut kinds: BTreeMap<u8, (EntityKind, usize)> = BTreeMap::new();
+            let mut kinds: BTreeMap<u16, (EntityKind, usize)> = BTreeMap::new();
             for (k, _) in rest {
                 kinds.entry(kind_priority(*k)).or_insert((*k, 0)).1 += 1;
             }
@@ -116238,8 +117237,9 @@ mod knowledge_graph {
         pending: &mut [PendingJoin],
         tables: &[(usize, usize, &str, &Vec<ColumnProfile>)],
     ) {
-        // (owner node, key) -> referencing nodes.
-        let mut spokes: HashMap<(usize, String), BTreeSet<usize>> = HashMap::new();
+        // (owner node, key) -> referencing nodes. Ordered, so when two
+        // owners both qualify the lower node is always the one named.
+        let mut spokes: BTreeMap<(usize, String), BTreeSet<usize>> = BTreeMap::new();
         for p in pending.iter() {
             if p.directed && p.relation == Relation::Joins && !p.key.is_empty() {
                 spokes
@@ -116931,12 +117931,21 @@ mod knowledge_graph {
         }))
     }
 
+    /// The shape of `graph.json`, bumped when a field changes meaning or
+    /// goes away (adding one does not). Version 1 is the shape written
+    /// before the field existed, so a file with none reads as 1.
+    pub(crate) const GRAPH_JSON_VERSION: u64 = 1;
+
+    /// The JSON Schema (draft-07) `graph.json` follows.
+    pub(crate) const GRAPH_JSON_SCHEMA: &str = include_str!("graph.schema.json");
+
     pub(crate) fn to_json(kg: &KnowledgeGraph) -> JsonValue {
         let mut graph = json_support::Map::new();
         graph.insert(
             "generator".to_string(),
             JsonValue::from(format!("sniff-rs {}", env!("CARGO_PKG_VERSION"))),
         );
+        graph.insert("version".to_string(), JsonValue::from(GRAPH_JSON_VERSION));
         graph.insert("input".to_string(), JsonValue::from(kg.input.clone()));
         let files: Vec<&KgNode> = kg
             .nodes
@@ -117028,6 +118037,18 @@ mod knowledge_graph {
                 if e.directed {
                     m.insert("directed".to_string(), JsonValue::from(true));
                 }
+                if e.provenance != Provenance::Extracted {
+                    m.insert(
+                        "provenance".to_string(),
+                        JsonValue::from(e.provenance.as_str()),
+                    );
+                }
+                if let Some(by) = &e.by {
+                    m.insert("by".to_string(), JsonValue::from(by.clone()));
+                }
+                if let Some(label) = &e.label {
+                    m.insert("label".to_string(), JsonValue::from(label.clone()));
+                }
                 JsonValue::Object(m)
             })
             .collect();
@@ -117075,6 +118096,14 @@ mod knowledge_graph {
                 ("graph", JsonValue::Object(g)) => {
                     for (gk, gv) in g {
                         match (gk.as_str(), gv) {
+                            ("version", n) => {
+                                let v = n.as_u64().unwrap_or(0);
+                                if v > GRAPH_JSON_VERSION {
+                                    bail!(
+                                        "{path:?} is graph.json version {v}, written by a newer sniff-rs; this one reads up to version {GRAPH_JSON_VERSION}"
+                                    );
+                                }
+                            }
                             ("input", JsonValue::String(s)) => input = s,
                             ("unresolved_references", n) => {
                                 unresolved = n.as_u64().unwrap_or(0) as usize;
@@ -117183,6 +118212,16 @@ mod knowledge_graph {
                 .get("directed")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false);
+            let provenance = v
+                .get("provenance")
+                .and_then(JsonValue::as_str)
+                .and_then(Provenance::parse)
+                .unwrap_or(Provenance::Extracted);
+            let by = v.get("by").and_then(JsonValue::as_str).map(str::to_string);
+            let label = v
+                .get("label")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string);
             edges.push(KgEdge {
                 source,
                 target,
@@ -117192,6 +118231,9 @@ mod knowledge_graph {
                 weight,
                 evidence,
                 directed,
+                provenance,
+                by,
+                label,
             });
         }
         let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -117216,6 +118258,882 @@ mod knowledge_graph {
             communities,
             unresolved_references: unresolved,
         })
+    }
+
+    // ---- Links from outside: external, manual, rejected, aliased ----
+    //
+    // The graph this tool reads out of files is not the whole picture: an
+    // agent (or a person) knows things the files do not say. This is how
+    // that knowledge gets in without a model inside the tool. A link
+    // handed in through `--links`, `graph merge`, or a `[[link]]` in the
+    // config file lands in the same graph as the extracted ones (so the
+    // communities see it) and says where it came from (`provenance`,
+    // `by`). A `[[reject]]` removes an extracted link someone has looked at
+    // and ruled out; an `[[alias]]` says two identifiers are one; an
+    // `[ignore]` entity is never linked.
+
+    pub(crate) struct ExtNode {
+        pub(crate) id: String,
+        pub(crate) label: String,
+        pub(crate) node_type: NodeType,
+        pub(crate) kind: String,
+    }
+
+    pub(crate) struct ExtLink {
+        pub(crate) source: String,
+        pub(crate) target: String,
+        pub(crate) relation: Relation,
+        pub(crate) label: Option<String>,
+        pub(crate) confidence: Conf,
+        pub(crate) score: f64,
+        pub(crate) weight: f64,
+        pub(crate) evidence: Vec<String>,
+        pub(crate) by: Option<String>,
+        pub(crate) provenance: Provenance,
+        pub(crate) directed: bool,
+    }
+
+    pub(crate) struct RejectRule {
+        pub(crate) source: Option<String>,
+        pub(crate) target: Option<String>,
+        pub(crate) relation: Option<Relation>,
+    }
+
+    #[derive(Default)]
+    pub(crate) struct Overrides {
+        pub(crate) nodes: Vec<ExtNode>,
+        pub(crate) links: Vec<ExtLink>,
+        pub(crate) rejects: Vec<RejectRule>,
+        /// (from entity id, to entity id), both lowercase `kind:value`.
+        pub(crate) aliases: Vec<(String, String)>,
+        /// Lowercase globs over an entity id.
+        pub(crate) ignore: Vec<String>,
+    }
+
+    impl Overrides {
+        pub(crate) fn alias_of(&self, id: &str) -> Option<&str> {
+            self.aliases
+                .iter()
+                .find(|(from, _)| from == id)
+                .map(|(_, to)| to.as_str())
+        }
+
+        pub(crate) fn ignores(&self, id: &str) -> bool {
+            self.ignore.iter().any(|g| glob_match(g, id))
+        }
+    }
+
+    fn string_field<'a>(v: &'a JsonValue, key: &str) -> Option<&'a str> {
+        v.get(key).and_then(JsonValue::as_str)
+    }
+
+    /// Links and nodes from a JSON document: `{"nodes": [...], "links":
+    /// [...]}` or a bare array of links. `provenance` and `default_by` say
+    /// where they come from; `origin` names the file for error messages.
+    pub(crate) fn parse_links(
+        doc: &JsonValue,
+        provenance: Provenance,
+        default_by: Option<&str>,
+        origin: &str,
+    ) -> Result<(Vec<ExtNode>, Vec<ExtLink>)> {
+        let (nodes_json, links_json): (&[JsonValue], &[JsonValue]) = match doc {
+            JsonValue::Array(a) => (&[], a),
+            JsonValue::Object(_) => (
+                doc.get("nodes")
+                    .and_then(JsonValue::as_array)
+                    .map_or(&[][..], |v| v),
+                doc.get("links")
+                    .and_then(JsonValue::as_array)
+                    .map_or(&[][..], |v| v),
+            ),
+            _ => bail!("{origin}: expected an object with \"links\" (or an array of links)"),
+        };
+        let mut nodes = Vec::new();
+        for (i, n) in nodes_json.iter().enumerate() {
+            let at = format!("{origin}: node {}", i + 1);
+            let id = string_field(n, "id").ok_or_else(|| anyhow!("{at} has no \"id\""))?;
+            let node_type = match string_field(n, "type") {
+                None => NodeType::Entity,
+                Some(t) => NodeType::parse(t).ok_or_else(|| {
+                    anyhow!("{at}: unknown type {t:?} (file, table, entity, schema, folder)")
+                })?,
+            };
+            let kind = string_field(n, "kind")
+                .map(str::to_string)
+                .or_else(|| id.split_once(':').map(|(k, _)| k.to_string()))
+                .unwrap_or_else(|| "concept".to_string());
+            nodes.push(ExtNode {
+                id: id.to_string(),
+                label: string_field(n, "label")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| id.split_once(':').map_or(id, |(_, v)| v).to_string()),
+                node_type,
+                kind,
+            });
+        }
+        let mut links = Vec::new();
+        for (i, l) in links_json.iter().enumerate() {
+            let at = format!("{origin}: link {}", i + 1);
+            let source =
+                string_field(l, "source").ok_or_else(|| anyhow!("{at} has no \"source\""))?;
+            let target =
+                string_field(l, "target").ok_or_else(|| anyhow!("{at} has no \"target\""))?;
+            let name = string_field(l, "relation").unwrap_or("related_to");
+            let (relation, label) = match Relation::parse(name) {
+                Some(r) => (r, string_field(l, "label").map(str::to_string)),
+                None => (
+                    Relation::RelatedTo,
+                    Some(string_field(l, "label").unwrap_or(name).to_string()),
+                ),
+            };
+            let confidence = match string_field(l, "confidence") {
+                None => {
+                    if provenance == Provenance::Manual {
+                        Conf::Extracted
+                    } else {
+                        Conf::Inferred
+                    }
+                }
+                Some(c) => Conf::parse(c).ok_or_else(|| {
+                    anyhow!("{at}: confidence {c:?} is not EXTRACTED, INFERRED or AMBIGUOUS")
+                })?,
+            };
+            let number = |key: &str| -> Result<Option<f64>> {
+                match l.get(key) {
+                    None => Ok(None),
+                    Some(v) => v
+                        .as_f64()
+                        .filter(|x| x.is_finite())
+                        .map(Some)
+                        .ok_or_else(|| anyhow!("{at}: {key:?} must be a number")),
+                }
+            };
+            let score = number("confidence_score")?
+                .or(number("score")?)
+                .unwrap_or(match confidence {
+                    Conf::Extracted => 1.0,
+                    Conf::Inferred => 0.5,
+                    Conf::Ambiguous => 0.25,
+                })
+                .clamp(0.0, 1.0);
+            let weight = number("weight")?.unwrap_or(1.0).clamp(0.05, 10.0);
+            let evidence = match l.get("evidence") {
+                None => Vec::new(),
+                Some(JsonValue::String(s)) => vec![s.clone()],
+                Some(JsonValue::Array(a)) => a
+                    .iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect(),
+                Some(_) => bail!("{at}: \"evidence\" must be a string or an array of strings"),
+            };
+            links.push(ExtLink {
+                source: source.to_string(),
+                target: target.to_string(),
+                relation,
+                label,
+                confidence,
+                score,
+                weight,
+                evidence,
+                by: string_field(l, "by").or(default_by).map(str::to_string),
+                provenance,
+                directed: l
+                    .get("directed")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+        Ok((nodes, links))
+    }
+
+    /// What `apply_overrides` did.
+    #[derive(Default, Debug, PartialEq)]
+    pub(crate) struct OverrideSummary {
+        pub(crate) rejected: usize,
+        pub(crate) nodes_added: usize,
+        pub(crate) links_added: usize,
+        pub(crate) links_merged: usize,
+    }
+
+    /// An entity id is `kind:value` with a plain kind word.
+    fn entity_form(spec: &str) -> Option<(&str, &str)> {
+        let (kind, value) = spec.split_once(':')?;
+        let plain = !kind.is_empty()
+            && kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        (plain && !value.is_empty()).then_some((kind, value))
+    }
+
+    /// The node a link endpoint names: an id, `./`-prefixed or not, a
+    /// unique label, or a unique file name. `None` when it names nothing.
+    fn find_endpoint(
+        nodes: &[KgNode],
+        index: &HashMap<String, usize>,
+        spec: &str,
+    ) -> Option<usize> {
+        let spec = spec.trim();
+        let plain = spec.strip_prefix("./").unwrap_or(spec);
+        if let Some(&i) = index.get(plain) {
+            return Some(i);
+        }
+        let by = |pred: &dyn Fn(&KgNode) -> bool| {
+            let mut hits = nodes.iter().enumerate().filter(|(_, n)| pred(n));
+            match (hits.next(), hits.next()) {
+                (Some((i, _)), None) => Some(i),
+                _ => None,
+            }
+        };
+        by(&|n: &KgNode| n.label == plain && n.node_type != NodeType::Entity)
+            .or_else(|| by(&|n: &KgNode| n.id.rsplit('/').next() == Some(plain)))
+    }
+
+    /// Applies the rejects, then adds the nodes and links. An endpoint of
+    /// the form `kind:value` that names no node becomes an entity node; any
+    /// other unknown endpoint is an error naming it.
+    pub(crate) fn apply_overrides(
+        nodes: &mut Vec<KgNode>,
+        edges: &mut Vec<KgEdge>,
+        ov: &Overrides,
+    ) -> Result<OverrideSummary> {
+        let mut summary = OverrideSummary::default();
+        if !ov.rejects.is_empty() {
+            let before = edges.len();
+            let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+            edges.retain(|e| {
+                !ov.rejects.iter().any(|r| {
+                    let rel_ok = r.relation.is_none_or(|x| x == e.relation);
+                    let (a, b) = (&ids[e.source], &ids[e.target]);
+                    let side = |pat: &Option<String>, id: &str| {
+                        pat.as_deref().is_none_or(|p| glob_match(p, id))
+                    };
+                    rel_ok
+                        && ((side(&r.source, a) && side(&r.target, b))
+                            || (side(&r.source, b) && side(&r.target, a)))
+                })
+            });
+            summary.rejected = before - edges.len();
+        }
+        let mut index: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id.clone(), i))
+            .collect();
+        for n in &ov.nodes {
+            if index.contains_key(&n.id) {
+                continue;
+            }
+            let mut attrs = json_support::Map::new();
+            attrs.insert("external".to_string(), JsonValue::from(true));
+            if n.node_type == NodeType::Entity {
+                attrs.insert("entity_kind".to_string(), JsonValue::from(n.kind.clone()));
+            }
+            index.insert(n.id.clone(), nodes.len());
+            nodes.push(KgNode {
+                id: n.id.clone(),
+                label: n.label.clone(),
+                node_type: n.node_type,
+                file_type: n.kind.clone(),
+                source_file: None,
+                attrs,
+                community: 0,
+            });
+            summary.nodes_added += 1;
+        }
+        let mut unknown: Vec<String> = Vec::new();
+        let mut resolved: Vec<(usize, usize, &ExtLink)> = Vec::new();
+        for l in &ov.links {
+            let mut ends = [0usize; 2];
+            let mut ok = true;
+            for (slot, spec) in [&l.source, &l.target].into_iter().enumerate() {
+                match find_endpoint(nodes, &index, spec) {
+                    Some(i) => ends[slot] = i,
+                    None => match entity_form(spec.trim()) {
+                        Some((kind, value)) => {
+                            let id = spec.trim().to_string();
+                            let mut attrs = json_support::Map::new();
+                            attrs.insert("external".to_string(), JsonValue::from(true));
+                            attrs.insert("entity_kind".to_string(), JsonValue::from(kind));
+                            index.insert(id.clone(), nodes.len());
+                            ends[slot] = nodes.len();
+                            nodes.push(KgNode {
+                                id,
+                                label: value.to_string(),
+                                node_type: NodeType::Entity,
+                                file_type: kind.to_string(),
+                                source_file: None,
+                                attrs,
+                                community: 0,
+                            });
+                            summary.nodes_added += 1;
+                        }
+                        None => {
+                            ok = false;
+                            if !unknown.contains(spec) {
+                                unknown.push(spec.clone());
+                            }
+                        }
+                    },
+                }
+            }
+            if ok {
+                resolved.push((ends[0], ends[1], l));
+            }
+        }
+        if !unknown.is_empty() {
+            let shown: Vec<String> = unknown.iter().take(10).map(|u| format!("{u:?}")).collect();
+            bail!(
+                "{} link endpoint(s) match no node: {}{} (name a node by its relative path, file#table, or kind:value)",
+                unknown.len(),
+                shown.join(", "),
+                if unknown.len() > 10 { ", ..." } else { "" }
+            );
+        }
+        for (s, t, l) in resolved {
+            if s == t {
+                continue;
+            }
+            let mut evidence: Vec<String> = Vec::new();
+            match (&l.by, l.provenance) {
+                (Some(by), _) => evidence.push(format!("asserted by {by}")),
+                (None, Provenance::Manual) => {
+                    evidence.push("asserted in the config file".to_string())
+                }
+                (None, _) => evidence.push("asserted from outside".to_string()),
+            }
+            if let (Relation::RelatedTo, Some(label)) = (l.relation, &l.label) {
+                evidence.push(format!("relation: {label}"));
+            }
+            evidence.extend(l.evidence.iter().cloned());
+            let same = |e: &KgEdge| {
+                e.relation == l.relation
+                    && e.label == l.label
+                    && ((e.source == s && e.target == t) || (e.source == t && e.target == s))
+            };
+            if let Some(e) = edges.iter_mut().find(|e| same(e)) {
+                e.confidence = e.confidence.min(l.confidence);
+                e.score = e.score.max(l.score);
+                e.weight = e.weight.max(l.weight);
+                for line in evidence {
+                    if !e.evidence.contains(&line) {
+                        e.evidence.push(line);
+                    }
+                }
+                summary.links_merged += 1;
+            } else {
+                edges.push(KgEdge {
+                    source: s,
+                    target: t,
+                    relation: l.relation,
+                    confidence: l.confidence,
+                    score: l.score,
+                    weight: l.weight,
+                    evidence,
+                    directed: l.directed,
+                    provenance: l.provenance,
+                    by: l.by.clone(),
+                    label: l.label.clone(),
+                });
+                summary.links_added += 1;
+            }
+        }
+        Ok(summary)
+    }
+
+    // ---- Merging graphs ----
+
+    /// Reclusters a graph whose nodes and links have changed (graphs merged,
+    /// links added): Louvain over every link, the communities relabelled,
+    /// and every node's degree counted again. The words that label a
+    /// community come from each file node's `top_terms`.
+    pub(crate) fn recluster(kg: &mut KnowledgeGraph, resolution: f64) {
+        let file_node: Vec<usize> = kg
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.node_type == NodeType::File)
+            .map(|(i, _)| i)
+            .collect();
+        let doc_terms: Vec<Vec<(String, f64)>> = file_node
+            .iter()
+            .map(|&i| {
+                let terms: Vec<String> = kg.nodes[i]
+                    .attrs
+                    .get("top_terms")
+                    .and_then(JsonValue::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| t.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let n = terms.len().max(1) as f64;
+                terms
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, t)| (t, 1.0 - k as f64 / n))
+                    .collect()
+            })
+            .collect();
+        let membership = louvain(
+            kg.nodes.len(),
+            &kg.edges
+                .iter()
+                .map(|e| (e.source, e.target, e.weight))
+                .collect::<Vec<_>>(),
+            resolution,
+        );
+        kg.communities = communities_from(
+            &mut kg.nodes,
+            &membership,
+            &doc_terms,
+            &file_node,
+            &kg.edges,
+        );
+        let degrees = kg.degrees();
+        for (node, d) in kg.nodes.iter_mut().zip(degrees) {
+            node.attrs.insert("degree".to_string(), JsonValue::from(d));
+        }
+    }
+
+    /// One graph from several: nodes by id (the first graph's version of a
+    /// node wins), links by their two ends, relation and label. A link in
+    /// more than one graph keeps the strongest confidence, the highest score
+    /// and weight, every line of evidence, and the most trusted provenance
+    /// (this tool's own reading, then a person's, then an outside one). The
+    /// result still needs `recluster`.
+    pub(crate) fn merge_graphs(graphs: Vec<KnowledgeGraph>) -> KnowledgeGraph {
+        let mut nodes: Vec<KgNode> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut edges: Vec<KgEdge> = Vec::new();
+        let mut edge_index: HashMap<(usize, usize, Relation, Option<String>), usize> =
+            HashMap::new();
+        let mut inputs: Vec<String> = Vec::new();
+        let mut unresolved = 0;
+        let trust = |p: Provenance| match p {
+            Provenance::Extracted => 0,
+            Provenance::Manual => 1,
+            Provenance::External => 2,
+        };
+        for g in graphs {
+            if !g.input.is_empty() && !inputs.contains(&g.input) {
+                inputs.push(g.input.clone());
+            }
+            unresolved += g.unresolved_references;
+            let mut map: Vec<usize> = Vec::with_capacity(g.nodes.len());
+            for n in g.nodes {
+                let i = *index.entry(n.id.clone()).or_insert_with(|| {
+                    nodes.push(n);
+                    nodes.len() - 1
+                });
+                map.push(i);
+            }
+            for e in g.edges {
+                let (s, t) = (map[e.source], map[e.target]);
+                let (lo, hi) = if e.directed || s <= t { (s, t) } else { (t, s) };
+                let key = (lo, hi, e.relation, e.label.clone());
+                match edge_index.get(&key) {
+                    Some(&at) => {
+                        let m = &mut edges[at];
+                        m.confidence = m.confidence.min(e.confidence);
+                        m.score = m.score.max(e.score);
+                        m.weight = m.weight.max(e.weight);
+                        for line in e.evidence {
+                            if !m.evidence.contains(&line) {
+                                m.evidence.push(line);
+                            }
+                        }
+                        if trust(e.provenance) < trust(m.provenance) {
+                            m.provenance = e.provenance;
+                            m.by = e.by.clone().or(m.by.take());
+                        }
+                        m.directed |= e.directed;
+                    }
+                    None => {
+                        edge_index.insert(key, edges.len());
+                        // Written the way the first graph had it.
+                        edges.push(KgEdge {
+                            source: s,
+                            target: t,
+                            ..e
+                        });
+                    }
+                }
+            }
+        }
+        KnowledgeGraph {
+            input: inputs.join(" + "),
+            nodes,
+            edges,
+            communities: Vec::new(),
+            unresolved_references: unresolved,
+        }
+    }
+
+    // ---- The config file (.sniff-rs.toml / .sniff-rs.json) ----
+
+    /// A project's settings for `sniff-rs graph` and the queries that read
+    /// a directory: kept in the folder being graphed, so every run (and
+    /// everyone) reads it the same way. The keys, in TOML (`.sniff-rs.json`
+    /// has the same shape as JSON):
+    ///
+    /// ```toml
+    /// [graph]                      # the same as the flags; a flag wins
+    /// include = ["**/*.csv"]
+    /// exclude = ["tmp/**"]
+    /// folders = true
+    /// resolution = 1.0
+    /// samples = 3
+    /// jobs = 4
+    ///
+    /// [[identifier]]               # an identifier this project has
+    /// name = "ticket"
+    /// pattern = '\b[A-Z]{2,5}-[0-9]{1,6}\b'
+    /// normalize = "upper"          # none (default), lower or upper
+    ///
+    /// [[link]]                     # a link someone knows is there
+    /// source = "docs/design.md"
+    /// target = "src/main.rs"
+    /// relation = "references"      # any name; unknown ones are related_to
+    /// evidence = "the design doc describes this file"
+    ///
+    /// [[reject]]                   # an extracted link ruled out
+    /// source = "a.csv"             # globs over node ids; either may be left out
+    /// target = "b.csv"
+    /// relation = "joins"           # optional
+    ///
+    /// [[alias]]                    # two identifiers that are one
+    /// from = "email:j.smith@acme.com"
+    /// to = "email:jane.smith@acme.com"
+    ///
+    /// [ignore]
+    /// entities = ["email:noreply@*", "domain:example.com"]
+    /// ```
+    ///
+    /// A key this does not know is an error, so a typo is not silently a
+    /// setting that does nothing.
+    pub(crate) mod config {
+        use super::*;
+
+        pub(crate) const CONFIG_NAMES: [&str; 2] = [".sniff-rs.toml", ".sniff-rs.json"];
+
+        pub(crate) struct IdentifierRule {
+            pub(crate) name: String,
+            pub(crate) pattern: String,
+            pub(crate) normalize: Normalize,
+        }
+
+        #[derive(Default)]
+        pub(crate) struct GraphConfig {
+            pub(crate) include: Vec<String>,
+            pub(crate) exclude: Vec<String>,
+            pub(crate) folders: Option<bool>,
+            pub(crate) resolution: Option<f64>,
+            pub(crate) samples: Option<usize>,
+            pub(crate) jobs: Option<usize>,
+            pub(crate) identifiers: Vec<IdentifierRule>,
+            pub(crate) overrides: Overrides,
+        }
+
+        impl GraphConfig {
+            /// The identifier patterns compiled, their kinds registered.
+            pub(crate) fn patterns(&self) -> Result<Vec<CustomPattern>> {
+                self.identifiers
+                    .iter()
+                    .map(|r| {
+                        let regex = regex_lite::Regex::new(&r.pattern).map_err(|e| {
+                            anyhow!("identifier {:?}: pattern {:?}: {e}", r.name, r.pattern)
+                        })?;
+                        Ok(CustomPattern {
+                            kind: register_custom_kind(&r.name)?,
+                            regex,
+                            normalize: r.normalize,
+                        })
+                    })
+                    .collect()
+            }
+
+            /// A number that changes when the identifier rules do, for the
+            /// per-file cache.
+            pub(crate) fn fingerprint(&self) -> u64 {
+                let mut h = FNV_OFFSET;
+                for r in &self.identifiers {
+                    for part in [r.name.as_bytes(), r.pattern.as_bytes()] {
+                        h = fnv64_extend(h, part);
+                        h = fnv64_extend(h, &[0]);
+                    }
+                    h = fnv64_extend(h, &[r.normalize as u8]);
+                }
+                h
+            }
+        }
+
+        /// The config file in `dir`, if there is one.
+        pub(crate) fn discover(dir: &Path) -> Option<PathBuf> {
+            CONFIG_NAMES
+                .iter()
+                .map(|n| dir.join(n))
+                .find(|p| p.is_file())
+        }
+
+        pub(crate) fn load(path: &Path) -> Result<GraphConfig> {
+            let origin = path.display().to_string();
+            let doc = if path.extension().is_some_and(|e| e == "json") {
+                let text =
+                    fs::read_to_string(path).with_context(|| format!("failed to read {origin}"))?;
+                json_support::from_str(&text)
+                    .with_context(|| format!("{origin} is not valid JSON"))?
+            } else {
+                #[cfg(feature = "toml")]
+                {
+                    JsonValue::Object(
+                        toml_support::document_object(path)
+                            .with_context(|| format!("failed to read {origin}"))?,
+                    )
+                }
+                #[cfg(not(feature = "toml"))]
+                {
+                    bail!(
+                        "{origin}: a TOML config needs a build with --features toml (or write .sniff-rs.json)"
+                    );
+                }
+            };
+            parse(&doc, &origin)
+        }
+
+        fn only_keys(v: &JsonValue, allowed: &[&str], what: &str, origin: &str) -> Result<()> {
+            let JsonValue::Object(m) = v else {
+                bail!("{origin}: {what} must be a table");
+            };
+            for (k, _) in m.iter() {
+                if !allowed.contains(&k.as_str()) {
+                    bail!(
+                        "{origin}: unknown key {k:?} in {what} (expected {})",
+                        allowed.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn strings(v: Option<&JsonValue>, what: &str, origin: &str) -> Result<Vec<String>> {
+            match v {
+                None => Ok(Vec::new()),
+                Some(JsonValue::Array(a)) => a
+                    .iter()
+                    .map(|x| {
+                        x.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| anyhow!("{origin}: {what} must be a list of strings"))
+                    })
+                    .collect(),
+                Some(_) => bail!("{origin}: {what} must be a list of strings"),
+            }
+        }
+
+        fn tables<'a>(
+            v: Option<&'a JsonValue>,
+            what: &str,
+            origin: &str,
+        ) -> Result<&'a [JsonValue]> {
+            match v {
+                None => Ok(&[]),
+                Some(JsonValue::Array(a)) => Ok(a),
+                Some(_) => bail!("{origin}: {what} must be written as [[{what}]] entries"),
+            }
+        }
+
+        pub(crate) fn parse(doc: &JsonValue, origin: &str) -> Result<GraphConfig> {
+            only_keys(
+                doc,
+                &["graph", "identifier", "link", "reject", "alias", "ignore"],
+                "the file",
+                origin,
+            )?;
+            let mut cfg = GraphConfig::default();
+            if let Some(g) = doc.get("graph") {
+                only_keys(
+                    g,
+                    &[
+                        "include",
+                        "exclude",
+                        "folders",
+                        "resolution",
+                        "samples",
+                        "jobs",
+                    ],
+                    "[graph]",
+                    origin,
+                )?;
+                cfg.include = strings(g.get("include"), "[graph] include", origin)?;
+                cfg.exclude = strings(g.get("exclude"), "[graph] exclude", origin)?;
+                if let Some(f) = g.get("folders") {
+                    cfg.folders = Some(f.as_bool().ok_or_else(|| {
+                        anyhow!("{origin}: [graph] folders must be true or false")
+                    })?);
+                }
+                if let Some(r) = g.get("resolution") {
+                    cfg.resolution = Some(
+                        r.as_f64()
+                            .filter(|x| x.is_finite() && *x > 0.0)
+                            .ok_or_else(|| {
+                                anyhow!("{origin}: [graph] resolution must be a positive number")
+                            })?,
+                    );
+                }
+                for (key, slot) in [("samples", &mut cfg.samples), ("jobs", &mut cfg.jobs)] {
+                    if let Some(n) = g.get(key) {
+                        *slot = Some(
+                            n.as_u64()
+                                .filter(|n| *n > 0)
+                                .map(|n| n as usize)
+                                .ok_or_else(|| {
+                                    anyhow!("{origin}: [graph] {key} must be a positive integer")
+                                })?,
+                        );
+                    }
+                }
+            }
+            for (i, r) in tables(doc.get("identifier"), "identifier", origin)?
+                .iter()
+                .enumerate()
+            {
+                let at = format!("[[identifier]] {}", i + 1);
+                only_keys(r, &["name", "pattern", "normalize"], &at, origin)?;
+                let name =
+                    string_field(r, "name").ok_or_else(|| anyhow!("{origin}: {at} has no name"))?;
+                let plain = name.starts_with(|c: char| c.is_ascii_lowercase())
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+                if !plain {
+                    bail!(
+                        "{origin}: {at}: name {name:?} must be lowercase letters, digits and _, starting with a letter"
+                    );
+                }
+                if EntityKind::parse(name).is_some_and(|k| !matches!(k, EntityKind::Custom(_))) {
+                    bail!(
+                        "{origin}: {at}: {name:?} is a built-in identifier kind; pick another name"
+                    );
+                }
+                if cfg.identifiers.iter().any(|x| x.name == name) {
+                    bail!("{origin}: identifier {name:?} is defined twice");
+                }
+                let pattern = string_field(r, "pattern")
+                    .ok_or_else(|| anyhow!("{origin}: {at} has no pattern"))?;
+                let regex = regex_lite::Regex::new(pattern)
+                    .map_err(|e| anyhow!("{origin}: {at}: pattern {pattern:?}: {e}"))?;
+                if regex.matches_empty() {
+                    bail!(
+                        "{origin}: {at}: pattern {pattern:?} matches the empty string, so it would find nothing"
+                    );
+                }
+                let normalize = match string_field(r, "normalize") {
+                    None | Some("none") => Normalize::None,
+                    Some("lower") => Normalize::Lower,
+                    Some("upper") => Normalize::Upper,
+                    Some(other) => {
+                        bail!("{origin}: {at}: normalize {other:?} must be none, lower or upper")
+                    }
+                };
+                cfg.identifiers.push(IdentifierRule {
+                    name: name.to_string(),
+                    pattern: pattern.to_string(),
+                    normalize,
+                });
+            }
+            // Identifier kinds must exist before an alias names one.
+            let _ = cfg.patterns()?;
+            let link_tables = tables(doc.get("link"), "link", origin)?;
+            for (i, l) in link_tables.iter().enumerate() {
+                only_keys(
+                    l,
+                    &[
+                        "source",
+                        "target",
+                        "relation",
+                        "label",
+                        "confidence",
+                        "evidence",
+                        "weight",
+                        "directed",
+                        "score",
+                    ],
+                    &format!("[[link]] {}", i + 1),
+                    origin,
+                )?;
+            }
+            if !link_tables.is_empty() {
+                let wrapped = {
+                    let mut m = json_support::Map::new();
+                    m.insert("links".to_string(), JsonValue::Array(link_tables.to_vec()));
+                    JsonValue::Object(m)
+                };
+                let (nodes, links) = parse_links(&wrapped, Provenance::Manual, None, origin)?;
+                cfg.overrides.nodes = nodes;
+                cfg.overrides.links = links;
+            }
+            for (i, r) in tables(doc.get("reject"), "reject", origin)?
+                .iter()
+                .enumerate()
+            {
+                let at = format!("[[reject]] {}", i + 1);
+                only_keys(r, &["source", "target", "relation"], &at, origin)?;
+                let relation = match string_field(r, "relation") {
+                    None => None,
+                    Some(n) => Some(
+                        Relation::parse(n)
+                            .ok_or_else(|| anyhow!("{origin}: {at}: unknown relation {n:?}"))?,
+                    ),
+                };
+                let rule = RejectRule {
+                    source: string_field(r, "source").map(str::to_string),
+                    target: string_field(r, "target").map(str::to_string),
+                    relation,
+                };
+                if rule.source.is_none() && rule.target.is_none() && rule.relation.is_none() {
+                    bail!(
+                        "{origin}: {at} says nothing to reject (give a source, a target or a relation)"
+                    );
+                }
+                cfg.overrides.rejects.push(rule);
+            }
+            for (i, a) in tables(doc.get("alias"), "alias", origin)?
+                .iter()
+                .enumerate()
+            {
+                let at = format!("[[alias]] {}", i + 1);
+                only_keys(a, &["from", "to"], &at, origin)?;
+                let (Some(from), Some(to)) = (string_field(a, "from"), string_field(a, "to"))
+                else {
+                    bail!("{origin}: {at} needs both from and to");
+                };
+                for (what, id) in [("from", from), ("to", to)] {
+                    let known = id.split_once(':').is_some_and(|(k, v)| {
+                        !v.is_empty() && EntityKind::parse(&k.to_lowercase()).is_some()
+                    });
+                    if !known {
+                        bail!(
+                            "{origin}: {at}: {what} {id:?} must be kind:value with a known identifier kind (email, domain, url, doi, isbn, uuid, ip, vin, iban, card, code, id, or one of your own)"
+                        );
+                    }
+                }
+                // The kind is a lowercase word; the target keeps its value's case.
+                let to = match to.split_once(':') {
+                    Some((k, v)) => format!("{}:{v}", k.to_lowercase()),
+                    None => to.to_string(),
+                };
+                cfg.overrides.aliases.push((from.to_lowercase(), to));
+            }
+            if let Some(ig) = doc.get("ignore") {
+                only_keys(ig, &["entities"], "[ignore]", origin)?;
+                cfg.overrides.ignore = strings(ig.get("entities"), "[ignore] entities", origin)?
+                    .into_iter()
+                    .map(|g| g.to_lowercase())
+                    .collect();
+            }
+            Ok(cfg)
+        }
     }
 
     // ---- GRAPH_REPORT.md ----
@@ -119737,6 +121655,804 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     }
 
     #[cfg(test)]
+    mod override_tests {
+        use super::*;
+
+        fn kg_file(rel: &str, text: &str, known: &Arc<KnownFiles>) -> KgFile {
+            let _scan = ScanGuard::new(Some(known.clone()));
+            let mut acc = content_scan::ContentAccumulator::new(false);
+            acc.push(text);
+            KgFile {
+                rel: rel.to_string(),
+                name: rel.rsplit('/').next().unwrap().to_string(),
+                file_type: "txt".to_string(),
+                kind: FileKind::Text,
+                size: text.len() as u64,
+                tables: Vec::new(),
+                text: Some(acc.finish("String")),
+                error: None,
+                fixed_schema: false,
+                truncated_scan: false,
+                hash: None,
+                meta: Vec::new(),
+            }
+        }
+
+        /// Three notes sharing an e-mail address and a ticket number.
+        fn three_notes(opts: &BuildOptions) -> KnowledgeGraph {
+            let known = Arc::new(KnownFiles::new(["a.txt", "b.txt", "c.txt"]));
+            let files = vec![
+                kg_file("a.txt", "mail jane@acme.com about SIT720", &known),
+                kg_file("b.txt", "jane@acme.com owns SIT720", &known),
+                kg_file("c.txt", "j.smith@acme.com wrote this, not SIT720", &known),
+            ];
+            build_with("t".to_string(), files, opts).unwrap()
+        }
+
+        fn parse(json: &str, p: Provenance) -> Overrides {
+            let doc = json_support::from_str(json).unwrap();
+            let (nodes, links) = parse_links(&doc, p, None, "test").unwrap();
+            Overrides {
+                nodes,
+                links,
+                ..Overrides::default()
+            }
+        }
+
+        fn has_link(kg: &KnowledgeGraph, rel: Relation, a: &str, b: &str) -> bool {
+            kg.edges.iter().any(|e| {
+                e.relation == rel && {
+                    let (x, y) = (&kg.nodes[e.source].id, &kg.nodes[e.target].id);
+                    (x == a && y == b) || (x == b && y == a)
+                }
+            })
+        }
+
+        #[test]
+        fn links_files_take_an_object_or_an_array_and_default_sensibly() {
+            let doc = json_support::from_str(
+                r#"[{"source":"a","target":"b"},
+                    {"source":"a","target":"c","relation":"cites","evidence":["x","y"],"by":"me",
+                     "confidence":"extracted","weight":99,"confidence_score":3}]"#,
+            )
+            .unwrap();
+            let (nodes, links) =
+                parse_links(&doc, Provenance::External, Some("agent"), "t").unwrap();
+            assert!(nodes.is_empty());
+            assert_eq!(links[0].relation, Relation::RelatedTo);
+            assert_eq!(
+                links[0].label, None,
+                "no relation named is plain related_to"
+            );
+            assert_eq!(links[0].confidence, Conf::Inferred);
+            assert_eq!(links[0].by.as_deref(), Some("agent"));
+            assert_eq!(links[1].label.as_deref(), Some("cites"));
+            assert_eq!(links[1].confidence, Conf::Extracted);
+            assert_eq!(links[1].weight, 10.0, "weight is clamped");
+            assert_eq!(links[1].score, 1.0, "score is clamped");
+            assert_eq!(links[1].by.as_deref(), Some("me"), "a link's own by wins");
+            assert_eq!(links[1].evidence, vec!["x", "y"]);
+            // A known relation name keeps its relation and takes no label.
+            let doc = json_support::from_str(
+                r#"{"links":[{"source":"a","target":"b","relation":"mentions"}]}"#,
+            )
+            .unwrap();
+            let (_, links) = parse_links(&doc, Provenance::Manual, None, "t").unwrap();
+            assert_eq!(links[0].relation, Relation::Mentions);
+            assert_eq!(links[0].label, None);
+            assert_eq!(
+                links[0].confidence,
+                Conf::Extracted,
+                "a person's link defaults to extracted"
+            );
+        }
+
+        #[test]
+        fn bad_links_say_which_one_and_why() {
+            for (json, needle) in [
+                (r#"[{"target":"b"}]"#, "link 1 has no \"source\""),
+                (r#"[{"source":"a"}]"#, "link 1 has no \"target\""),
+                (
+                    r#"[{"source":"a","target":"b","confidence":"sure"}]"#,
+                    "confidence \"sure\"",
+                ),
+                (
+                    r#"[{"source":"a","target":"b","weight":"x"}]"#,
+                    "\"weight\" must be a number",
+                ),
+                (
+                    r#"[{"source":"a","target":"b","evidence":3}]"#,
+                    "\"evidence\" must be",
+                ),
+                (r#"{"nodes":[{"label":"x"}]}"#, "node 1 has no \"id\""),
+                (r#"{"nodes":[{"id":"x","type":"blob"}]}"#, "unknown type"),
+                (r#"7"#, "expected an object"),
+            ] {
+                let doc = json_support::from_str(json).unwrap();
+                let err = parse_links(&doc, Provenance::External, None, "t")
+                    .err()
+                    .expect(json);
+                assert!(err.to_string().contains(needle), "{json}: {err}");
+            }
+        }
+
+        #[test]
+        fn outside_links_join_the_graph_before_its_communities() {
+            let plain = three_notes(&BuildOptions::default());
+            assert!(!has_link(&plain, Relation::RelatedTo, "a.txt", "c.txt"));
+            let opts = BuildOptions {
+                overrides: parse(
+                    r#"{"links":[{"source":"c.txt","target":"a.txt","relation":"extends","by":"me","weight":10}]}"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            assert!(has_link(&kg, Relation::RelatedTo, "a.txt", "c.txt"));
+            let e = kg
+                .edges
+                .iter()
+                .find(|e| e.relation == Relation::RelatedTo)
+                .unwrap();
+            assert_eq!(e.provenance, Provenance::External);
+            assert_eq!(e.by.as_deref(), Some("me"));
+            assert_eq!(e.label.as_deref(), Some("extends"));
+            assert!(e.evidence.iter().any(|l| l == "asserted by me"));
+            assert!(e.evidence.iter().any(|l| l == "relation: extends"));
+            let community = |id: &str| kg.nodes.iter().find(|n| n.id == id).unwrap().community;
+            assert_eq!(
+                community("a.txt"),
+                community("c.txt"),
+                "a heavy link pulls its ends together"
+            );
+        }
+
+        #[test]
+        fn an_endpoint_that_names_nothing_is_an_error_unless_it_is_kind_value() {
+            let known = Arc::new(KnownFiles::new(["a.txt"]));
+            let files = vec![kg_file("a.txt", "hello", &known)];
+            let bad = BuildOptions {
+                overrides: parse(
+                    r#"[{"source":"a.txt","target":"missing.txt"},{"source":"zzz","target":"a.txt"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let err = build_with("t".to_string(), files, &bad)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("2 link endpoint(s) match no node"), "{err}");
+            assert!(
+                err.contains("\"missing.txt\"") && err.contains("\"zzz\""),
+                "{err}"
+            );
+            let known = Arc::new(KnownFiles::new(["a.txt"]));
+            let files = vec![kg_file("a.txt", "hello", &known)];
+            let ok = BuildOptions {
+                overrides: parse(
+                    r#"[{"source":"./a.txt","target":"concept:churn"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let kg = build_with("t".to_string(), files, &ok).unwrap();
+            let n = kg.nodes.iter().find(|n| n.id == "concept:churn").unwrap();
+            assert_eq!(
+                (n.node_type, n.file_type.as_str(), n.label.as_str()),
+                (NodeType::Entity, "concept", "churn")
+            );
+        }
+
+        #[test]
+        fn a_link_the_tool_already_found_is_strengthened_not_doubled() {
+            let opts = BuildOptions {
+                overrides: parse(
+                    r#"[{"source":"a.txt","target":"email:jane@acme.com","relation":"mentions","confidence":"EXTRACTED","by":"me","evidence":"seen by eye"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            let hits: Vec<&KgEdge> = kg
+                .edges
+                .iter()
+                .filter(|e| {
+                    e.relation == Relation::Mentions
+                        && kg.nodes[e.source].id == "a.txt"
+                        && kg.nodes[e.target].id == "email:jane@acme.com"
+                })
+                .collect();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].provenance, Provenance::Extracted);
+            assert!(hits[0].evidence.iter().any(|l| l == "seen by eye"));
+            assert!(hits[0].evidence.iter().any(|l| l.starts_with("mentioned")));
+        }
+
+        #[test]
+        fn rejects_remove_extracted_links_by_glob_and_relation() {
+            let kg = three_notes(&BuildOptions::default());
+            assert!(has_link(&kg, Relation::Mentions, "a.txt", "ticket-none").not_or(true));
+            let before = kg.edges.len();
+            let opts = BuildOptions {
+                overrides: Overrides {
+                    rejects: vec![RejectRule {
+                        source: Some("*.txt".into()),
+                        target: Some("email:*".into()),
+                        relation: Some(Relation::Mentions),
+                    }],
+                    ..Overrides::default()
+                },
+                ..BuildOptions::default()
+            };
+            let kg2 = three_notes(&opts);
+            assert!(kg2.edges.len() < before);
+            assert!(!kg2.edges.iter().any(|e| e.relation == Relation::Mentions
+                && kg2.nodes[e.target].id.starts_with("email:")));
+            // The other relations are untouched.
+            let count = |kg: &KnowledgeGraph, r: Relation| {
+                kg.edges.iter().filter(|e| e.relation == r).count()
+            };
+            assert_eq!(
+                count(&kg, Relation::References),
+                count(&kg2, Relation::References)
+            );
+        }
+
+        trait NotOr {
+            fn not_or(self, v: bool) -> bool;
+        }
+        impl NotOr for bool {
+            fn not_or(self, v: bool) -> bool {
+                !self || v
+            }
+        }
+
+        #[test]
+        fn aliases_make_two_identifiers_one_and_ignores_drop_one() {
+            let plain = three_notes(&BuildOptions::default());
+            assert!(
+                !plain.nodes.iter().any(|n| n.id == "email:j.smith@acme.com"),
+                "one mention is no link"
+            );
+            let opts = BuildOptions {
+                overrides: Overrides {
+                    aliases: vec![(
+                        "email:j.smith@acme.com".into(),
+                        "email:jane@acme.com".into(),
+                    )],
+                    ..Overrides::default()
+                },
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            assert!(has_link(
+                &kg,
+                Relation::Mentions,
+                "c.txt",
+                "email:jane@acme.com"
+            ));
+            let node = kg
+                .nodes
+                .iter()
+                .find(|n| n.id == "email:jane@acme.com")
+                .unwrap();
+            assert_eq!(node.attrs.get("files").and_then(JsonValue::as_u64), Some(3));
+            let opts = BuildOptions {
+                overrides: Overrides {
+                    ignore: vec!["email:jane@*".into(), "domain:*".into()],
+                    ..Overrides::default()
+                },
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            assert!(
+                !kg.nodes
+                    .iter()
+                    .any(|n| n.id.starts_with("email:") || n.id.starts_with("domain:"))
+            );
+            assert!(
+                kg.nodes
+                    .iter()
+                    .any(|n| n.id.to_lowercase() == "code:sit720"),
+                "other identifiers stay"
+            );
+        }
+
+        #[test]
+        fn custom_identifier_kinds_are_found_normalized_and_linked() {
+            let kind = register_custom_kind("ticket_t1").unwrap();
+            assert_eq!(
+                register_custom_kind("ticket_t1").unwrap(),
+                kind,
+                "registering twice is one kind"
+            );
+            assert_eq!(EntityKind::parse("ticket_t1"), Some(kind));
+            assert_eq!(kind.as_str(), "ticket_t1");
+            let patterns = vec![CustomPattern {
+                kind,
+                regex: regex_lite::Regex::new(r"(?i)\bproj-\d+\b").unwrap(),
+                normalize: Normalize::Upper,
+            }];
+            let known = Arc::new(KnownFiles::new(["a.txt", "b.txt"]).with_patterns(patterns));
+            let files = vec![
+                kg_file("a.txt", "fixes proj-1 and PROJ-22", &known),
+                kg_file("b.txt", "PROJ-1 shipped", &known),
+            ];
+            let kg = build("t".to_string(), files);
+            let n = kg
+                .nodes
+                .iter()
+                .find(|n| n.id == "ticket_t1:PROJ-1")
+                .expect("normalized to upper");
+            assert_eq!(
+                (n.node_type, n.file_type.as_str()),
+                (NodeType::Entity, "ticket_t1")
+            );
+            assert!(has_link(
+                &kg,
+                Relation::Mentions,
+                "a.txt",
+                "ticket_t1:PROJ-1"
+            ));
+            assert!(has_link(
+                &kg,
+                Relation::Mentions,
+                "b.txt",
+                "ticket_t1:PROJ-1"
+            ));
+            assert!(
+                !kg.nodes.iter().any(|n| n.id == "ticket_t1:PROJ-22"),
+                "one mention is no link"
+            );
+        }
+
+        #[test]
+        fn merging_a_graph_with_itself_changes_nothing_but_keeps_provenance_honest() {
+            let opts = BuildOptions {
+                overrides: parse(
+                    r#"[{"source":"a.txt","target":"b.txt","relation":"cites"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let a = three_notes(&opts);
+            let b = three_notes(&opts);
+            let n_edges = a.edges.len();
+            let n_nodes = a.nodes.len();
+            let mut merged = merge_graphs(vec![a, b]);
+            recluster(&mut merged, 1.0);
+            assert_eq!(merged.nodes.len(), n_nodes);
+            assert_eq!(merged.edges.len(), n_edges);
+            let cites = merged
+                .edges
+                .iter()
+                .find(|e| e.relation == Relation::RelatedTo)
+                .unwrap();
+            assert_eq!(cites.provenance, Provenance::External);
+            assert_eq!(
+                cites
+                    .evidence
+                    .iter()
+                    .filter(|l| l.starts_with("asserted"))
+                    .count(),
+                1,
+                "evidence is not repeated"
+            );
+            // A tool-found link beats an outside one of the same name.
+            let mut x = three_notes(&BuildOptions::default());
+            let mut y = three_notes(&BuildOptions::default());
+            x.edges
+                .iter_mut()
+                .for_each(|e| e.provenance = Provenance::External);
+            y.edges
+                .iter_mut()
+                .for_each(|e| e.confidence = Conf::Ambiguous);
+            let merged = merge_graphs(vec![x, y]);
+            assert!(
+                merged
+                    .edges
+                    .iter()
+                    .all(|e| e.provenance == Provenance::Extracted)
+            );
+            assert!(
+                merged
+                    .edges
+                    .iter()
+                    .all(|e| e.confidence == Conf::Extracted || e.confidence == Conf::Inferred)
+            );
+        }
+
+        #[test]
+        fn shares_key_evidence_names_the_same_hub_every_time() {
+            // Two owners of one key, both pointed at by the same two
+            // tables: which hub the evidence names must not depend on
+            // hash order.
+            let pending = || -> Vec<PendingJoin> {
+                let spoke = |from: usize, to: usize| PendingJoin {
+                    from,
+                    to,
+                    directed: true,
+                    key: "customer_id".to_string(),
+                    shared_key: String::new(),
+                    relation: Relation::Joins,
+                    confidence: Conf::Extracted,
+                    score: 1.0,
+                    evidence: Vec::new(),
+                };
+                let mut v = vec![spoke(2, 0), spoke(3, 0), spoke(2, 1), spoke(3, 1)];
+                v.push(PendingJoin {
+                    from: 2,
+                    to: 3,
+                    directed: false,
+                    key: String::new(),
+                    shared_key: "customer_id".to_string(),
+                    relation: Relation::Joins,
+                    confidence: Conf::Extracted,
+                    score: 1.0,
+                    evidence: Vec::new(),
+                });
+                v
+            };
+            let cols: Vec<ColumnProfile> = Vec::new();
+            let tables = [
+                (0usize, 0usize, "customers", &cols),
+                (1, 0, "customers_archive", &cols),
+                (2, 0, "orders", &cols),
+                (3, 0, "invoices", &cols),
+            ];
+            for _ in 0..40 {
+                let mut p = pending();
+                relabel_shared_keys(&mut p, &tables);
+                assert_eq!(p[4].relation, Relation::SharesKey);
+                assert_eq!(
+                    p[4].evidence[0],
+                    "both tables reference customers.customer_id, which owns the key"
+                );
+            }
+        }
+
+        #[test]
+        fn recluster_is_deterministic_and_labels_every_community() {
+            let mut a = three_notes(&BuildOptions::default());
+            let before: Vec<usize> = a.nodes.iter().map(|n| n.community).collect();
+            recluster(&mut a, 1.0);
+            let after: Vec<usize> = a.nodes.iter().map(|n| n.community).collect();
+            assert_eq!(before, after, "the same links give the same communities");
+            assert!(a.communities.iter().all(|c| !c.label.is_empty()));
+            assert_eq!(
+                a.communities.iter().map(|c| c.members.len()).sum::<usize>(),
+                a.nodes.len()
+            );
+        }
+
+        #[test]
+        fn graph_json_round_trips_provenance_label_and_version() {
+            let opts = BuildOptions {
+                overrides: parse(
+                    r#"[{"source":"a.txt","target":"c.txt","relation":"extends","by":"me","evidence":"why"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            let dir =
+                std::env::temp_dir().join(format!("sniff-rs-kg-roundtrip-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("graph.json");
+            let text = json_support::to_pretty_string(&to_json(&kg));
+            fs::write(&path, &text).unwrap();
+            let doc = json_support::from_str(&text).unwrap();
+            assert_eq!(
+                doc.get("graph")
+                    .and_then(|g| g.get("version"))
+                    .and_then(JsonValue::as_u64),
+                Some(GRAPH_JSON_VERSION)
+            );
+            let back = from_json(&path).unwrap();
+            let e = back
+                .edges
+                .iter()
+                .find(|e| e.relation == Relation::RelatedTo)
+                .unwrap();
+            assert_eq!(
+                (e.provenance, e.by.as_deref(), e.label.as_deref()),
+                (Provenance::External, Some("me"), Some("extends"))
+            );
+            // A tool-found link has none of the three on the page.
+            let plain = back
+                .edges
+                .iter()
+                .position(|e| e.relation == Relation::Mentions)
+                .unwrap();
+            let links = doc.get("links").and_then(JsonValue::as_array).unwrap();
+            let m = &links[plain];
+            assert!(
+                m.get("provenance").is_none() && m.get("by").is_none() && m.get("label").is_none()
+            );
+            // A graph from a newer sniff-rs is refused, not misread.
+            let newer = text.replacen("\"version\": 1", "\"version\": 99", 1);
+            fs::write(&path, newer).unwrap();
+            let err = from_json(&path).err().unwrap().to_string();
+            assert!(err.contains("version 99") && err.contains("newer"), "{err}");
+            // One without a version field is version 1.
+            let older = text.replacen("\"version\": 1,", "", 1);
+            fs::write(&path, older).unwrap();
+            assert!(from_json(&path).is_ok());
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A checker for the part of JSON Schema `graph.schema.json` uses:
+        /// type, enum, required, properties, items, minimum and
+        /// additionalProperties as a schema.
+        fn conforms(v: &JsonValue, schema: &JsonValue, at: &str, errors: &mut Vec<String>) {
+            if let Some(t) = schema.get("type").and_then(JsonValue::as_str) {
+                let ok = match t {
+                    "object" => matches!(v, JsonValue::Object(_)),
+                    "array" => matches!(v, JsonValue::Array(_)),
+                    "string" => matches!(v, JsonValue::String(_)),
+                    "boolean" => v.as_bool().is_some(),
+                    "integer" => v.as_u64().is_some() || v.as_i64().is_some(),
+                    "number" => v.as_f64().is_some(),
+                    _ => true,
+                };
+                if !ok {
+                    errors.push(format!("{at}: not a {t}"));
+                    return;
+                }
+            }
+            if let Some(options) = schema.get("enum").and_then(JsonValue::as_array)
+                && !options.iter().any(|o| o == v)
+            {
+                errors.push(format!("{at}: {v:?} is not one of the allowed values"));
+            }
+            if let Some(min) = schema.get("minimum").and_then(JsonValue::as_f64)
+                && v.as_f64().is_some_and(|x| x < min)
+            {
+                errors.push(format!("{at}: below the minimum"));
+            }
+            if let (JsonValue::Object(m), Some(req)) =
+                (v, schema.get("required").and_then(JsonValue::as_array))
+            {
+                for r in req.iter().filter_map(JsonValue::as_str) {
+                    if m.get(r).is_none() {
+                        errors.push(format!("{at}: missing {r}"));
+                    }
+                }
+            }
+            if let (JsonValue::Object(m), Some(JsonValue::Object(props))) =
+                (v, schema.get("properties"))
+            {
+                for (k, sub) in props.iter() {
+                    if let Some(x) = m.get(k) {
+                        conforms(x, sub, &format!("{at}.{k}"), errors);
+                    }
+                }
+            }
+            if let (JsonValue::Object(m), Some(extra)) = (v, schema.get("additionalProperties"))
+                && matches!(extra, JsonValue::Object(_))
+            {
+                let known: Vec<&String> = match schema.get("properties") {
+                    Some(JsonValue::Object(p)) => p.iter().map(|(k, _)| k).collect(),
+                    _ => Vec::new(),
+                };
+                for (k, x) in m.iter() {
+                    if !known.contains(&k) {
+                        conforms(x, extra, &format!("{at}.{k}"), errors);
+                    }
+                }
+            }
+            if let (JsonValue::Array(items), Some(sub)) = (v, schema.get("items")) {
+                for (i, x) in items.iter().enumerate() {
+                    conforms(x, sub, &format!("{at}[{i}]"), errors);
+                }
+            }
+        }
+
+        #[test]
+        fn graph_json_follows_its_json_schema() {
+            let schema = json_support::from_str(GRAPH_JSON_SCHEMA).unwrap();
+            // The schema names every relation this tool writes.
+            let listed: Vec<&str> = schema
+                .get("properties")
+                .and_then(|p| p.get("links"))
+                .and_then(|l| l.get("items"))
+                .and_then(|i| i.get("properties"))
+                .and_then(|p| p.get("relation"))
+                .and_then(|r| r.get("enum"))
+                .and_then(JsonValue::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(JsonValue::as_str)
+                .collect();
+            for r in Relation::ALL {
+                assert!(
+                    listed.contains(&r.as_str()),
+                    "{} is missing from the schema",
+                    r.as_str()
+                );
+            }
+            assert_eq!(listed.len(), Relation::ALL.len());
+            let opts = BuildOptions {
+                folders: true,
+                overrides: parse(
+                    r#"[{"source":"a.txt","target":"concept:x","relation":"cites","by":"me"}]"#,
+                    Provenance::External,
+                ),
+                ..BuildOptions::default()
+            };
+            let kg = three_notes(&opts);
+            let doc =
+                json_support::from_str(&json_support::to_pretty_string(&to_json(&kg))).unwrap();
+            let mut errors = Vec::new();
+            conforms(&doc, &schema, "$", &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+            // And the checker is not vacuous: a broken graph fails it.
+            let mut broken = json_support::to_pretty_string(&to_json(&kg));
+            broken = broken.replacen("\"EXTRACTED\"", "\"CERTAIN\"", 1).replacen(
+                "\"source\":",
+                "\"sauce\":",
+                1,
+            );
+            let doc = json_support::from_str(&broken).unwrap();
+            let mut errors = Vec::new();
+            conforms(&doc, &schema, "$", &mut errors);
+            assert!(errors.len() >= 2, "{errors:?}");
+        }
+    }
+
+    #[cfg(test)]
+    mod config_tests {
+        use super::config::parse;
+        use super::*;
+
+        fn cfg(json: &str) -> Result<config::GraphConfig> {
+            parse(&json_support::from_str(json).unwrap(), "test.json")
+        }
+
+        fn err(json: &str) -> String {
+            cfg(json).err().expect(json).to_string()
+        }
+
+        #[test]
+        fn a_full_config_is_read() {
+            let c = cfg(
+                r#"{
+                "graph": {"include": ["**/*.csv"], "exclude": ["tmp/**"], "folders": true,
+                          "resolution": 0.5, "samples": 5, "jobs": 2},
+                "identifier": [{"name": "ticket_c1", "pattern": "[A-Z]+-[0-9]+", "normalize": "upper"}],
+                "link": [{"source": "a.md", "target": "b.csv", "relation": "describes", "evidence": "why"}],
+                "reject": [{"source": "a.csv", "relation": "joins"}],
+                "alias": [{"from": "Email:J@X.org", "to": "email:Jane@x.org"}],
+                "ignore": {"entities": ["Email:noreply@*"]}
+            }"#,
+            )
+            .unwrap();
+            assert_eq!(c.include, vec!["**/*.csv"]);
+            assert_eq!(c.exclude, vec!["tmp/**"]);
+            assert_eq!(
+                (c.folders, c.resolution, c.samples, c.jobs),
+                (Some(true), Some(0.5), Some(5), Some(2))
+            );
+            assert_eq!(c.identifiers.len(), 1);
+            assert_eq!(c.identifiers[0].normalize, Normalize::Upper);
+            assert_eq!(c.overrides.links.len(), 1);
+            assert_eq!(c.overrides.links[0].provenance, Provenance::Manual);
+            assert_eq!(c.overrides.links[0].label.as_deref(), Some("describes"));
+            assert_eq!(c.overrides.rejects.len(), 1);
+            assert_eq!(c.overrides.rejects[0].relation, Some(Relation::Joins));
+            assert_eq!(
+                c.overrides.aliases,
+                vec![("email:j@x.org".to_string(), "email:Jane@x.org".to_string())],
+                "the target keeps its case"
+            );
+            assert_eq!(c.overrides.ignore, vec!["email:noreply@*"]);
+            assert_eq!(c.patterns().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn an_empty_config_is_fine_and_a_typo_is_not() {
+            assert!(cfg("{}").is_ok());
+            assert!(err(r#"{"grph": {}}"#).contains("unknown key \"grph\" in the file"));
+            assert!(
+                err(r#"{"graph": {"folder": true}}"#).contains("unknown key \"folder\" in [graph]")
+            );
+            assert!(
+                err(r#"{"identifier": [{"name": "x1", "pattern": "a", "format": "u"}]}"#)
+                    .contains("unknown key \"format\"")
+            );
+            assert!(
+                err(r#"{"link": [{"source": "a", "target": "b", "by": "x"}]}"#)
+                    .contains("unknown key \"by\"")
+            );
+        }
+
+        #[test]
+        fn values_are_checked() {
+            assert!(
+                err(r#"{"graph": {"resolution": 0}}"#)
+                    .contains("resolution must be a positive number")
+            );
+            assert!(
+                err(r#"{"graph": {"samples": 0}}"#).contains("samples must be a positive integer")
+            );
+            assert!(
+                err(r#"{"graph": {"folders": "yes"}}"#).contains("folders must be true or false")
+            );
+            assert!(
+                err(r#"{"graph": {"include": "*.csv"}}"#).contains("must be a list of strings")
+            );
+            assert!(err(r#"{"link": [{"source": "a"}]}"#).contains("link 1 has no \"target\""));
+            assert!(err(r#"{"reject": [{}]}"#).contains("says nothing to reject"));
+            assert!(
+                err(r#"{"reject": [{"source": "a", "relation": "nope"}]}"#)
+                    .contains("unknown relation \"nope\"")
+            );
+            assert!(
+                err(r#"{"alias": [{"from": "email:a@b.c"}]}"#).contains("needs both from and to")
+            );
+            assert!(
+                err(r#"{"alias": [{"from": "nothing", "to": "email:a@b.c"}]}"#)
+                    .contains("must be kind:value")
+            );
+            assert!(
+                err(r#"{"alias": [{"from": "color:red", "to": "email:a@b.c"}]}"#)
+                    .contains("known identifier kind")
+            );
+            assert!(err(r#"{"link": {"source": "a"}}"#).contains("must be written as [[link]]"));
+        }
+
+        #[test]
+        fn identifier_rules_are_checked() {
+            assert!(err(r#"{"identifier": [{"pattern": "a"}]}"#).contains("has no name"));
+            assert!(err(r#"{"identifier": [{"name": "x1"}]}"#).contains("has no pattern"));
+            assert!(
+                err(r#"{"identifier": [{"name": "Bad Name", "pattern": "a"}]}"#)
+                    .contains("lowercase letters")
+            );
+            assert!(
+                err(r#"{"identifier": [{"name": "email", "pattern": "a"}]}"#)
+                    .contains("built-in identifier kind")
+            );
+            assert!(err(r#"{"identifier": [{"name": "dup_c2", "pattern": "a"}, {"name": "dup_c2", "pattern": "b"}]}"#).contains("defined twice"));
+            assert!(
+                err(r#"{"identifier": [{"name": "x_c3", "pattern": "(a"}]}"#)
+                    .contains("a group is not closed")
+            );
+            assert!(
+                err(r#"{"identifier": [{"name": "x_c4", "pattern": "a*"}]}"#)
+                    .contains("matches the empty string")
+            );
+            assert!(
+                err(r#"{"identifier": [{"name": "x_c5", "pattern": "a", "normalize": "title"}]}"#)
+                    .contains("must be none, lower or upper")
+            );
+        }
+
+        #[test]
+        fn an_alias_may_name_a_kind_the_config_defines() {
+            let c = cfg(
+                r#"{"identifier": [{"name": "ticket_c6", "pattern": "T-[0-9]+"}],
+                    "alias": [{"from": "ticket_c6:T-1", "to": "ticket_c6:T-2"}]}"#,
+            )
+            .unwrap();
+            assert_eq!(c.overrides.aliases.len(), 1);
+        }
+
+        #[test]
+        fn the_fingerprint_changes_with_the_identifier_rules_only() {
+            let a = cfg(r#"{"identifier": [{"name": "fp_a", "pattern": "A-[0-9]+"}]}"#).unwrap();
+            let same = cfg(r#"{"identifier": [{"name": "fp_a", "pattern": "A-[0-9]+"}], "graph": {"samples": 9}}"#).unwrap();
+            let other =
+                cfg(r#"{"identifier": [{"name": "fp_a", "pattern": "A-[0-9]{2}"}]}"#).unwrap();
+            let upper = cfg(r#"{"identifier": [{"name": "fp_a", "pattern": "A-[0-9]+", "normalize": "upper"}]}"#).unwrap();
+            assert_eq!(a.fingerprint(), same.fingerprint());
+            assert_ne!(a.fingerprint(), other.fingerprint());
+            assert_ne!(a.fingerprint(), upper.fingerprint());
+        }
+    }
+
+    #[cfg(test)]
     mod image_meta_tests {
         use super::image_meta::{Found, scan};
         use std::io::Cursor;
@@ -120586,6 +123302,8 @@ USAGE:
                    name in their own properties: a PDF's or office
                    document's, or a photo's EXIF and XMP (INFERRED)
       in_folder    with --folders: a file and the folder it is kept in
+      related_to   a link handed in from outside (--links, graph merge, a
+                   [[link]] in the config file); its own name is its label
 
     Every data format sniff-rs reads is profiled; any other text file (txt,
     md, html, source code) is scanned for the same links; binary files
@@ -120606,7 +123324,9 @@ USAGE:
 
     Query it afterwards: sniff-rs explain|path|rank <OUTPUT_DIR>/graph.json
     (they also accept a directory directly), or compare two runs with
-    sniff-rs diff <OLD>/graph.json <NEW>/graph.json.
+    sniff-rs diff <OLD>/graph.json <NEW>/graph.json. Add what you know that
+    the files don't say with --links (or graph merge, below), and keep a
+    project's settings in .sniff-rs.toml (see CONFIG FILE).
 
     Candidate join pairs are found through value and name indexes, not by
     comparing every pair, so thousands of tables take seconds. Two caps
@@ -120646,24 +123366,100 @@ OPTIONS:
         --folders               Add a node per directory, so files kept in
                                 one folder pull together when nothing else
                                 links them
+        --config <FILE>         Read settings from FILE (default: the
+                                .sniff-rs.toml or .sniff-rs.json in a
+                                directory INPUT)
+        --links <FILE>          Add links from outside: JSON with "links"
+                                (and optionally "nodes"), or a bare array
+                                of links. Repeatable. Each link has source,
+                                target, and optionally relation, confidence,
+                                weight, evidence and by; a node is named by
+                                its relative path, file#table or kind:value
+                                (a kind:value that doesn't exist yet is
+                                created). The links join the graph before
+                                its communities are found.
+        --schema                Print graph.json's JSON Schema and exit
         --include <GLOB>        Only files matching GLOB (repeatable)
         --exclude <GLOB>        Skip files matching GLOB (repeatable)
         --output-format <FMT>   With OUTPUT_DIR "-": json (default), md,
                                 graphml, dot, cypher or html
     -h, --help                  Print this help
+
+SUBCOMMAND:
+    sniff-rs graph merge <GRAPH>... -o <DIR>   merge graph.json files and
+    links files into one graph (see sniff-rs graph merge --help)
+
+CONFIG FILE:
+    .sniff-rs.toml (or .sniff-rs.json) in the folder being graphed:
+
+      [graph]                    # the flags above; a flag wins
+      include = ["**/*.csv"]
+      folders = true
+      [[identifier]]             # an identifier your project has
+      name = "ticket"
+      pattern = '\b[A-Z]{2,5}-[0-9]{1,6}\b'
+      normalize = "upper"        # none, lower or upper
+      [[link]]                   # a link you know is there
+      source = "docs/design.md"
+      target = "src/main.rs"
+      relation = "references"
+      [[reject]]                 # an extracted link you have ruled out
+      source = "a.csv"
+      target = "b.csv"
+      [[alias]]                  # two identifiers that are one
+      from = "email:j.smith@acme.com"
+      to = "email:jane.smith@acme.com"
+      [ignore]
+      entities = ["email:noreply@*"]
+
+    An identifier pattern is a small regular expression (classes, groups,
+    alternation, * + ? {n,m}, \d \w \s \b, ^ $, (?i)); it matches in every
+    text and value the graph reads. A key it does not know is an error.
+"#;
+
+const GRAPH_MERGE_HELP_TEXT: &str = r#"sniff-rs graph merge - one graph from several
+
+USAGE:
+    sniff-rs graph merge <INPUT>... -o <OUTPUT_DIR> [OPTIONS]
+
+    Each <INPUT> is a graph.json (or a directory holding one) written by
+    sniff-rs graph, or a links file as sniff-rs graph --links takes it. The
+    graphs are combined (nodes by id, links by their two ends and relation;
+    a link in several keeps its strongest confidence and all its evidence),
+    the links files are added on top, and the communities are found again
+    over the whole.
+
+    This is how to add what an agent or a person knows to a graph: write
+    the links to a JSON file, merge it in, query the result.
+
+      {"links": [{"source": "docs/a.md", "target": "concept:churn",
+                  "relation": "mentions", "confidence": "INFERRED",
+                  "evidence": "a.md is about customer churn", "by": "claude"}]}
+
+OPTIONS:
+    -o, --output <DIR>      Where the merged graph.json and GRAPH_REPORT.md
+                            go ("-" prints graph.json)
+        --by <NAME>         Credit links that don't say who asserted them
+        --resolution <X>    Community resolution (default 1.0)
+    -h, --help              Print this help
 "#;
 
 fn run_graph(raw: &[String]) -> Result<()> {
+    if raw.first().map(String::as_str) == Some("merge") {
+        return run_graph_merge(&raw[1..]);
+    }
     let mut obsidian = false;
     let mut obsidian_dir: Option<PathBuf> = None;
-    let mut samples: usize = 3;
+    let mut samples: Option<usize> = None;
     let mut include: Vec<String> = Vec::new();
     let mut exclude: Vec<String> = Vec::new();
     let mut output_format: Option<String> = None;
     let mut jobs: Option<usize> = None;
     let mut no_cache = false;
-    let mut folders = false;
-    let mut resolution = 1.0f64;
+    let mut folders: Option<bool> = None;
+    let mut resolution: Option<f64> = None;
+    let mut config_arg: Option<PathBuf> = None;
+    let mut link_files: Vec<PathBuf> = Vec::new();
     let mut exports: Vec<String> = Vec::new();
     let mut cache_dir_arg: Option<PathBuf> = None;
     let mut positionals: Vec<String> = Vec::new();
@@ -120700,13 +123496,15 @@ fn run_graph(raw: &[String]) -> Result<()> {
                 "obsidian-dir" => obsidian_dir = Some(PathBuf::from(value(&mut i)?)),
                 "samples" => {
                     let raw_value = value(&mut i)?;
-                    samples = raw_value
-                        .parse()
-                        .ok()
-                        .filter(|n: &usize| *n > 0)
-                        .ok_or_else(|| {
-                            anyhow!("--samples must be a positive integer, got {raw_value:?}")
-                        })?;
+                    samples = Some(
+                        raw_value
+                            .parse()
+                            .ok()
+                            .filter(|n: &usize| *n > 0)
+                            .ok_or_else(|| {
+                                anyhow!("--samples must be a positive integer, got {raw_value:?}")
+                            })?,
+                    );
                 }
                 "no-cache" => {
                     if inline_value.is_some() {
@@ -120718,17 +123516,18 @@ fn run_graph(raw: &[String]) -> Result<()> {
                     if inline_value.is_some() {
                         bail!("--folders takes no value");
                     }
-                    folders = true;
+                    folders = Some(true);
                 }
                 "resolution" => {
                     let v = value(&mut i)?;
-                    resolution = v
-                        .parse()
-                        .ok()
-                        .filter(|x: &f64| x.is_finite() && *x > 0.0)
-                        .ok_or_else(|| {
-                            anyhow!("--resolution must be a positive number, got {v:?}")
-                        })?;
+                    resolution = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|x: &f64| x.is_finite() && *x > 0.0)
+                            .ok_or_else(|| {
+                                anyhow!("--resolution must be a positive number, got {v:?}")
+                            })?,
+                    );
                 }
                 "export" => {
                     for kind in value(&mut i)?.split(',') {
@@ -120756,6 +123555,15 @@ fn run_graph(raw: &[String]) -> Result<()> {
                                 anyhow!("--jobs must be a positive integer, got {raw_value:?}")
                             })?,
                     );
+                }
+                "config" => config_arg = Some(PathBuf::from(value(&mut i)?)),
+                "links" => link_files.push(PathBuf::from(value(&mut i)?)),
+                "schema" => {
+                    if inline_value.is_some() {
+                        bail!("--schema takes no value");
+                    }
+                    print!("{}", knowledge_graph::GRAPH_JSON_SCHEMA);
+                    return Ok(());
                 }
                 "include" => include.push(value(&mut i)?),
                 "exclude" => exclude.push(value(&mut i)?),
@@ -120828,6 +123636,17 @@ fn run_graph(raw: &[String]) -> Result<()> {
     if let Some(c) = &cache_dir {
         fs::create_dir_all(c).with_context(|| format!("failed to create {c:?}"))?;
     }
+    let mut cfg = load_graph_config(&input, config_arg.as_deref())?;
+    include.splice(0..0, std::mem::take(&mut cfg.include));
+    exclude.splice(0..0, std::mem::take(&mut cfg.exclude));
+    let samples = samples.or(cfg.samples).unwrap_or(3);
+    let jobs = jobs.or(cfg.jobs);
+    let folders = folders.or(cfg.folders).unwrap_or(false);
+    let resolution = resolution.or(cfg.resolution).unwrap_or(1.0);
+    let patterns = cfg.patterns()?;
+    let patterns_fingerprint = cfg.fingerprint();
+    let mut overrides = std::mem::take(&mut cfg.overrides);
+    read_link_files(&link_files, &mut overrides)?;
     let (name, files) = knowledge_graph::collect(
         &input,
         &knowledge_graph::CollectOptions {
@@ -120837,6 +123656,8 @@ fn run_graph(raw: &[String]) -> Result<()> {
             progress: true,
             jobs,
             cache_dir,
+            patterns,
+            patterns_fingerprint,
         },
     )?;
     if files.is_empty() {
@@ -120848,8 +123669,9 @@ fn run_graph(raw: &[String]) -> Result<()> {
         &knowledge_graph::BuildOptions {
             folders,
             resolution,
+            overrides,
         },
-    );
+    )?;
     let summary = format!(
         "{} files, {} nodes, {} links, {} communities",
         kg.nodes
@@ -120911,6 +123733,146 @@ fn run_graph(raw: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `sniff-rs graph merge <GRAPH>... -o <DIR>`: several `graph.json` files
+/// (and any number of links files, as `--links` takes them) become one
+/// graph, reclustered. An agent's way to add what it knows to a graph:
+/// write links to a JSON file and merge it in.
+fn run_graph_merge(raw: &[String]) -> Result<()> {
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut output: Option<PathBuf> = None;
+    let mut resolution = 1.0f64;
+    let mut by: Option<String> = None;
+    let mut i = 0;
+    while i < raw.len() {
+        let arg = raw[i].as_str();
+        let take = |i: &mut usize| -> Result<String> {
+            *i += 1;
+            raw.get(*i)
+                .cloned()
+                .ok_or_else(|| anyhow!("{arg} requires a value"))
+        };
+        match arg {
+            "-h" | "--help" => {
+                print!("{GRAPH_MERGE_HELP_TEXT}");
+                std::process::exit(0);
+            }
+            "-o" | "--output" => output = Some(PathBuf::from(take(&mut i)?)),
+            "--by" => by = Some(take(&mut i)?),
+            "--resolution" => {
+                let v = take(&mut i)?;
+                resolution = v
+                    .parse()
+                    .ok()
+                    .filter(|x: &f64| x.is_finite() && *x > 0.0)
+                    .ok_or_else(|| anyhow!("--resolution must be a positive number, got {v:?}"))?;
+            }
+            other if other.starts_with("--") && other != "-" => {
+                bail!("unrecognized flag {other} (see sniff-rs graph merge --help)")
+            }
+            _ => inputs.push(PathBuf::from(arg)),
+        }
+        i += 1;
+    }
+    let Some(output) = output else {
+        bail!("graph merge needs -o <DIR> (or -o - to print graph.json)");
+    };
+    let mut graphs = Vec::new();
+    let mut overrides = knowledge_graph::Overrides::default();
+    for path in &inputs {
+        // A directory means the graph.json an earlier run left in it.
+        let path = if path.is_dir() {
+            path.join("graph.json")
+        } else {
+            path.clone()
+        };
+        if knowledge_graph::looks_like_graph_json(&path) {
+            graphs.push(knowledge_graph::from_json(&path)?);
+        } else {
+            read_link_files(std::slice::from_ref(&path), &mut overrides)?;
+        }
+    }
+    if graphs.is_empty() {
+        bail!("graph merge needs at least one graph.json to merge into");
+    }
+    if let Some(by) = &by {
+        for l in &mut overrides.links {
+            l.by.get_or_insert_with(|| by.clone());
+        }
+    }
+    let n_graphs = graphs.len();
+    let mut kg = knowledge_graph::merge_graphs(graphs);
+    let summary = knowledge_graph::apply_overrides(&mut kg.nodes, &mut kg.edges, &overrides)?;
+    knowledge_graph::recluster(&mut kg, resolution);
+    let status = format!(
+        "merged {n_graphs} graph(s): {} nodes, {} links, {} communities ({} links added, {} merged into existing links, {} nodes added)",
+        kg.nodes.len(),
+        kg.edges.len(),
+        kg.communities.len(),
+        summary.links_added,
+        summary.links_merged,
+        summary.nodes_added
+    );
+    if output == Path::new("-") {
+        print!(
+            "{}",
+            json_support::to_pretty_string(&knowledge_graph::to_json(&kg))
+        );
+        println!();
+        eprintln!("{status}");
+        return Ok(());
+    }
+    knowledge_graph::prepare_generated_dir(&output)?;
+    let graph_path = output.join("graph.json");
+    fs::write(
+        &graph_path,
+        json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
+    )
+    .with_context(|| format!("failed to write {graph_path:?}"))?;
+    let report_path = output.join("GRAPH_REPORT.md");
+    fs::write(&report_path, knowledge_graph::render_report(&kg))
+        .with_context(|| format!("failed to write {report_path:?}"))?;
+    eprintln!("{status} -> {}", output.display());
+    Ok(())
+}
+
+/// The config file for a graph run: the one named with `--config`, else
+/// `.sniff-rs.toml` / `.sniff-rs.json` in the input directory, else none.
+fn load_graph_config(
+    input: &Path,
+    explicit: Option<&Path>,
+) -> Result<knowledge_graph::config::GraphConfig> {
+    let path = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None if input.is_dir() => knowledge_graph::config::discover(input),
+        None => None,
+    };
+    let Some(path) = path else {
+        return Ok(knowledge_graph::config::GraphConfig::default());
+    };
+    let cfg = knowledge_graph::config::load(&path)?;
+    eprintln!("using config {}", path.display());
+    Ok(cfg)
+}
+
+/// Reads `--links` files (`{"nodes": [...], "links": [...]}` or a bare
+/// array of links) into `overrides`, as links from outside.
+fn read_link_files(files: &[PathBuf], overrides: &mut knowledge_graph::Overrides) -> Result<()> {
+    for f in files {
+        let text = fs::read_to_string(f).with_context(|| format!("failed to read {f:?}"))?;
+        let doc =
+            json_support::from_str(&text).with_context(|| format!("{f:?} is not valid JSON"))?;
+        let (nodes, links) = knowledge_graph::parse_links(
+            &doc,
+            knowledge_graph::Provenance::External,
+            None,
+            &f.display().to_string(),
+        )?;
+        overrides.nodes.extend(nodes);
+        overrides.links.extend(links);
+    }
+    Ok(())
+}
+
 /// `<INPUT>.graph` beside the input: `data/` -> `data.graph/`,
 /// `sales.csv` -> `sales.csv.graph/`.
 fn default_graph_dir(input: &Path) -> Result<PathBuf> {
@@ -120935,22 +123897,35 @@ fn load_knowledge_graph_input(
     samples: Option<usize>,
 ) -> Result<Option<knowledge_graph::KnowledgeGraph>> {
     if input.is_dir() {
+        let mut cfg = load_graph_config(input, None)?;
+        let patterns = cfg.patterns()?;
+        let patterns_fingerprint = cfg.fingerprint();
         let (name, files) = knowledge_graph::collect(
             input,
             &knowledge_graph::CollectOptions {
-                samples: samples.unwrap_or(3),
-                include: Vec::new(),
-                exclude: Vec::new(),
+                samples: samples.or(cfg.samples).unwrap_or(3),
+                include: std::mem::take(&mut cfg.include),
+                exclude: std::mem::take(&mut cfg.exclude),
                 progress: false,
-                jobs: None,
+                jobs: cfg.jobs,
                 cache_dir: None,
+                patterns,
+                patterns_fingerprint,
             },
         )?;
         if files.is_empty() {
             bail!("no files found under {input:?}");
         }
         eprintln!("graphed {} files under {}", files.len(), input.display());
-        return Ok(Some(knowledge_graph::build(name, files)));
+        return Ok(Some(knowledge_graph::build_with(
+            name,
+            files,
+            &knowledge_graph::BuildOptions {
+                folders: cfg.folders.unwrap_or(false),
+                resolution: cfg.resolution.unwrap_or(1.0),
+                overrides: std::mem::take(&mut cfg.overrides),
+            },
+        )?));
     }
     if input.is_file() && knowledge_graph::looks_like_graph_json(input) {
         if let Some(n) = samples {

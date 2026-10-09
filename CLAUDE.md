@@ -18465,6 +18465,76 @@ columns, is N(N-1)/2 edges whichever way they are found.
 item). The knowledge graph's own two caps (`MAX_HASH_POSTING`,
 `MAX_NAME_GROUP`) remain approximations; dictionary mode has none.
 
+## Connect-everything roadmap (the graph as something you add to)
+
+A ten-phase plan (kept in project memory as `graph_roadmap_plan`) to make
+`sniff-rs graph` connect everything and let outside knowledge in. Each
+phase is its own branch, checked against an independent oracle, and
+disclosed where it stops. Decisions taken without being asked, with the
+reason: the default build stays nightly (a recorded project decision,
+`af7abbe`; prebuilt binaries are the answer for users, phase 10); phase 5
+shells out to `git`/`psql`/`mysql` like `--load-into` already does; names in
+prose are found only behind a flag, as AMBIGUOUS; GPS is opt-in and coarse;
+the external-links shape is `{source, target, relation, confidence,
+evidence, by}`.
+
+### Phase 1: foundations - versioned output, config file, links from outside, merge
+
+- **`graph.json` has a `graph.version`** (1) and a JSON Schema
+  (`src/graph.schema.json`, printed by `sniff-rs graph --schema`). A file
+  with no version reads as 1; a newer version is refused with the version
+  named. Fields may be added within a version. Checked three ways: a
+  Rust-side checker (`graph_json_follows_its_json_schema`, which also fails
+  on a deliberately broken graph), a test that every `Relation` is in the
+  schema's enum, and Python `jsonschema` (Draft7) on graphs from fixtures,
+  a config run and a merge.
+- **Provenance.** Every link says where it came from: absent means this
+  tool read it out of the files; `external` (`--links`, `graph merge`) and
+  `manual` (a `[[link]]` in the config file) are named, with an optional
+  `by` (who asserted it). A new relation, `related_to`, carries a link
+  under a name this tool has no relation for (the name is its `label`; a
+  link named for a known relation keeps that relation). An outside link that
+  duplicates one the tool found strengthens it (strongest confidence, all
+  the evidence) instead of doubling it.
+- **`--links FILE`** (repeatable) adds `{"nodes": [...], "links": [...]}`
+  (or a bare array of links) before communities are found, so an outside
+  link can pull its ends into one community. A node is named by relative
+  path, `file#table`, `kind:value`, a unique label, or a unique file name;
+  a `kind:value` that names nothing becomes an entity node (`concept:churn`),
+  any other unknown endpoint is an error naming all of them.
+- **`sniff-rs graph merge <GRAPH>... -o DIR`** combines graph.json files
+  (or directories holding one) and links files: nodes by id, links by their
+  two ends, relation and label (the first graph's orientation kept, so
+  merging a graph with itself is a no-op), then reclusters. `--by NAME`
+  credits unattributed links. This is the way an agent adds what it knows
+  without a model inside the tool: write links, merge, query.
+- **`.sniff-rs.toml` / `.sniff-rs.json`** in a graphed directory (or
+  `--config FILE`), read by `graph` and by `explain`/`path`/`rank` over a
+  directory, so every command sees the same graph. Keys: `[graph]` (the
+  flags; a flag wins), `[[identifier]]` (a project's own identifier kind
+  from a pattern), `[[link]]`, `[[reject]]` (rule out an extracted link, by
+  glob and relation), `[[alias]]` (two identifiers are one), `[ignore]`
+  entities. An unknown key, a bad value or a bad pattern is an error that
+  names the file and the entry. The file is never read as data. TOML needs
+  `--features toml`; JSON always works.
+- **Custom identifiers need a regex engine and this project has none, so
+  `regex_lite` is one** (a Pike VM, leftmost-first like Perl and Python,
+  linear time whatever the pattern - 50,000 `a`s against `(a*)*b` is
+  instant; classes, groups, alternation, `* + ? {n,m}` and lazy forms,
+  `\d \w \s \b`, `^ $`, `(?i)`; no backreferences or lookaround; ASCII
+  classes). Verified against Python's `re` on 3,000 generated pattern/text
+  pairs (`tests/fixtures/regex_vectors.jsonl`, made by
+  `tools/gen_regex_vectors.py`; 1,938 with matches), which found one real
+  bug (a failed assertion at the first position ended the search). A match
+  is an `EntityKind::Custom` entity (a registry of names; EXTRACTED, since
+  a rule matched it) and goes through the same `mentions` linking as any
+  built-in. The per-file cache key now includes the identifier rules.
+- **Found on the way:** `shares_key` evidence named an arbitrary hub when
+  two owners qualified (a `HashMap` walk), so two runs could write
+  different `graph.json`; it is ordered now, with a test that fails under a
+  `HashMap`. Checked on the real corpus (aggregate): the graph is identical
+  to the previous build apart from that and the new `version` field.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

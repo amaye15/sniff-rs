@@ -16271,6 +16271,399 @@ fn graph_links_photos_by_the_photographer_and_camera_in_their_own_metadata() {
     assert!(!links.iter().any(|f| f == "lone.jpg" || f == "plain.png"));
 }
 
+/// A docs-and-data tree with tickets, two spellings of one e-mail address
+/// and two tables sharing a key.
+fn config_scratch_tree(root: &std::path::Path) -> std::path::PathBuf {
+    let data = root.join("project");
+    std::fs::create_dir_all(data.join("docs")).unwrap();
+    std::fs::create_dir_all(data.join("data")).unwrap();
+    std::fs::write(
+        data.join("docs/notes.txt"),
+        "Fixes PROJ-123 and PROJ-77; see design.txt\n",
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("docs/design.txt"),
+        "Design for PROJ-123, contact j.smith@acme.com, cc noreply@acme.com\n",
+    )
+    .unwrap();
+    std::fs::write(
+        data.join("docs/release.txt"),
+        "Release notes: PROJ-77 shipped. Ask jane.smith@acme.com or noreply@acme.com\n",
+    )
+    .unwrap();
+    let rows = "AC-0001,a\nAC-0002,b\nAC-0003,c\nAC-0004,d\nAC-0005,e\nAC-0006,f\n";
+    std::fs::write(data.join("data/a.csv"), format!("code,name\n{rows}")).unwrap();
+    std::fs::write(data.join("data/b.csv"), format!("code,qty\n{rows}")).unwrap();
+    data
+}
+
+const SCRATCH_CONFIG_JSON: &str = r#"{
+  "graph": {"folders": true},
+  "identifier": [{"name": "ticket", "pattern": "\\b[A-Z]{2,5}-[0-9]{1,6}\\b"}],
+  "link": [{"source": "docs/design.txt", "target": "data/a.csv", "relation": "describes",
+            "evidence": "the design doc is about this table"}],
+  "reject": [{"source": "data/a.csv", "target": "data/b.csv", "relation": "joins"}],
+  "alias": [{"from": "email:j.smith@acme.com", "to": "email:jane.smith@acme.com"}],
+  "ignore": {"entities": ["email:noreply@*"]}
+}"#;
+
+fn graph_doc(args: &[&str]) -> serde_json::Value {
+    let run = run_graph(args);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    serde_json::from_slice(&run.stdout).unwrap()
+}
+
+#[test]
+fn graph_config_file_names_identifiers_links_rejects_aliases_and_ignores() {
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    let input = data.to_str().unwrap();
+    let before = graph_doc(&["graph", input, "-", "--no-cache"]);
+    // Without a config: the two tables join, the two spellings are two
+    // addresses (one mention each, so no node), and tickets are plain text.
+    assert!(kg_link_any(&before, "joins", "data/a.csv", "data/b.csv"));
+    assert!(!before["nodes"].to_string().contains("ticket:"));
+
+    std::fs::write(data.join(".sniff-rs.json"), SCRATCH_CONFIG_JSON).unwrap();
+    let doc = graph_doc(&["graph", input, "-", "--no-cache"]);
+    // The config file is itself never read as data.
+    assert!(!doc["nodes"].to_string().contains(".sniff-rs"));
+    // A project identifier, found in prose and in a column alike.
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/notes.txt",
+        "ticket:PROJ-123"
+    ));
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/design.txt",
+        "ticket:PROJ-123"
+    ));
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/notes.txt",
+        "ticket:PROJ-77"
+    ));
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "data/a.csv",
+        "ticket:AC-0001"
+    ));
+    // A manual link, saying it is one.
+    let manual = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == "related_to")
+        .expect("the manual link");
+    assert_eq!(manual["provenance"], "manual");
+    assert_eq!(manual["label"], "describes");
+    assert_eq!(manual["source"], "docs/design.txt");
+    // A rejected link is gone; the aliased address is one node with both
+    // files; the ignored one is not a node.
+    assert!(!kg_link_any(&doc, "joins", "data/a.csv", "data/b.csv"));
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/design.txt",
+        "email:jane.smith@acme.com"
+    ));
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/release.txt",
+        "email:jane.smith@acme.com"
+    ));
+    assert!(!doc["nodes"].to_string().contains("noreply"));
+    // Folder nodes came from the config's [graph] section.
+    assert!(doc["nodes"].to_string().contains("folder:docs"));
+    // The same file given with --config from elsewhere reads the same.
+    let elsewhere = tmp.path().join("settings.json");
+    std::fs::rename(data.join(".sniff-rs.json"), &elsewhere).unwrap();
+    let via_flag = graph_doc(&[
+        "graph",
+        input,
+        "-",
+        "--no-cache",
+        "--config",
+        elsewhere.to_str().unwrap(),
+    ]);
+    assert_eq!(via_flag["links"], doc["links"]);
+    // explain over the directory reads the discovered config too.
+    std::fs::copy(&elsewhere, data.join(".sniff-rs.json")).unwrap();
+    let explained = run_graph(&[
+        "explain",
+        input,
+        "ticket:PROJ-123",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        explained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&explained.stderr)
+    );
+    let e: serde_json::Value = serde_json::from_slice(&explained.stdout).unwrap();
+    assert_eq!(e["node"]["file_type"], "ticket");
+}
+
+#[test]
+#[cfg(feature = "toml")]
+fn graph_reads_a_toml_config_the_same_way() {
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    std::fs::write(
+        data.join(".sniff-rs.toml"),
+        r#"
+[[identifier]]
+name = "ticket"
+pattern = '\b[A-Z]{2,5}-[0-9]{1,6}\b'
+normalize = "lower"
+
+[[reject]]
+source = "data/a.csv"
+target = "data/b.csv"
+"#,
+    )
+    .unwrap();
+    let doc = graph_doc(&["graph", data.to_str().unwrap(), "-", "--no-cache"]);
+    assert!(kg_link_any(
+        &doc,
+        "mentions",
+        "docs/notes.txt",
+        "ticket:proj-123"
+    ));
+    assert!(!kg_link_any(&doc, "joins", "data/a.csv", "data/b.csv"));
+    assert!(!doc["nodes"].to_string().contains(".sniff-rs"));
+}
+
+#[test]
+fn graph_config_mistakes_are_errors_that_say_where() {
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    let input = data.to_str().unwrap();
+    for (config, needle) in [
+        (r#"{"grph": {}}"#, "unknown key \"grph\""),
+        (
+            r#"{"identifier": [{"name": "t", "pattern": "(a"}]}"#,
+            "a group is not closed",
+        ),
+        (
+            r#"{"identifier": [{"name": "t", "pattern": "a*"}]}"#,
+            "matches the empty string",
+        ),
+        (
+            r#"{"identifier": [{"name": "email", "pattern": "a"}]}"#,
+            "built-in identifier kind",
+        ),
+        (
+            r#"{"link": [{"source": "nope.txt", "target": "docs/notes.txt"}]}"#,
+            "match no node",
+        ),
+        (
+            r#"{"graph": {"resolution": -1}}"#,
+            "resolution must be a positive number",
+        ),
+        ("{not json", "not valid JSON"),
+    ] {
+        std::fs::write(data.join(".sniff-rs.json"), config).unwrap();
+        let run = run_graph(&["graph", input, "-", "--no-cache"]);
+        assert!(!run.status.success(), "{config}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains(needle),
+            "{config}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    let missing = run_graph(&["graph", input, "-", "--config", "/no/such/config.json"]);
+    assert!(!missing.status.success());
+}
+
+#[test]
+fn graph_cache_notices_a_changed_identifier_pattern() {
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    let out = tmp.path().join("out");
+    let run = |config: &str| {
+        std::fs::write(data.join(".sniff-rs.json"), config).unwrap();
+        let r = run_graph(&["graph", data.to_str().unwrap(), out.to_str().unwrap()]);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        graph_json_of(&out)
+    };
+    let narrow = run(r#"{"identifier": [{"name": "ticket", "pattern": "PROJ-123"}]}"#);
+    assert!(narrow["nodes"].to_string().contains("ticket:PROJ-123"));
+    assert!(!narrow["nodes"].to_string().contains("ticket:PROJ-77"));
+    // The files did not change, the rule did: the cache must not answer.
+    let wide = run(r#"{"identifier": [{"name": "ticket", "pattern": "PROJ-[0-9]+"}]}"#);
+    assert!(wide["nodes"].to_string().contains("ticket:PROJ-77"));
+}
+
+#[test]
+fn graph_links_and_merge_add_what_the_files_do_not_say() {
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    let input = data.to_str().unwrap();
+    let extra = tmp.path().join("extra.json");
+    std::fs::write(
+        &extra,
+        r#"{"links": [
+            {"source": "docs/release.txt", "target": "concept:churn", "relation": "mentions",
+             "evidence": "release.txt is about churn", "by": "claude"},
+            {"source": "docs/notes.txt", "target": "concept:churn", "relation": "cites",
+             "confidence": "AMBIGUOUS", "weight": 3}]}"#,
+    )
+    .unwrap();
+    // On the way in: --links joins the graph before its communities.
+    let direct = graph_doc(&[
+        "graph",
+        input,
+        "-",
+        "--no-cache",
+        "--links",
+        extra.to_str().unwrap(),
+    ]);
+    let churn: Vec<&serde_json::Value> = direct["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["target"] == "concept:churn")
+        .collect();
+    assert_eq!(churn.len(), 2);
+    assert!(churn.iter().all(|l| l["provenance"] == "external"));
+    assert!(
+        churn
+            .iter()
+            .any(|l| l["by"] == "claude" && l["relation"] == "mentions")
+    );
+    assert!(
+        churn
+            .iter()
+            .any(|l| l["relation"] == "related_to" && l["label"] == "cites")
+    );
+
+    // Afterwards: graph merge, on a graph written earlier.
+    let out = tmp.path().join("out");
+    assert!(
+        run_graph(&["graph", input, out.to_str().unwrap(), "--no-cache"])
+            .status
+            .success()
+    );
+    let merged = tmp.path().join("merged");
+    let run = run_graph(&[
+        "graph",
+        "merge",
+        out.to_str().unwrap(),
+        extra.to_str().unwrap(),
+        "--by",
+        "agent",
+        "-o",
+        merged.to_str().unwrap(),
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let after = graph_json_of(&merged);
+    let plain = graph_json_of(&out);
+    assert_eq!(
+        after["links"].as_array().unwrap().len(),
+        plain["links"].as_array().unwrap().len() + 2
+    );
+    let cites = after["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["label"] == "cites")
+        .unwrap();
+    assert_eq!(
+        cites["by"], "agent",
+        "--by credits a link that names no one"
+    );
+    // Every community has a label, and the merged graph is queryable.
+    assert!(
+        after["graph"]["communities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| !c["label"].as_str().unwrap().is_empty())
+    );
+    let explained = run_graph(&[
+        "explain",
+        merged.join("graph.json").to_str().unwrap(),
+        "concept:churn",
+    ]);
+    assert!(explained.status.success());
+    assert!(String::from_utf8_lossy(&explained.stdout).contains("asserted by claude"));
+    // Merging a graph with itself changes nothing.
+    let twice = tmp.path().join("twice");
+    assert!(
+        run_graph(&[
+            "graph",
+            "merge",
+            out.to_str().unwrap(),
+            out.to_str().unwrap(),
+            "-o",
+            twice.to_str().unwrap()
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(graph_json_of(&twice)["links"], plain["links"]);
+    // And the mistakes: an endpoint naming nothing, and nothing to merge into.
+    std::fs::write(
+        &extra,
+        r#"[{"source": "nope.txt", "target": "docs/notes.txt"}]"#,
+    )
+    .unwrap();
+    let bad = run_graph(&[
+        "graph",
+        "merge",
+        out.to_str().unwrap(),
+        extra.to_str().unwrap(),
+        "-o",
+        "-",
+    ]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("match no node"));
+    let alone = run_graph(&["graph", "merge", extra.to_str().unwrap(), "-o", "-"]);
+    assert!(String::from_utf8_lossy(&alone.stderr).contains("at least one graph.json"));
+    let no_output = run_graph(&["graph", "merge", out.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&no_output.stderr).contains("needs -o"));
+}
+
+#[test]
+fn graph_schema_flag_prints_the_json_schema_graph_json_follows() {
+    let run = run_graph(&["graph", "--schema"]);
+    assert!(run.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert_eq!(schema["$schema"], "http://json-schema.org/draft-07/schema#");
+    assert_eq!(schema["required"].as_array().unwrap().len(), 5);
+    let tmp = TempDir::new();
+    let data = config_scratch_tree(tmp.path());
+    let doc = graph_doc(&["graph", data.to_str().unwrap(), "-", "--no-cache"]);
+    assert_eq!(doc["graph"]["version"], 1);
+    let relations: Vec<&str> =
+        schema["properties"]["links"]["items"]["properties"]["relation"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+    for l in doc["links"].as_array().unwrap() {
+        assert!(relations.contains(&l["relation"].as_str().unwrap()), "{l}");
+    }
+}
+
 // --- Compressed input recognized by content, and `diff` reading stdin ---
 
 /// A gzip-compressed CSV with no extension at all is decompressed from

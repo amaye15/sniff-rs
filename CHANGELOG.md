@@ -7,6 +7,15 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Graph foundations: `graph.json` carries a `version` and has a JSON Schema
+  (`sniff-rs graph --schema`); every link says where it came from
+  (`provenance`: absent for the tool's own, `external`, `manual`; optional
+  `by`); a `related_to` relation carries links under any other name.
+  `--links FILE` and `sniff-rs graph merge` add links from outside (an
+  agent's, a person's) and recluster. A `.sniff-rs.toml` / `.sniff-rs.json`
+  in the graphed folder holds settings, project identifier patterns
+  (`[[identifier]]`, matched by a small built-in regular-expression
+  engine), manual links, rejected links, aliases and ignored identifiers.
 - Knowledge graph (`sniff-rs graph`), faster and richer. Files are read on a
   worker pool (`--jobs`), and each file's result is cached in
   `OUTPUT_DIR/.sniff-rs-cache` (`--no-cache`, `--cache-dir`), so a re-run
@@ -151,6 +160,9 @@ All notable changes to sniff-rs are documented here. Format follows
   files.
 
 ### Fixed
+- Two runs of `sniff-rs graph` on one input could write different
+  `shares_key` evidence (a hash-order walk named an arbitrary owner); the
+  lowest owner is named now.
 - A column with a few missing values (under 0.05%) reported `missing_pct`
   `0.0`, lost its "has missing values" note, and was declared `NOT NULL` in
   SQL, so the first NULL failed the load. It now reports the real share.
