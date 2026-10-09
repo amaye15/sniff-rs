@@ -7,6 +7,15 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- Code to data links in `sniff-rs graph`: `imports` (Python, JavaScript/
+  TypeScript, Rust, Java, R), `reads` and `writes` (the files and tables a
+  script, notebook or SQL query reads or writes - `pd.read_csv`, `open`,
+  `fs.readFile`, `File::open`, `read.csv`, `SELECT ... FROM`, `INSERT INTO`,
+  dbt `ref()`), directed, with the call as evidence. A file or table no
+  input file has, but two or more programs name, becomes a `path:` or
+  `table:` node between them. Replaces the plain `references` link between
+  the same two files. Checked against `ast`, `sqlglot` and tree-sitter on
+  tens of thousands of real files.
 - Graph foundations: `graph.json` carries a `version` and has a JSON Schema
   (`sniff-rs graph --schema`); every link says where it came from
   (`provenance`: absent for the tool's own, `external`, `manual`; optional
@@ -160,6 +169,7 @@ All notable changes to sniff-rs are documented here. Format follows
   files.
 
 ### Fixed
+- A short source file with commas (`.js`, `.py`, `.rs`, ...) was read as a CSV table and lost its text; files with a source extension are never sniffed as tables.
 - Two runs of `sniff-rs graph` on one input could write different
   `shares_key` evidence (a hash-order walk named an arbitrary owner); the
   lowest owner is named now.

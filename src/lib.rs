@@ -85041,7 +85041,7 @@ fn detect_format(
     // export, or an extensionless pipe). The bar is deliberately high - see
     // `looks_like_delimited_table` - because guessing "CSV" for prose or a
     // log would be worse than asking for `--format`.
-    if looks_like_delimited_table(read_path) {
+    if !code_facts::is_source_extension(&ext) && looks_like_delimited_table(read_path) {
         return Ok(InputFormat::Csv);
     }
     bail!(
@@ -111839,6 +111839,2515 @@ mod regex_lite_tests {
     }
 }
 
+// --- What source code and SQL say about files and tables ---
+//
+// A script that reads `sales.csv` and a query that selects from `sales`
+// are connected to that data, and a module that imports another is
+// connected to it; none of that is in the data. `code_facts` reads it out
+// of the source: the files a program imports, the files it reads and
+// writes (by the path literal in the call that does it), and the tables
+// a SQL statement reads and writes - in `.sql` files, in the SQL strings
+// inside other code, and in dbt's `{{ ref('model') }}`.
+//
+// It is a lexer and a small call engine, not a parser: a lexer per
+// language family skips comments and finds string literals, and the
+// engine keeps a stack of the calls and brackets a literal sits in, so
+// `pd.read_csv(os.path.join(DIR, "sales.csv"))` finds `sales.csv` read and
+// `df.to_csv("out.csv")` finds `out.csv` written, while a string inside a
+// dict or list literal (`json.dump({"note": "a.txt"}, f)`) is not a path.
+// Every language is a table of which call names read, write, or only name
+// a path. What is out of reach is disclosed in CLAUDE.md: a path built in a
+// variable first, `import *`, packages (only files inside the input
+// resolve), Go package imports.
+mod code_facts {
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub(crate) struct CodeFacts {
+        pub(crate) language: String,
+        pub(crate) imports: Vec<Import>,
+        pub(crate) accesses: Vec<Access>,
+        pub(crate) sql: Vec<SqlRef>,
+    }
+
+    /// A module a file imports. Python: `module` is dotted, `dots` its
+    /// leading dots (relative), `names` what a `from` import takes from it.
+    /// Elsewhere `module` is the path or package as written.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Import {
+        pub(crate) module: String,
+        pub(crate) names: Vec<String>,
+        pub(crate) dots: usize,
+        /// Named by a call (`importlib.import_module("m")`, `require("m")`)
+        /// and not by an import statement.
+        pub(crate) dynamic: bool,
+    }
+
+    /// A file path a call reads or writes.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct Access {
+        pub(crate) path: String,
+        pub(crate) write: bool,
+        /// The call, as written (`pd.read_csv`).
+        pub(crate) call: String,
+    }
+
+    /// A table a SQL statement reads or writes.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(crate) struct SqlRef {
+        pub(crate) table: String,
+        pub(crate) write: bool,
+        /// `sql`, `dbt ref` or `dbt source`.
+        pub(crate) origin: String,
+    }
+
+    const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_FACTS: usize = 500;
+
+    /// Extensions of programs and scripts, whatever their language: a file
+    /// with one is source, never a table, however many commas it has.
+    pub(crate) fn is_source_extension(ext: &str) -> bool {
+        language_of(ext).is_some()
+            || matches!(
+                ext,
+                "c" | "h"
+                    | "cc"
+                    | "cpp"
+                    | "cxx"
+                    | "hpp"
+                    | "cs"
+                    | "rb"
+                    | "php"
+                    | "swift"
+                    | "kt"
+                    | "kts"
+                    | "scala"
+                    | "sh"
+                    | "bash"
+                    | "zsh"
+                    | "ps1"
+                    | "lua"
+                    | "pl"
+                    | "pm"
+                    | "jl"
+                    | "m"
+                    | "dart"
+                    | "ex"
+                    | "exs"
+                    | "erl"
+                    | "hs"
+                    | "clj"
+                    | "vue"
+                    | "svelte"
+                    | "css"
+                    | "scss"
+                    | "less"
+                    | "bat"
+                    | "cmd"
+                    | "vb"
+                    | "fs"
+                    | "groovy"
+                    | "gradle"
+            )
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Lang {
+        Python,
+        Js,
+        Java,
+        Go,
+        Rust,
+        R,
+        Sql,
+    }
+
+    impl Lang {
+        pub(crate) fn name(self) -> &'static str {
+            match self {
+                Lang::Python => "python",
+                Lang::Js => "javascript",
+                Lang::Java => "java",
+                Lang::Go => "go",
+                Lang::Rust => "rust",
+                Lang::R => "r",
+                Lang::Sql => "sql",
+            }
+        }
+    }
+
+    /// The language of a file extension, when this reads it.
+    pub(crate) fn language_of(ext: &str) -> Option<Lang> {
+        Some(match ext {
+            "py" | "pyw" => Lang::Python,
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => Lang::Js,
+            "java" => Lang::Java,
+            "go" => Lang::Go,
+            "rs" => Lang::Rust,
+            "r" | "rmd" => Lang::R,
+            "sql" => Lang::Sql,
+            _ => return None,
+        })
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Tok {
+        Ident(String),
+        Str(String),
+        Punct(u8),
+        Newline,
+        Other,
+    }
+
+    fn ident_byte(b: u8, lang: Lang) -> bool {
+        b.is_ascii_alphanumeric()
+            || b == b'_'
+            || b >= 0x80
+            || (b == b'$' && lang == Lang::Js)
+            || (b == b'.' && lang == Lang::R)
+    }
+
+    /// The text of a string literal as the program sees it, closely enough
+    /// for a path: `\\`, `\"` and `\'` unescaped, any other escape kept.
+    fn unescape(raw: &[u8], raw_string: bool) -> String {
+        if raw_string || !raw.contains(&b'\\') {
+            return String::from_utf8_lossy(raw).into_owned();
+        }
+        let hex = |s: &[u8]| -> Option<u32> {
+            std::str::from_utf8(s)
+                .ok()
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+        };
+        let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] != b'\\' || i + 1 >= raw.len() {
+                out.push(raw[i]);
+                i += 1;
+                continue;
+            }
+            let c = raw[i + 1];
+            let (ch, used): (Option<char>, usize) = match c {
+                b'\\' | b'"' | b'\'' => (Some(c as char), 2),
+                b'n' => (Some('\n'), 2),
+                b't' => (Some('\t'), 2),
+                b'r' => (Some('\r'), 2),
+                b'0' => (Some('\0'), 2),
+                b'x' => match raw.get(i + 2..i + 4).and_then(hex) {
+                    Some(v) => (char::from_u32(v), 4),
+                    None => (None, 0),
+                },
+                b'u' if raw.get(i + 2) == Some(&b'{') => {
+                    match raw[i + 3..].iter().position(|&x| x == b'}') {
+                        Some(end) => (
+                            hex(&raw[i + 3..i + 3 + end]).and_then(char::from_u32),
+                            end + 4,
+                        ),
+                        None => (None, 0),
+                    }
+                }
+                b'u' => match raw.get(i + 2..i + 6).and_then(hex) {
+                    Some(v) => (char::from_u32(v), 6),
+                    None => (None, 0),
+                },
+                b'U' => match raw.get(i + 2..i + 10).and_then(hex) {
+                    Some(v) => (char::from_u32(v), 10),
+                    None => (None, 0),
+                },
+                _ => (None, 0),
+            };
+            match ch {
+                Some(ch) => {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    i += used;
+                }
+                // Any other escape stays as written.
+                None => {
+                    out.push(b'\\');
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Scans a string body from `i` (just past the opening quote) to the
+    /// closing `quote` (or `triple`), returning the raw bytes and the
+    /// index after it. `escapes` makes a backslash protect the next byte;
+    /// a plain string ends at a newline.
+    fn scan_string(
+        b: &[u8],
+        mut i: usize,
+        quote: u8,
+        triple: bool,
+        escapes: bool,
+        multiline: bool,
+    ) -> (usize, usize, usize) {
+        let start = i;
+        while i < b.len() {
+            let c = b[i];
+            if escapes && c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == quote {
+                if !triple {
+                    return (start, i, i + 1);
+                }
+                if b.get(i + 1) == Some(&quote) && b.get(i + 2) == Some(&quote) {
+                    return (start, i, i + 3);
+                }
+            }
+            if c == b'\n' && !triple && !multiline {
+                return (start, i, i);
+            }
+            i += 1;
+        }
+        (start, b.len(), b.len())
+    }
+
+    fn lex(lang: Lang, src: &str) -> Vec<Tok> {
+        let b = src.as_bytes();
+        let n = b.len();
+        let mut i = 0;
+        let mut out: Vec<Tok> = Vec::new();
+        let hash = matches!(lang, Lang::Python | Lang::R);
+        let slash = matches!(lang, Lang::Js | Lang::Java | Lang::Go | Lang::Rust);
+        while i < n {
+            let c = b[i];
+            match c {
+                b'\n' => {
+                    out.push(Tok::Newline);
+                    i += 1;
+                }
+                b' ' | b'\t' | b'\r' | 0x0c => i += 1,
+                // A Python line continuation joins two lines.
+                b'\\' if lang == Lang::Python && matches!(b.get(i + 1), Some(b'\n' | b'\r')) => {
+                    i += 1;
+                    while i < n && matches!(b[i], b'\r') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'#' if hash => {
+                    while i < n && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if slash && b.get(i + 1) == Some(&b'/') => {
+                    while i < n && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if slash && b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    let mut depth = 1;
+                    while i < n && depth > 0 {
+                        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') && lang == Lang::Rust {
+                            depth += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'/' if lang == Lang::Js && regex_allowed(&out) => {
+                    // A regular expression literal, skipped.
+                    i += 1;
+                    let mut in_class = false;
+                    while i < n && b[i] != b'\n' {
+                        match b[i] {
+                            b'\\' => i += 1,
+                            b'[' => in_class = true,
+                            b']' => in_class = false,
+                            b'/' if !in_class => {
+                                i += 1;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    while i < n && b[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    out.push(Tok::Other);
+                }
+                b'"' | b'\'' | b'`' => {
+                    i = lex_quoted(lang, b, i, &mut out);
+                }
+                c if c.is_ascii_digit() => {
+                    while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.') {
+                        i += 1;
+                    }
+                    out.push(Tok::Other);
+                }
+                c if ident_byte(c, lang) => {
+                    let start = i;
+                    while i < n && ident_byte(b[i], lang) {
+                        i += 1;
+                    }
+                    let word = &src[start..i];
+                    // A string prefix: Python r/b/u/f, Rust r/b/br/c.
+                    let quote_next = matches!(b.get(i), Some(b'"' | b'\''));
+                    let prefix = match lang {
+                        Lang::Python => {
+                            word.len() <= 2 && word.bytes().all(|x| b"rRbBuUfF".contains(&x))
+                        }
+                        Lang::Rust => matches!(word, "r" | "b" | "br" | "rb" | "c" | "cr"),
+                        _ => false,
+                    };
+                    if prefix && quote_next {
+                        let raw = word.bytes().any(|x| x == b'r' || x == b'R');
+                        i = lex_prefixed(lang, b, i, raw, &mut out);
+                    } else if lang == Lang::Rust
+                        && word == "r"
+                        && b.get(i) == Some(&b'#')
+                        && b.get(i + 1)
+                            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    {
+                        // A raw identifier, `r#gen`.
+                        let start = i + 1;
+                        i = start;
+                        while i < n && ident_byte(b[i], lang) {
+                            i += 1;
+                        }
+                        out.push(Tok::Ident(src[start..i].to_string()));
+                    } else if lang == Lang::Rust
+                        && matches!(word, "r" | "br" | "cr")
+                        && b.get(i) == Some(&b'#')
+                    {
+                        // r#"..."#
+                        let mut hashes = 0;
+                        let mut j = i;
+                        while b.get(j) == Some(&b'#') {
+                            hashes += 1;
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'"') {
+                            j += 1;
+                            let body = j;
+                            let mut end = n;
+                            let mut k = j;
+                            while k < n {
+                                if b[k] == b'"'
+                                    && (0..hashes).all(|h| b.get(k + 1 + h) == Some(&b'#'))
+                                {
+                                    end = k;
+                                    k += 1 + hashes;
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            out.push(Tok::Str(
+                                String::from_utf8_lossy(&b[body..end]).into_owned(),
+                            ));
+                            i = k.min(n);
+                        } else {
+                            out.push(Tok::Ident(word.to_string()));
+                        }
+                    } else {
+                        out.push(Tok::Ident(word.to_string()));
+                    }
+                }
+                c if c.is_ascii_punctuation() => {
+                    out.push(Tok::Punct(c));
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+        if lang == Lang::Python {
+            merge_adjacent_strings(&mut out);
+        }
+        out
+    }
+
+    /// Python joins `"a" "b"` into one string, across lines inside brackets.
+    fn merge_adjacent_strings(toks: &mut Vec<Tok>) {
+        let mut out: Vec<Tok> = Vec::with_capacity(toks.len());
+        let mut depth = 0i32;
+        let mut pending_nl = 0;
+        for t in toks.drain(..) {
+            match &t {
+                Tok::Punct(b'(' | b'[' | b'{') => depth += 1,
+                Tok::Punct(b')' | b']' | b'}') => depth = (depth - 1).max(0),
+                _ => {}
+            }
+            if let Tok::Str(next) = &t {
+                // Newlines inside brackets between two strings don't end the expression.
+                let mut k = out.len();
+                while depth > 0 && k > 0 && out[k - 1] == Tok::Newline {
+                    k -= 1;
+                }
+                if k > 0
+                    && let Tok::Str(prev) = &out[k - 1]
+                {
+                    let joined = format!("{prev}{next}");
+                    out.truncate(k - 1);
+                    out.push(Tok::Str(joined));
+                    pending_nl = 0;
+                    continue;
+                }
+            }
+            pending_nl = 0;
+            out.push(t);
+        }
+        let _ = pending_nl;
+        *toks = out;
+    }
+
+    fn regex_allowed(out: &[Tok]) -> bool {
+        match out.iter().rev().find(|t| **t != Tok::Newline) {
+            None => true,
+            Some(Tok::Punct(p)) => !matches!(p, b')' | b']' | b'}'),
+            Some(Tok::Ident(w)) => matches!(
+                w.as_str(),
+                "return"
+                    | "typeof"
+                    | "instanceof"
+                    | "in"
+                    | "of"
+                    | "new"
+                    | "delete"
+                    | "void"
+                    | "throw"
+                    | "case"
+                    | "do"
+                    | "else"
+                    | "yield"
+                    | "await"
+            ),
+            Some(_) => false,
+        }
+    }
+
+    /// A string whose prefix was just read; `i` is at the quote.
+    fn lex_prefixed(lang: Lang, b: &[u8], i: usize, raw: bool, out: &mut Vec<Tok>) -> usize {
+        let quote = b[i];
+        let triple =
+            lang == Lang::Python && b.get(i + 1) == Some(&quote) && b.get(i + 2) == Some(&quote);
+        let body = if triple { i + 3 } else { i + 1 };
+        let (s, e, next) = scan_string(b, body, quote, triple, true, lang == Lang::Rust);
+        out.push(Tok::Str(unescape(&b[s..e], raw)));
+        next
+    }
+
+    /// A string or character literal at `i` (a quote): pushes it, returns
+    /// the index after.
+    fn lex_quoted(lang: Lang, b: &[u8], i: usize, out: &mut Vec<Tok>) -> usize {
+        let quote = b[i];
+        let n = b.len();
+        match (lang, quote) {
+            // An R backtick name is an identifier.
+            (Lang::R, b'`') => {
+                let (s, e, next) = scan_string(b, i + 1, b'`', false, false, false);
+                out.push(Tok::Ident(String::from_utf8_lossy(&b[s..e]).into_owned()));
+                next
+            }
+            // Go raw strings and JS template literals: to the next backtick.
+            (_, b'`') => {
+                let (s, e, next) = scan_string(b, i + 1, b'`', false, lang == Lang::Js, true);
+                out.push(Tok::Str(String::from_utf8_lossy(&b[s..e]).into_owned()));
+                next
+            }
+            // A character literal (Java, Go) or a Rust char or lifetime.
+            (Lang::Java | Lang::Go | Lang::Rust, b'\'') => {
+                let is_char = match lang {
+                    Lang::Rust => b.get(i + 1) == Some(&b'\\') || b.get(i + 2) == Some(&b'\''),
+                    _ => true,
+                };
+                if !is_char {
+                    out.push(Tok::Punct(b'\''));
+                    return i + 1;
+                }
+                let mut j = i + 1;
+                while j < n && b[j] != b'\'' && b[j] != b'\n' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                out.push(Tok::Other);
+                (j + 1).min(n)
+            }
+            // A Java text block.
+            (Lang::Java, b'"') if b.get(i + 1) == Some(&b'"') && b.get(i + 2) == Some(&b'"') => {
+                let (s, e, next) = scan_string(b, i + 3, b'"', true, true, true);
+                out.push(Tok::Str(unescape(&b[s..e], false)));
+                next
+            }
+            // A Python triple-quoted string.
+            (Lang::Python, q) if b.get(i + 1) == Some(&q) && b.get(i + 2) == Some(&q) => {
+                let (s, e, next) = scan_string(b, i + 3, q, true, true, true);
+                out.push(Tok::Str(unescape(&b[s..e], false)));
+                next
+            }
+            _ => {
+                let (s, e, next) = scan_string(b, i + 1, quote, false, true, lang == Lang::Rust);
+                out.push(Tok::Str(unescape(&b[s..e], false)));
+                next
+            }
+        }
+    }
+
+    // ---- The call engine ----
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Kind {
+        Read,
+        Write,
+        /// Python's `open`: the second string says which.
+        OpenMode,
+        /// Names a path without saying what is done with it
+        /// (`Paths.get("x")`): the enclosing call decides, else a read.
+        Neutral,
+        Import,
+        None,
+    }
+
+    /// A string literal passed directly to a call.
+    struct ArgStr {
+        index: usize,
+        keyword: Option<String>,
+        text: String,
+    }
+
+    struct Frame {
+        chain: String,
+        kind: Kind,
+        /// Brackets and braces hold literals, not arguments.
+        literal: bool,
+        strings: Vec<ArgStr>,
+        /// Which argument the next token belongs to, and the name it was
+        /// given (`mode="w"`).
+        arg_index: usize,
+        keyword: Option<String>,
+        /// Paths named by Neutral calls inside, waiting for this call's
+        /// kind.
+        pending: Vec<(String, String)>,
+    }
+
+    const EXTENSIONS: &[&str] = &[
+        "csv", "tsv", "psv", "json", "jsonl", "ndjson", "parquet", "pqt", "xlsx", "xls", "xlsb",
+        "ods", "txt", "dat", "pkl", "pickle", "npy", "npz", "h5", "hdf5", "hdf", "feather",
+        "arrow", "db", "sqlite", "sqlite3", "png", "jpg", "jpeg", "gif", "svg", "pdf", "html",
+        "htm", "xml", "yaml", "yml", "toml", "ini", "md", "log", "sav", "dta", "rds", "rdata",
+        "rda", "orc", "avro", "zip", "gz", "bz2", "xz", "sql", "py", "ipynb", "js", "ts", "r",
+        "geojson", "shp", "gpkg", "mat", "nc", "fits", "bin", "pt", "pth", "ckpt", "onnx", "parq",
+        "tif", "tiff", "bmp", "webp", "mp3", "mp4", "wav", "docx", "pptx", "rtf", "tex", "bib",
+        "fasta", "fa", "fastq", "vcf", "bed", "gff", "sam", "bam", "xpt", "sas7bdat", "zst", "tar",
+        "mbox", "eml", "ics", "vcf", "har", "plist", "msgpack", "cbor", "bson", "env", "cfg",
+        "conf",
+    ];
+
+    /// Whether a string reads as a path to a file: no URL scheme, a final
+    /// component with an extension that has a letter in it.
+    fn path_like(s: &str) -> bool {
+        let t = s.trim();
+        if t.is_empty()
+            || t.len() > 300
+            || t.contains("://")
+            || t.chars()
+                .any(|c| c.is_control() || matches!(c, '<' | '>' | '|' | '"'))
+            || t.match_indices(':').any(|(i, _)| i != 1)
+        {
+            return false;
+        }
+        let last = t.rsplit(['/', '\\']).next().unwrap_or(t);
+        match last.rsplit_once('.') {
+            Some((stem, ext)) => {
+                !ext.is_empty()
+                    && (ext.len() > 1 || EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+                    && ext.len() <= 10
+                    && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                    && ext.bytes().any(|b| b.is_ascii_alphabetic())
+                    && (!stem.is_empty() || t.len() > last.len())
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a path with this extension is worth a node of its own when
+    /// nothing in the input has that name.
+    pub(crate) fn known_extension(path: &str) -> bool {
+        path.rsplit(['/', '\\'])
+            .next()
+            .and_then(|f| f.rsplit_once('.'))
+            .is_some_and(|(_, e)| EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    }
+
+    fn classify(lang: Lang, name: &str, chain: &str) -> Kind {
+        use Kind::*;
+        let n = name.to_ascii_lowercase();
+        let mut c = chain.to_ascii_lowercase();
+        // `java.nio.file.Paths.get` is `Paths.get`.
+        if lang == Lang::Java {
+            let parts: Vec<&str> = c.split('.').collect();
+            c = parts[parts.len().saturating_sub(2)..].join(".");
+        }
+        match lang {
+            Lang::Python => match n.as_str() {
+                "open" => OpenMode,
+                "read_csv" | "read_table" | "read_excel" | "read_json" | "read_parquet"
+                | "read_feather" | "read_pickle" | "read_fwf" | "read_hdf" | "read_stata"
+                | "read_sas" | "read_spss" | "read_orc" | "read_xml" | "read_html" | "loadtxt"
+                | "genfromtxt" | "load" | "load_workbook" | "read_file" | "read_text"
+                | "read_bytes" | "imread" | "from_csv" | "open_workbook" | "fromfile"
+                | "read_sql_table" | "read_gbq" | "read_netcdf" | "open_dataset"
+                | "read_raster" => Read,
+                "to_csv" | "to_excel" | "to_json" | "to_parquet" | "to_feather" | "to_pickle"
+                | "to_hdf" | "to_stata" | "to_html" | "to_latex" | "to_markdown" | "to_xml"
+                | "to_file" | "to_orc" | "savefig" | "save" | "savez" | "savez_compressed"
+                | "savetxt" | "dump" | "imwrite" | "write_text" | "write_bytes" | "write_table"
+                | "write_csv" | "tofile" | "to_netcdf" | "to_zarr" => Write,
+                "path" | "purepath" | "posixpath" | "windowspath" => Neutral,
+                "join" if c.contains("path") => Neutral,
+                "import_module" | "__import__" => Import,
+                _ => None,
+            },
+            Lang::Js => match n.as_str() {
+                "readfile" | "readfilesync" | "createreadstream" | "readjson" | "readjsonsync"
+                | "readfilepromise" | "loadjson" | "readcsv" => Read,
+                "writefile" | "writefilesync" | "appendfile" | "appendfilesync"
+                | "createwritestream" | "outputfile" | "outputfilesync" | "writejson"
+                | "writejsonsync" => Write,
+                "csv" | "tsv" | "json" | "text" | "xml" | "html" | "image"
+                    if c.starts_with("d3.") =>
+                {
+                    Read
+                }
+                "fetch" => Read,
+                "require" | "import" => Import,
+                "join" | "resolve" if c.starts_with("path") => Neutral,
+                _ => None,
+            },
+            Lang::Rust => match n.as_str() {
+                "open" | "read_to_string" | "read" | "include_str" | "include_bytes"
+                | "read_csv" | "from_path"
+                    if !(n == "from_path" && c.contains("writer")) =>
+                {
+                    Read
+                }
+                "from_path" => Write,
+                "create" | "write" | "write_csv" | "to_path" => Write,
+                "new" if c.starts_with("path::") || c.starts_with("pathbuf::") => Neutral,
+                "from" if c.contains("pathbuf") => Neutral,
+                "join" => Neutral,
+                _ => None,
+            },
+            Lang::Go => match n.as_str() {
+                "open" | "readfile" | "openfile" => Read,
+                "create" | "writefile" => Write,
+                "join" if c.starts_with("filepath.") || c.starts_with("path.") => Neutral,
+                _ => None,
+            },
+            Lang::Java => match n.as_str() {
+                "filereader" | "fileinputstream" | "readalllines" | "readallbytes"
+                | "readstring" | "lines" | "newbufferedreader" | "newinputstream" => Read,
+                "filewriter" | "fileoutputstream" | "printwriter" | "writestring"
+                | "newbufferedwriter" | "newoutputstream" => Write,
+                "write" if c.starts_with("files") => Write,
+                "file" => Neutral,
+                "get" if c.starts_with("paths") => Neutral,
+                "of" if c.starts_with("path") => Neutral,
+                _ => None,
+            },
+            Lang::R => match n.as_str() {
+                "read.csv" | "read.csv2" | "read.table" | "read.delim" | "read_csv"
+                | "read_tsv" | "read_delim" | "read_excel" | "read_xlsx" | "readrds" | "load"
+                | "fread" | "read_json" | "fromjson" | "read_parquet" | "read_feather"
+                | "read_sas" | "read_spss" | "read_stata" | "read.xlsx" | "readlines" | "scan"
+                | "read_rds" | "read_fwf" | "read_lines" | "read_file" | "readline"
+                | "read_dta" => Read,
+                "write.csv" | "write.csv2" | "write.table" | "write_csv" | "write_tsv"
+                | "write_delim" | "write_xlsx" | "saverds" | "save" | "fwrite" | "ggsave"
+                | "write_json" | "write_parquet" | "write_feather" | "write_rds" | "writelines"
+                | "sink" | "png" | "pdf" | "jpeg" | "svg" | "tiff" | "bmp" | "write_lines"
+                | "write.xlsx" => Write,
+                "source" | "sys.source" => Import,
+                "file.path" | "here" => Neutral,
+                _ => None,
+            },
+            Lang::Sql => None,
+        }
+    }
+
+    /// Words that put a `(` after them in a definition, not a call.
+    /// The path a join of string parts names: parts joined by `/`, a part
+    /// that is itself absolute starting over.
+    fn join_parts(parts: &[&str]) -> Option<String> {
+        let mut out = String::new();
+        for p in parts {
+            if p.is_empty() {
+                continue;
+            }
+            if out.is_empty() || p.starts_with('/') {
+                out = (*p).to_string();
+            } else {
+                if !out.ends_with('/') {
+                    out.push('/');
+                }
+                out.push_str(p);
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// Keyword arguments whose strings are options, not paths.
+    const NON_PATH_KEYWORDS: &[&str] = &[
+        "encoding",
+        "mode",
+        "errors",
+        "newline",
+        "sep",
+        "delimiter",
+        "compression",
+        "engine",
+        "sheet_name",
+        "orient",
+        "lineterminator",
+        "quotechar",
+        "na_rep",
+        "float_format",
+        "date_format",
+        "decimal",
+        "key",
+        "dtype",
+        "format",
+        "index_label",
+        "header",
+        "comment",
+        "na_values",
+        "quote",
+        "fileencoding",
+        "enc",
+        "colnames",
+        "dec",
+        "name",
+        "label",
+        "title",
+        "xlabel",
+        "ylabel",
+        "usecols",
+        "parse_dates",
+        "storage_options",
+        "protocol",
+        "mime",
+    ];
+
+    fn defines(prev: Option<&Tok>) -> bool {
+        matches!(prev, Some(Tok::Ident(w)) if matches!(w.as_str(), "def" | "fn" | "func" | "function" | "class" | "interface" | "struct" | "enum" | "trait" | "impl"))
+    }
+
+    fn call_name(toks: &[Tok], open: usize, lang: Lang) -> Option<(String, String)> {
+        let mut j = open;
+        // Rust macros: name ! (
+        if lang == Lang::Rust && j >= 2 && toks[j - 1] == Tok::Punct(b'!') {
+            j -= 1;
+        }
+        let Tok::Ident(name) = toks.get(j.checked_sub(1)?)? else {
+            return None;
+        };
+        let mut chain = name.clone();
+        let mut k = j - 1;
+        loop {
+            // `a.b` or `a::b`
+            if k >= 2
+                && toks[k - 1] == Tok::Punct(b'.')
+                && lang != Lang::R
+                && let Tok::Ident(prev) = &toks[k - 2]
+            {
+                chain = format!("{prev}.{chain}");
+                k -= 2;
+                continue;
+            }
+            if k >= 3
+                && toks[k - 1] == Tok::Punct(b':')
+                && toks[k - 2] == Tok::Punct(b':')
+                && let Tok::Ident(prev) = &toks[k - 3]
+            {
+                chain = format!("{prev}::{chain}");
+                k -= 3;
+                continue;
+            }
+            break;
+        }
+        if defines(k.checked_sub(1).and_then(|p| toks.get(p))) {
+            return None;
+        }
+        Some((name.clone(), chain))
+    }
+
+    /// Whether the token run after a closing paren is `.method(`: the
+    /// method then says what a path just named is used for.
+    fn chained_kind(toks: &[Tok], close: usize, lang: Lang) -> Option<Kind> {
+        if toks.get(close + 1) == Some(&Tok::Punct(b'.'))
+            && let Some(Tok::Ident(m)) = toks.get(close + 2)
+            && toks.get(close + 3) == Some(&Tok::Punct(b'('))
+            && let k @ (Kind::Read | Kind::Write | Kind::OpenMode) = classify(lang, m, m)
+        {
+            return Some(k);
+        }
+        None
+    }
+
+    fn push_access(out: &mut Vec<Access>, path: String, write: bool, call: String) {
+        if out.len() < MAX_FACTS && !out.iter().any(|a| a.path == path && a.write == write) {
+            out.push(Access { path, write, call });
+        }
+    }
+
+    fn open_writes(mode: Option<&String>) -> bool {
+        mode.is_some_and(|m| m.bytes().any(|b| matches!(b, b'w' | b'a' | b'x' | b'+')))
+    }
+
+    /// Runs the call engine over the tokens of one source file.
+    fn engine(lang: Lang, toks: &[Tok], facts: &mut CodeFacts, sql_strings: &mut Vec<String>) {
+        let mut stack: Vec<Frame> = Vec::new();
+        for i in 0..toks.len() {
+            match &toks[i] {
+                Tok::Punct(b'(') => {
+                    let (chain, kind) = match call_name(toks, i, lang) {
+                        Some((name, chain)) => {
+                            let kind = classify(lang, &name, &chain);
+                            (chain, kind)
+                        }
+                        None => (String::new(), Kind::None),
+                    };
+                    stack.push(Frame {
+                        chain,
+                        kind,
+                        literal: false,
+                        strings: Vec::new(),
+                        arg_index: 0,
+                        keyword: None,
+                        pending: Vec::new(),
+                    });
+                }
+                Tok::Punct(b'[') | Tok::Punct(b'{') => stack.push(Frame {
+                    chain: String::new(),
+                    kind: Kind::None,
+                    literal: true,
+                    strings: Vec::new(),
+                    arg_index: 0,
+                    keyword: None,
+                    pending: Vec::new(),
+                }),
+                Tok::Punct(b',') => {
+                    if let Some(top) = stack.last_mut() {
+                        top.arg_index += 1;
+                        top.keyword = None;
+                    }
+                }
+                Tok::Ident(w) => {
+                    // `name=` starting an argument.
+                    let starts_arg = matches!(
+                        toks[..i].iter().rev().find(|t| **t != Tok::Newline),
+                        Some(Tok::Punct(b'(' | b','))
+                    );
+                    if starts_arg
+                        && toks.get(i + 1) == Some(&Tok::Punct(b'='))
+                        && toks.get(i + 2) != Some(&Tok::Punct(b'='))
+                        && let Some(top) = stack.last_mut()
+                        && !top.literal
+                    {
+                        top.keyword = Some(w.clone());
+                    }
+                }
+                Tok::Punct(b')') | Tok::Punct(b']') | Tok::Punct(b'}') => {
+                    let Some(f) = stack.pop() else { continue };
+                    finish(lang, toks, i, f, stack.last_mut(), facts);
+                }
+                Tok::Str(s) => {
+                    if looks_like_sql(s) {
+                        sql_strings.push(s.clone());
+                    }
+                    if let Some(top) = stack.last_mut()
+                        && !top.literal
+                        && top.strings.len() < 8
+                    {
+                        top.strings.push(ArgStr {
+                            index: top.arg_index,
+                            keyword: top.keyword.clone(),
+                            text: s.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some(f) = stack.pop() {
+            let at = toks.len().saturating_sub(1);
+            finish(lang, toks, at, f, stack.last_mut(), facts);
+        }
+    }
+
+    /// Whether the string given to an import call can name a module: a
+    /// partial name (`"pkg." + x`) or a sentence can't.
+    fn importable(lang: Lang, m: &str) -> bool {
+        if m.is_empty() || m.len() > 200 || m.contains(char::is_whitespace) {
+            return false;
+        }
+        match lang {
+            Lang::Python => {
+                !m.starts_with('.')
+                    && !m.ends_with('.')
+                    && m.split('.').all(|p| {
+                        !p.is_empty()
+                            && p.bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80)
+                    })
+            }
+            // A template literal with a substitution names no fixed module.
+            Lang::Js => !m.contains("${"),
+            _ => true,
+        }
+    }
+
+    fn finish(
+        lang: Lang,
+        toks: &[Tok],
+        close: usize,
+        f: Frame,
+        parent: Option<&mut Frame>,
+        facts: &mut CodeFacts,
+    ) {
+        let first_path = f
+            .strings
+            .iter()
+            .find(|a| {
+                path_like(&a.text)
+                    && a.keyword.as_deref().is_none_or(|k| {
+                        !NON_PATH_KEYWORDS.contains(&k.to_ascii_lowercase().as_str())
+                    })
+            })
+            .map(|a| a.text.clone());
+        match f.kind {
+            Kind::Read | Kind::Write | Kind::OpenMode => {
+                let write = match f.kind {
+                    Kind::Write => true,
+                    Kind::OpenMode => {
+                        let mode = f
+                            .strings
+                            .iter()
+                            .find(|a| a.keyword.as_deref() == Some("mode"))
+                            .or_else(|| {
+                                f.strings
+                                    .iter()
+                                    .find(|a| a.index == 1 && a.keyword.is_none())
+                            });
+                        open_writes(mode.map(|a| &a.text))
+                    }
+                    _ => false,
+                };
+                for (path, _) in f.pending.iter() {
+                    push_access(&mut facts.accesses, path.clone(), write, f.chain.clone());
+                }
+                if let Some(p) = first_path {
+                    push_access(&mut facts.accesses, p, write, f.chain.clone());
+                }
+            }
+            Kind::Neutral => {
+                let mut paths: Vec<(String, String)> = f.pending;
+                // `os.path.join("data", "raw", "x.csv")` names data/raw/x.csv.
+                let parts: Vec<&str> = f
+                    .strings
+                    .iter()
+                    .filter(|a| {
+                        a.keyword.as_deref().is_none_or(|k| {
+                            !NON_PATH_KEYWORDS.contains(&k.to_ascii_lowercase().as_str())
+                        })
+                    })
+                    .map(|a| a.text.as_str())
+                    .collect();
+                let joined = join_parts(&parts);
+                match joined {
+                    Some(j) if parts.len() >= 2 && path_like(&j) => {
+                        paths.push((j, f.chain.clone()))
+                    }
+                    _ => {
+                        if let Some(p) = first_path {
+                            paths.push((p, f.chain.clone()));
+                        }
+                    }
+                }
+                match chained_kind(toks, close, lang) {
+                    Some(k) => {
+                        let write = match k {
+                            Kind::Write => true,
+                            Kind::OpenMode => {
+                                // `Path("x").open("w")`: the mode is in the next call.
+                                let mut j = close + 4;
+                                let mut mode = None;
+                                while let Some(t) = toks.get(j) {
+                                    if let Tok::Str(m) = t {
+                                        let keyword = j >= 2 && toks[j - 1] == Tok::Punct(b'=');
+                                        if !keyword
+                                            || matches!(&toks[j - 2], Tok::Ident(k) if k == "mode")
+                                        {
+                                            mode = Some(m.clone());
+                                            break;
+                                        }
+                                    }
+                                    if matches!(t, Tok::Punct(b')')) {
+                                        break;
+                                    }
+                                    j += 1;
+                                }
+                                open_writes(mode.as_ref())
+                            }
+                            _ => false,
+                        };
+                        for (p, c) in paths {
+                            push_access(&mut facts.accesses, p, write, c);
+                        }
+                    }
+                    // Not read or written here: the enclosing call decides, and
+                    // a path nothing consumes is left to the plain file-name
+                    // references.
+                    None => {
+                        if let Some(par) = parent {
+                            par.pending.extend(paths);
+                        }
+                    }
+                }
+            }
+            Kind::Import => {
+                if let Some(m) = f.strings.first().map(|a| &a.text)
+                    && importable(lang, m)
+                    && facts.imports.len() < MAX_FACTS
+                {
+                    facts.imports.push(Import {
+                        module: m.clone(),
+                        names: Vec::new(),
+                        dots: 0,
+                        dynamic: true,
+                    });
+                }
+            }
+            Kind::None => {
+                if let Some(par) = parent {
+                    par.pending.extend(f.pending);
+                    // `(name + ".csv")` is one expression, not a call: its
+                    // strings belong to the call around it.
+                    if f.chain.is_empty() && !f.literal && !par.literal {
+                        for a in f.strings {
+                            par.strings.push(ArgStr {
+                                index: par.arg_index,
+                                keyword: par.keyword.clone(),
+                                text: a.text,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Imports ----
+
+    fn python_imports(toks: &[Tok], facts: &mut CodeFacts) {
+        let mut depth = 0i32;
+        let mut stmt_start = true;
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
+                Tok::Newline => {
+                    if depth == 0 {
+                        stmt_start = true;
+                    }
+                    i += 1;
+                    continue;
+                }
+                Tok::Punct(b'(' | b'[' | b'{') => depth += 1,
+                Tok::Punct(b')' | b']' | b'}') => depth = (depth - 1).max(0),
+                Tok::Punct(b';') | Tok::Punct(b':') if depth == 0 => {
+                    stmt_start = true;
+                    i += 1;
+                    continue;
+                }
+                Tok::Ident(w) if stmt_start && depth == 0 && w == "import" => {
+                    i = python_import_list(toks, i + 1, facts);
+                    stmt_start = false;
+                    continue;
+                }
+                Tok::Ident(w) if stmt_start && depth == 0 && w == "from" => {
+                    i = python_from_import(toks, i + 1, facts);
+                    stmt_start = false;
+                    continue;
+                }
+                _ => {}
+            }
+            stmt_start = false;
+            i += 1;
+        }
+    }
+
+    fn dotted(toks: &[Tok], mut i: usize) -> (String, usize) {
+        let mut name = String::new();
+        loop {
+            match toks.get(i) {
+                Some(Tok::Ident(p)) if p != "import" => {
+                    name.push_str(p);
+                    i += 1;
+                }
+                _ => break,
+            }
+            if toks.get(i) == Some(&Tok::Punct(b'.'))
+                && matches!(toks.get(i + 1), Some(Tok::Ident(_)))
+            {
+                name.push('.');
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        (name, i)
+    }
+
+    /// `import a.b as c, d.e`
+    fn python_import_list(toks: &[Tok], mut i: usize, facts: &mut CodeFacts) -> usize {
+        loop {
+            let (name, next) = dotted(toks, i);
+            i = next;
+            if !name.is_empty() && facts.imports.len() < MAX_FACTS {
+                facts.imports.push(Import {
+                    module: name,
+                    names: Vec::new(),
+                    dots: 0,
+                    dynamic: false,
+                });
+            }
+            if matches!(toks.get(i), Some(Tok::Ident(w)) if w == "as") {
+                i += 2;
+            }
+            if toks.get(i) == Some(&Tok::Punct(b',')) {
+                i += 1;
+                continue;
+            }
+            return i;
+        }
+    }
+
+    /// `from ..a.b import (c, d as e)`
+    fn python_from_import(toks: &[Tok], mut i: usize, facts: &mut CodeFacts) -> usize {
+        let mut dots = 0;
+        while toks.get(i) == Some(&Tok::Punct(b'.')) {
+            dots += 1;
+            i += 1;
+        }
+        let (module, next) = dotted(toks, i);
+        i = next;
+        if !matches!(toks.get(i), Some(Tok::Ident(w)) if w == "import") {
+            return i;
+        }
+        i += 1;
+        let paren = toks.get(i) == Some(&Tok::Punct(b'('));
+        if paren {
+            i += 1;
+        }
+        let mut names = Vec::new();
+        let skip_nl = |i: &mut usize| {
+            if paren {
+                while matches!(toks.get(*i), Some(Tok::Newline)) {
+                    *i += 1;
+                }
+            }
+        };
+        loop {
+            skip_nl(&mut i);
+            match toks.get(i) {
+                Some(Tok::Ident(n)) => {
+                    names.push(n.clone());
+                    i += 1;
+                    skip_nl(&mut i);
+                    if matches!(toks.get(i), Some(Tok::Ident(w)) if w == "as") {
+                        i += 1;
+                        skip_nl(&mut i);
+                        i += 1;
+                    }
+                }
+                Some(Tok::Punct(b'*')) => {
+                    names.push("*".to_string());
+                    i += 1;
+                }
+                _ => break,
+            }
+            skip_nl(&mut i);
+            if toks.get(i) == Some(&Tok::Punct(b',')) {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        skip_nl(&mut i);
+        if paren && toks.get(i) == Some(&Tok::Punct(b')')) {
+            i += 1;
+        }
+        if (!module.is_empty() || dots > 0) && facts.imports.len() < MAX_FACTS {
+            facts.imports.push(Import {
+                module,
+                names,
+                dots,
+                dynamic: false,
+            });
+        }
+        i
+    }
+
+    /// ES imports and re-exports: `import x from "m"`, `import "m"`,
+    /// `export * from "m"`.
+    fn js_imports(toks: &[Tok], facts: &mut CodeFacts) {
+        let mut i = 0;
+        while i < toks.len() {
+            let is_import = matches!(&toks[i], Tok::Ident(w) if w == "import")
+                && !matches!(toks.get(i + 1), Some(Tok::Punct(b'(' | b'.')));
+            let is_export = matches!(&toks[i], Tok::Ident(w) if w == "export");
+            if is_import || is_export {
+                let mut j = i + 1;
+                let mut seen_from = is_import && matches!(toks.get(j), Some(Tok::Str(_)));
+                while j < toks.len() && j < i + 400 {
+                    match &toks[j] {
+                        Tok::Punct(b';') => break,
+                        Tok::Ident(w)
+                            if j > i + 1
+                                && matches!(
+                                    w.as_str(),
+                                    "import"
+                                        | "export"
+                                        | "function"
+                                        | "class"
+                                        | "const"
+                                        | "let"
+                                        | "var"
+                                        | "interface"
+                                        | "type"
+                                        | "enum"
+                                )
+                                && toks[j - 1] == Tok::Newline =>
+                        {
+                            break;
+                        }
+                        Tok::Ident(w) if w == "from" => seen_from = true,
+                        Tok::Str(m) if seen_from => {
+                            if facts.imports.len() < MAX_FACTS {
+                                facts.imports.push(Import {
+                                    module: m.clone(),
+                                    names: Vec::new(),
+                                    dots: 0,
+                                    dynamic: false,
+                                });
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// `mod name;` in Rust, `import a.b.C;` in Java.
+    fn item_imports(lang: Lang, toks: &[Tok], facts: &mut CodeFacts) {
+        let mut i = 0;
+        while i + 1 < toks.len() {
+            match (lang, &toks[i]) {
+                (Lang::Rust, Tok::Ident(w)) if w == "mod" => {
+                    if let (Some(Tok::Ident(name)), Some(Tok::Punct(b';'))) =
+                        (toks.get(i + 1), toks.get(i + 2))
+                        && facts.imports.len() < MAX_FACTS
+                    {
+                        facts.imports.push(Import {
+                            module: name.clone(),
+                            names: Vec::new(),
+                            dots: 0,
+                            dynamic: false,
+                        });
+                    }
+                }
+                (Lang::Java, Tok::Ident(w)) if w == "import" => {
+                    let mut j = i + 1;
+                    if matches!(toks.get(j), Some(Tok::Ident(s)) if s == "static") {
+                        j += 1;
+                    }
+                    let (name, next) = dotted(toks, j);
+                    let wildcard = toks.get(next) == Some(&Tok::Punct(b'.'));
+                    if !name.is_empty() && !wildcard && facts.imports.len() < MAX_FACTS {
+                        facts.imports.push(Import {
+                            module: name,
+                            names: Vec::new(),
+                            dots: 0,
+                            dynamic: false,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    /// `//go:embed a.csv b/*.json` lines.
+    fn go_embeds(src: &str, facts: &mut CodeFacts) {
+        for line in src.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("//go:embed ") {
+                for p in rest.split_whitespace() {
+                    if path_like(p) {
+                        push_access(
+                            &mut facts.accesses,
+                            p.to_string(),
+                            false,
+                            "go:embed".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a source file says. `ext_lang` is from `language_of`.
+    pub(crate) fn analyze(lang: Lang, src: &str) -> CodeFacts {
+        let mut facts = CodeFacts {
+            language: lang.name().to_string(),
+            ..CodeFacts::default()
+        };
+        if src.len() > MAX_FILE_BYTES {
+            return facts;
+        }
+        if lang == Lang::Sql {
+            facts.sql = sql_refs(src);
+            return facts;
+        }
+        let toks = lex(lang, src);
+        let mut sql_strings = Vec::new();
+        engine(lang, &toks, &mut facts, &mut sql_strings);
+        match lang {
+            Lang::Python => python_imports(&toks, &mut facts),
+            Lang::Js => js_imports(&toks, &mut facts),
+            Lang::Rust | Lang::Java => item_imports(lang, &toks, &mut facts),
+            Lang::Go => go_embeds(src, &mut facts),
+            Lang::R | Lang::Sql => {}
+        }
+        for s in sql_strings {
+            for r in sql_refs(&s) {
+                if facts.sql.len() < MAX_FACTS && !facts.sql.contains(&r) {
+                    facts.sql.push(r);
+                }
+            }
+        }
+        facts
+    }
+
+    // ---- SQL ----
+
+    /// Whether a string literal is a SQL statement rather than prose that
+    /// starts with a verb.
+    pub(crate) fn looks_like_sql(s: &str) -> bool {
+        let t = s.trim_start();
+        if t.len() < 12 {
+            return false;
+        }
+        let lower: String = t
+            .chars()
+            .take(4096)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let first = lower.split_whitespace().next().unwrap_or("");
+        let has = |w: &str| lower.contains(w);
+        match first {
+            "select" => has(" from "),
+            "with" => has(" as ") && has("select"),
+            "insert" => has(" into ") || has(" overwrite "),
+            "update" => has(" set "),
+            "delete" => has(" from "),
+            "create" => has(" table ") || has(" view "),
+            "merge" => has(" using "),
+            "drop" | "alter" | "truncate" => has(" table ") || has(" view "),
+            _ => false,
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum SqlTok {
+        Word(String),
+        Quoted(String),
+        Punct(u8),
+        Other,
+    }
+
+    /// dbt's `{{ ref('a') }}` and `{{ source('s', 't') }}`, taken out
+    /// (a placeholder word is left so the statement still reads), and
+    /// every other Jinja block dropped.
+    fn dbt_pass(src: &str, refs: &mut Vec<SqlRef>) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(open) = rest.find("{{").or_else(|| rest.find("{%")) {
+            out.push_str(&rest[..open]);
+            let is_expr = rest[open..].starts_with("{{");
+            let close_pat = if is_expr { "}}" } else { "%}" };
+            let Some(end) = rest[open + 2..].find(close_pat) else {
+                rest = &rest[open + 2..];
+                continue;
+            };
+            let body = &rest[open + 2..open + 2 + end];
+            if is_expr {
+                let literals: Vec<&str> = body
+                    .split(['\'', '"'])
+                    .enumerate()
+                    .filter(|(i, _)| i % 2 == 1)
+                    .map(|(_, s)| s)
+                    .collect();
+                let call = body.trim_start().split('(').next().unwrap_or("").trim();
+                match (call, literals.as_slice()) {
+                    ("ref", [name]) | ("ref", [_, name]) => refs.push(SqlRef {
+                        table: (*name).to_string(),
+                        write: false,
+                        origin: "dbt ref".to_string(),
+                    }),
+                    ("source", [schema, table]) => refs.push(SqlRef {
+                        table: format!("{schema}.{table}"),
+                        write: false,
+                        origin: "dbt source".to_string(),
+                    }),
+                    _ => {}
+                }
+                out.push_str(" __jinja__ ");
+            } else {
+                out.push(' ');
+            }
+            rest = &rest[open + 2 + end + 2..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn sql_lex(src: &str) -> Vec<SqlTok> {
+        let b = src.as_bytes();
+        let n = b.len();
+        let mut i = 0;
+        let mut out = Vec::new();
+        while i < n {
+            let c = b[i];
+            match c {
+                b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    while i < n && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i < n && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                        i += 1;
+                    }
+                    i = (i + 2).min(n);
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < n {
+                        if b[i] == b'\'' {
+                            if b.get(i + 1) == Some(&b'\'') {
+                                i += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i = (i + 1).min(n);
+                    out.push(SqlTok::Other);
+                }
+                b'"' | b'`' | b'[' => {
+                    let close = if c == b'[' { b']' } else { c };
+                    let start = i + 1;
+                    i += 1;
+                    while i < n && b[i] != close {
+                        i += 1;
+                    }
+                    let name = String::from_utf8_lossy(&b[start..i.min(n)]).into_owned();
+                    i = (i + 1).min(n);
+                    if c == b'['
+                        && !name
+                            .chars()
+                            .all(|x| x.is_alphanumeric() || x == '_' || x == ' ')
+                    {
+                        out.push(SqlTok::Other);
+                    } else {
+                        out.push(SqlTok::Quoted(name));
+                    }
+                }
+                c if c.is_ascii_alphabetic()
+                    || c == b'_'
+                    || c >= 0x80
+                    || c == b'#'
+                    || c == b'@' =>
+                {
+                    let start = i;
+                    i += 1;
+                    while i < n
+                        && (b[i].is_ascii_alphanumeric()
+                            || b[i] == b'_'
+                            || b[i] == b'$'
+                            || b[i] >= 0x80)
+                    {
+                        i += 1;
+                    }
+                    let w = String::from_utf8_lossy(&b[start..i]).into_owned();
+                    if w.starts_with('#') || w.starts_with('@') {
+                        out.push(SqlTok::Other);
+                    } else {
+                        out.push(SqlTok::Word(w));
+                    }
+                }
+                c if c.is_ascii_digit() => {
+                    while i < n && (b[i].is_ascii_alphanumeric() || b[i] == b'.') {
+                        i += 1;
+                    }
+                    out.push(SqlTok::Other);
+                }
+                c => {
+                    out.push(SqlTok::Punct(c));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn word_is(t: Option<&SqlTok>, w: &str) -> bool {
+        matches!(t, Some(SqlTok::Word(x)) if x.eq_ignore_ascii_case(w))
+    }
+
+    /// Words that end a table list or can't be an alias.
+    const SQL_STOP: &[&str] = &[
+        "where",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "offset",
+        "union",
+        "intersect",
+        "except",
+        "on",
+        "using",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "natural",
+        "outer",
+        "lateral",
+        "set",
+        "values",
+        "select",
+        "from",
+        "into",
+        "returning",
+        "window",
+        "qualify",
+        "fetch",
+        "for",
+        "when",
+        "then",
+        "else",
+        "end",
+        "and",
+        "or",
+        "not",
+        "tablesample",
+        "pivot",
+        "unpivot",
+        "partition",
+        "straight_join",
+        "semi",
+        "anti",
+        "as",
+        "with",
+        "insert",
+        "update",
+        "delete",
+        "merge",
+        "create",
+        "drop",
+        "alter",
+        "truncate",
+        "table",
+        "view",
+        "if",
+        "exists",
+        "distinct",
+        "all",
+        "by",
+        "asc",
+        "desc",
+        "is",
+        "in",
+        "like",
+        "between",
+        "case",
+        "null",
+        "true",
+        "false",
+        "only",
+    ];
+
+    fn sql_stop(w: &str) -> bool {
+        SQL_STOP.iter().any(|s| s.eq_ignore_ascii_case(w))
+    }
+
+    /// A table name starting at `i`: `a`, `a.b`, `"a"."b"`, up to three
+    /// parts. Returns the dotted name and the index after it.
+    fn sql_table_name(t: &[SqlTok], mut i: usize) -> Option<(String, usize)> {
+        let mut parts: Vec<String> = Vec::new();
+        loop {
+            match t.get(i) {
+                Some(SqlTok::Word(w)) if parts.is_empty() && sql_stop(w) => return None,
+                Some(SqlTok::Word(w)) => parts.push(w.clone()),
+                Some(SqlTok::Quoted(w)) => parts.push(w.clone()),
+                _ => return None,
+            }
+            i += 1;
+            if t.get(i) == Some(&SqlTok::Punct(b'.'))
+                && matches!(t.get(i + 1), Some(SqlTok::Word(_) | SqlTok::Quoted(_)))
+                && parts.len() < 3
+            {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if parts.is_empty() || parts.iter().any(String::is_empty) {
+            return None;
+        }
+        Some((parts.join("."), i))
+    }
+
+    fn add_sql_ref(refs: &mut Vec<SqlRef>, ctes: &[String], name: String, write: bool) {
+        let lower = name.to_ascii_lowercase();
+        if name == "__jinja__" || ctes.contains(&lower) || refs.len() >= MAX_FACTS {
+            return;
+        }
+        let r = SqlRef {
+            table: name,
+            write,
+            origin: "sql".to_string(),
+        };
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
+    }
+
+    /// The tables a SQL script reads and writes, each once.
+    pub(crate) fn sql_refs(src: &str) -> Vec<SqlRef> {
+        let mut refs: Vec<SqlRef> = Vec::new();
+        let cleaned = if src.contains("{{") || src.contains("{%") {
+            dbt_pass(src, &mut refs)
+        } else {
+            src.to_string()
+        };
+        let t = sql_lex(&cleaned);
+        let mut ctes: Vec<String> = Vec::new();
+        // One scope per open paren (the first is the top level): the
+        // function name before it, for `EXTRACT(x FROM y)`, and whether a
+        // FROM clause is open in it, so a comma starts the next table.
+        let mut scopes: Vec<(Option<String>, bool)> = vec![(None, false)];
+        let mut i = 0;
+        let mut delete_pending = false;
+        while i < t.len() {
+            // GRANT and REVOKE name tables but neither read nor write them.
+            if (i == 0 || t[i - 1] == SqlTok::Punct(b';'))
+                && (word_is(t.get(i), "grant") || word_is(t.get(i), "revoke"))
+            {
+                while i < t.len() && t[i] != SqlTok::Punct(b';') {
+                    i += 1;
+                }
+                continue;
+            }
+            match &t[i] {
+                SqlTok::Punct(b';') => {
+                    ctes.clear();
+                    scopes.truncate(1);
+                    scopes[0].1 = false;
+                    delete_pending = false;
+                    i += 1;
+                    continue;
+                }
+                SqlTok::Punct(b'(') => {
+                    let prev = i.checked_sub(1).and_then(|p| t.get(p));
+                    let func = match prev {
+                        Some(SqlTok::Word(w)) => Some(w.to_ascii_lowercase()),
+                        _ => None,
+                    };
+                    // `FROM (a JOIN b ON ...)`: a parenthesized table list.
+                    let in_from = scopes.last().is_some_and(|s| s.1);
+                    let table_list = (word_is(prev, "from")
+                        || word_is(prev, "join")
+                        || (in_from && matches!(prev, Some(SqlTok::Punct(b',' | b'(')))))
+                        && sql_table_name(&t, i + 1)
+                            .is_some_and(|(_, next)| t.get(next) != Some(&SqlTok::Punct(b'(')));
+                    if table_list && let Some((name, _)) = sql_table_name(&t, i + 1) {
+                        add_sql_ref(&mut refs, &ctes, name, false);
+                    }
+                    scopes.push((func, table_list));
+                    i += 1;
+                    continue;
+                }
+                SqlTok::Punct(b')') => {
+                    if scopes.len() > 1 {
+                        scopes.pop();
+                    }
+                    i += 1;
+                    continue;
+                }
+                SqlTok::Punct(b',') => {
+                    if scopes.last().is_some_and(|s| s.1)
+                        && let Some((name, next)) = sql_table_name(&t, i + 1)
+                        && t.get(next) != Some(&SqlTok::Punct(b'('))
+                    {
+                        add_sql_ref(&mut refs, &ctes, name, false);
+                    }
+                    i += 1;
+                    continue;
+                }
+                SqlTok::Word(w) => {
+                    let lw = w.to_ascii_lowercase();
+                    if matches!(
+                        lw.as_str(),
+                        "where"
+                            | "group"
+                            | "order"
+                            | "having"
+                            | "limit"
+                            | "offset"
+                            | "union"
+                            | "intersect"
+                            | "except"
+                            | "window"
+                            | "qualify"
+                            | "fetch"
+                            | "for"
+                            | "returning"
+                            | "set"
+                            | "values"
+                            | "select"
+                            | "with"
+                    ) && let Some(s) = scopes.last_mut()
+                    {
+                        s.1 = false;
+                    }
+                    match lw.as_str() {
+                        "with" => {
+                            // WITH [RECURSIVE] name [(cols)] AS [MATERIALIZED] ( ... ) [, ...]
+                            let mut j = i + 1;
+                            if word_is(t.get(j), "recursive") {
+                                j += 1;
+                            }
+                            while let Some(SqlTok::Word(name) | SqlTok::Quoted(name)) = t.get(j) {
+                                let name = name.to_ascii_lowercase();
+                                let mut k = j + 1;
+                                if t.get(k) == Some(&SqlTok::Punct(b'(')) {
+                                    k = skip_balanced(&t, k);
+                                }
+                                if !word_is(t.get(k), "as") {
+                                    break;
+                                }
+                                k += 1;
+                                while word_is(t.get(k), "not") || word_is(t.get(k), "materialized")
+                                {
+                                    k += 1;
+                                }
+                                if t.get(k) != Some(&SqlTok::Punct(b'(')) {
+                                    break;
+                                }
+                                ctes.push(name);
+                                k = skip_balanced(&t, k);
+                                if t.get(k) == Some(&SqlTok::Punct(b',')) {
+                                    j = k + 1;
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        "from" | "join" => {
+                            let in_func =
+                                scopes.last().and_then(|f| f.0.as_deref()).is_some_and(|f| {
+                                    matches!(f, "extract" | "trim" | "substring" | "overlay")
+                                });
+                            let write = lw == "from" && delete_pending;
+                            if lw == "from" {
+                                delete_pending = false;
+                            }
+                            if !in_func {
+                                if let Some(s) = scopes.last_mut() {
+                                    s.1 = true;
+                                }
+                                // A function (`unnest(...)`) is not a table.
+                                if let Some((name, next)) = sql_table_name(&t, i + 1)
+                                    && t.get(next) != Some(&SqlTok::Punct(b'('))
+                                {
+                                    add_sql_ref(&mut refs, &ctes, name, write);
+                                }
+                            }
+                        }
+                        "into" => {
+                            let mut j = i + 1;
+                            if word_is(t.get(j), "table") {
+                                j += 1;
+                            }
+                            if let Some((name, _)) = sql_table_name(&t, j) {
+                                add_sql_ref(&mut refs, &ctes, name, true);
+                            }
+                        }
+                        "update" => {
+                            let prev = i.checked_sub(1).and_then(|p| t.get(p));
+                            let after_clause =
+                                word_is(prev, "for") || word_is(prev, "do") || word_is(prev, "on");
+                            if !after_clause {
+                                let mut j = i + 1;
+                                if word_is(t.get(j), "only") {
+                                    j += 1;
+                                }
+                                if let Some((name, _)) = sql_table_name(&t, j) {
+                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                }
+                            }
+                        }
+                        "delete" => delete_pending = true,
+                        "table" => {
+                            let prev = i.checked_sub(1).and_then(|p| t.get(p));
+                            let ddl = matches!(prev, Some(SqlTok::Word(p)) if matches!(p.to_ascii_lowercase().as_str(), "create" | "alter" | "drop" | "truncate" | "temp" | "temporary" | "external" | "unlogged" | "global" | "local" | "transient" | "replace" | "overwrite" | "into" | "volatile" | "exists" | "if" | "iceberg" | "virtual"));
+                            if ddl && !matches!(t.get(i + 1), Some(SqlTok::Punct(b'('))) {
+                                let mut j = i + 1;
+                                if word_is(t.get(j), "if") {
+                                    j += 1;
+                                    if word_is(t.get(j), "not") {
+                                        j += 1;
+                                    }
+                                    if word_is(t.get(j), "exists") {
+                                        j += 1;
+                                    }
+                                }
+                                if word_is(t.get(j), "only") {
+                                    j += 1;
+                                }
+                                // `INSERT INTO TABLE t` was already taken at INTO.
+                                if !word_is(prev, "into")
+                                    && let Some((name, _)) = sql_table_name(&t, j)
+                                {
+                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                }
+                            }
+                        }
+                        "view" => {
+                            let mut back = 0;
+                            let mut ddl = false;
+                            while back < 5 && back < i {
+                                back += 1;
+                                if let SqlTok::Word(p) = &t[i - back] {
+                                    let p = p.to_ascii_lowercase();
+                                    if matches!(p.as_str(), "create" | "alter" | "drop") {
+                                        ddl = true;
+                                        break;
+                                    }
+                                    if !matches!(
+                                        p.as_str(),
+                                        "or" | "replace"
+                                            | "materialized"
+                                            | "temp"
+                                            | "temporary"
+                                            | "recursive"
+                                            | "secure"
+                                            | "if"
+                                            | "not"
+                                            | "exists"
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            }
+                            if ddl {
+                                let mut j = i + 1;
+                                if word_is(t.get(j), "if") {
+                                    j += 1;
+                                    if word_is(t.get(j), "not") {
+                                        j += 1;
+                                    }
+                                    if word_is(t.get(j), "exists") {
+                                        j += 1;
+                                    }
+                                }
+                                if let Some((name, _)) = sql_table_name(&t, j) {
+                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                }
+                            }
+                        }
+                        "using" => {
+                            // MERGE ... USING t, DELETE ... USING t; JOIN ... USING (col) has a paren.
+                            if !matches!(t.get(i + 1), Some(SqlTok::Punct(b'(')))
+                                && let Some((name, next)) = sql_table_name(&t, i + 1)
+                                && t.get(next) != Some(&SqlTok::Punct(b'('))
+                            {
+                                add_sql_ref(&mut refs, &ctes, name, false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        refs
+    }
+
+    fn skip_balanced(t: &[SqlTok], open: usize) -> usize {
+        let mut depth = 0i32;
+        let mut i = open;
+        while i < t.len() {
+            match t[i] {
+                SqlTok::Punct(b'(') => depth += 1,
+                SqlTok::Punct(b')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        t.len()
+    }
+}
+
+#[cfg(test)]
+mod code_facts_tests {
+    use super::code_facts::*;
+    use crate::json_support;
+
+    fn facts(lang: Lang, src: &str) -> CodeFacts {
+        analyze(lang, src)
+    }
+
+    fn reads(f: &CodeFacts) -> Vec<&str> {
+        f.accesses
+            .iter()
+            .filter(|a| !a.write)
+            .map(|a| a.path.as_str())
+            .collect()
+    }
+
+    fn writes(f: &CodeFacts) -> Vec<&str> {
+        f.accesses
+            .iter()
+            .filter(|a| a.write)
+            .map(|a| a.path.as_str())
+            .collect()
+    }
+
+    /// Checks `sql_refs` against a vectors file made by
+    /// `tools/gen_sql_vectors.py` (sqlglot's tables for each statement).
+    fn check_sql_vectors(text: &str, limit: usize) -> (usize, Vec<String>) {
+        let mut checked = 0;
+        let mut bad = Vec::new();
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let sql = v.get("sql").and_then(|x| x.as_str()).unwrap();
+            let list = |k: &str| -> Vec<String> {
+                let mut l: Vec<String> = v
+                    .get(k)
+                    .and_then(|x| x.as_array())
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_str().unwrap().to_string())
+                    .collect();
+                l.sort();
+                l
+            };
+            let (want_r, want_w) = (list("reads"), list("writes"));
+            let refs = sql_refs(sql);
+            let pick = |write: bool| -> Vec<String> {
+                let mut l: Vec<String> = refs
+                    .iter()
+                    .filter(|r| r.write == write)
+                    .map(|r| r.table.to_ascii_lowercase())
+                    .collect();
+                l.sort();
+                l.dedup();
+                l
+            };
+            checked += 1;
+            if (pick(false) != want_r || pick(true) != want_w) && bad.len() < limit {
+                bad.push(format!(
+                    "{sql}\n   want reads {want_r:?} writes {want_w:?}\n   got  reads {:?} writes {:?}",
+                    pick(false),
+                    pick(true)
+                ));
+            }
+        }
+        (checked, bad)
+    }
+
+    /// The committed statements (generated, sqlglot as the oracle).
+    #[test]
+    fn sql_tables_match_sqlglot_on_generated_statements() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sql_table_vectors.jsonl"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let (checked, bad) = check_sql_vectors(&text, 8);
+        assert!(checked >= 1000, "only {checked} vectors");
+        assert!(
+            bad.is_empty(),
+            "{} differ, first:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// Any vectors file: SNIFF_SQL_VECTORS=<jsonl>.
+    #[test]
+    #[ignore]
+    fn sql_tables_match_sqlglot_on_a_corpus() {
+        let Ok(path) = std::env::var("SNIFF_SQL_VECTORS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let (checked, bad) = check_sql_vectors(&text, 25);
+        eprintln!("checked {checked}");
+        assert!(bad.is_empty(), "differ, first:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn javascript_reads_writes_and_imports() {
+        let f = facts(
+            Lang::Js,
+            r#"
+import fs from "fs";
+import { a, b } from './lib/util.js';
+import "./side-effect";
+export * from "./reexport";
+export { x } from './x';
+const csv = require('./data/cfg.json');            // line comment require("./ghost.js")
+/* block comment: fs.readFileSync("ghost.csv") */
+const re = /fs\.readFile\("ghost2.csv"\)/g;
+const rows = fs.readFileSync(path.join(__dirname, "data", "sales.csv"), "utf8");
+fs.writeFile("out/report.json", JSON.stringify({ file: "inner.txt" }), cb);
+const s = fs.createWriteStream(`logs/run.log`);
+d3.csv("assets/points.csv").then(go);
+const lazy = await import("./lazy.js");
+fetch("https://example.com/remote.json");
+const o = { read: "notes.txt" };
+"#,
+        );
+        let mut mods: Vec<_> = f
+            .imports
+            .iter()
+            .map(|i| (i.module.as_str(), i.dynamic))
+            .collect();
+        mods.sort();
+        assert_eq!(
+            mods,
+            vec![
+                ("./data/cfg.json", true),
+                ("./lazy.js", true),
+                ("./lib/util.js", false),
+                ("./reexport", false),
+                ("./side-effect", false),
+                ("./x", false),
+                ("fs", false),
+            ]
+        );
+        assert_eq!(reads(&f), vec!["data/sales.csv", "assets/points.csv"]);
+        assert_eq!(writes(&f), vec!["out/report.json", "logs/run.log"]);
+    }
+
+    #[test]
+    fn java_reads_writes_and_imports() {
+        let f = facts(
+            Lang::Java,
+            r#"
+import java.io.File;
+import static org.junit.Assert.assertEquals;
+import java.util.*;
+class A {
+  void m() throws Exception {
+    // new FileReader("ghost.csv");
+    List<String> lines = Files.readAllLines(Paths.get("data/in.csv"));
+    BufferedReader r = new BufferedReader(new FileReader(new File(dir, "people.tsv")));
+    PrintWriter w = new PrintWriter("out/summary.txt");
+    String t = """
+        not a path.csv
+        """;
+    File unused = new File("never_used.dat");
+  }
+}
+"#,
+        );
+        let mods: Vec<_> = f.imports.iter().map(|i| i.module.as_str()).collect();
+        assert_eq!(mods, vec!["java.io.File", "org.junit.Assert.assertEquals"]);
+        assert_eq!(reads(&f), vec!["data/in.csv", "people.tsv"]);
+        assert_eq!(writes(&f), vec!["out/summary.txt"]);
+    }
+
+    #[test]
+    fn go_reads_writes_and_embeds() {
+        let f = facts(
+            Lang::Go,
+            "package main\n//go:embed schema.sql seeds/*.json\nvar x string\nfunc main() {\n\tb, _ := os.ReadFile(filepath.Join(\"data\", \"in.csv\"))\n\tf, _ := os.Create(`out.txt`)\n\t// os.Open(\"ghost.txt\")\n\tg, _ := os.Open(\"cfg/app.yaml\")\n}\n",
+        );
+        let mut r = reads(&f);
+        r.sort();
+        assert_eq!(
+            r,
+            vec!["cfg/app.yaml", "data/in.csv", "schema.sql", "seeds/*.json"]
+        );
+        assert_eq!(writes(&f), vec!["out.txt"]);
+    }
+
+    #[test]
+    fn rust_reads_writes_and_modules() {
+        let f = facts(
+            Lang::Rust,
+            r##"
+mod util;
+pub mod model;
+mod inline { fn f() {} }
+const SQL: &str = include_str!("../queries/top.sql");
+fn main() {
+    // File::open("ghost.csv");
+    let a = std::fs::read_to_string(Path::new("data").join("in.csv"));
+    std::fs::write("out/result.json", b"{}").unwrap();
+    let raw = r#"File::open("also-ghost.csv")"#;
+    let r = csv::Reader::from_path("people.csv");
+    let w = csv::Writer::from_path("copy.csv");
+}
+"##,
+        );
+        let mods: Vec<_> = f.imports.iter().map(|i| i.module.as_str()).collect();
+        assert_eq!(mods, vec!["util", "model"]);
+        assert_eq!(
+            reads(&f),
+            vec!["../queries/top.sql", "in.csv", "people.csv"]
+        );
+        assert_eq!(writes(&f), vec!["out/result.json", "copy.csv"]);
+    }
+
+    #[test]
+    fn r_reads_writes_and_sources() {
+        let f = facts(
+            Lang::R,
+            r#"
+source("R/helpers.R")   # source("ghost.R")
+df <- read.csv(file = "data/raw.csv", sep = ";")
+x <- readRDS(file.path("data", "model.rds"))
+write.csv(df, "out/clean.csv", row.names = FALSE)
+ggsave("plots/fig.png", p)
+y <- read_excel(path = 'book.xlsx', sheet = "Sheet.1")
+"#,
+        );
+        assert_eq!(
+            f.imports
+                .iter()
+                .map(|i| i.module.as_str())
+                .collect::<Vec<_>>(),
+            vec!["R/helpers.R"]
+        );
+        assert_eq!(
+            reads(&f),
+            vec!["data/raw.csv", "data/model.rds", "book.xlsx"]
+        );
+        assert_eq!(writes(&f), vec!["out/clean.csv", "plots/fig.png"]);
+    }
+
+    /// A path with every `{...}` placeholder of an f-string made `{}`.
+    fn norm_path(p: &str) -> String {
+        let mut out = String::new();
+        let mut depth = 0;
+        for c in p.chars() {
+            match c {
+                '{' => {
+                    if depth == 0 {
+                        out.push_str("{}");
+                    }
+                    depth += 1;
+                }
+                '}' if depth > 0 => depth -= 1,
+                _ if depth > 0 => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// (missing, extra, number expected).
+    type AccessDiff = (Vec<(String, bool)>, Vec<(String, bool)>, usize);
+
+    /// What differs between the accesses found in `src` and the expected
+    /// list (`[[path, write], ...]` from `ast`): (missing, extra).
+    fn access_diff(src: &str, want: &json_support::Value) -> AccessDiff {
+        let f = analyze(Lang::Python, src);
+        let mut got: Vec<(String, bool)> = f
+            .accesses
+            .iter()
+            .map(|a| (norm_path(&a.path), a.write))
+            .collect();
+        let mut want: Vec<(String, bool)> = want
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                let a = a.as_array().unwrap();
+                (norm_path(a[0].as_str().unwrap()), a[1].as_bool().unwrap())
+            })
+            .collect();
+        got.sort();
+        want.sort();
+        got.dedup();
+        want.dedup();
+        let missing = want.iter().filter(|w| !got.contains(w)).cloned().collect();
+        let extra = got.iter().filter(|g| !want.contains(g)).cloned().collect();
+        (missing, extra, want.len())
+    }
+
+    /// Generated programs (tools/gen_code_access_vectors.py --synthetic),
+    /// with `ast` as the oracle for which files they read and write.
+    #[test]
+    fn python_accesses_match_ast_on_generated_programs() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/code_access_vectors.jsonl"
+        );
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut checked, mut accesses) = (0, 0);
+        let mut bad = Vec::new();
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let src = v.get("src").and_then(|x| x.as_str()).unwrap();
+            let (missing, extra, n) = access_diff(src, v.get("accesses").unwrap());
+            checked += 1;
+            accesses += n;
+            if !missing.is_empty() || !extra.is_empty() {
+                bad.push(format!("{src}\n  missing {missing:?}\n  extra {extra:?}"));
+            }
+        }
+        assert!(
+            checked >= 500 && accesses >= 1000,
+            "{checked} programs, {accesses} accesses"
+        );
+        assert!(
+            bad.is_empty(),
+            "{} differ, first:\n{}",
+            bad.len(),
+            bad.iter().take(5).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    /// Reads a vectors file made by `tools/gen_code_access_vectors.py` over
+    /// real files and checks the reads and writes found in each. Run with
+    /// SNIFF_CODE_ACCESS_VECTORS=<jsonl>.
+    #[test]
+    #[ignore]
+    fn python_accesses_match_ast_on_a_corpus() {
+        let Ok(path) = std::env::var("SNIFF_CODE_ACCESS_VECTORS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut checked, mut missing_total, mut extra_total) = (0, 0, 0);
+        let mut bad = Vec::new();
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let file = v.get("path").and_then(|p| p.as_str()).unwrap().to_string();
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let (missing, extra, n) = access_diff(&src, v.get("accesses").unwrap());
+            if n >= 400 {
+                continue;
+            }
+            checked += 1;
+            missing_total += missing.len();
+            extra_total += extra.len();
+            if (!missing.is_empty() || !extra.is_empty()) && bad.len() < 12 {
+                bad.push(format!("{file}\n  missing {missing:?}\n  extra {extra:?}"));
+            }
+        }
+        eprintln!("checked {checked} files, missing {missing_total}, extra {extra_total}");
+        for b in &bad {
+            eprintln!("{b}");
+        }
+        assert!(missing_total + extra_total == 0);
+    }
+
+    /// Imports and accesses in JavaScript, Rust, Java and Go files against
+    /// tree-sitter (tools/gen_code_ts_vectors.py). Run with
+    /// SNIFF_CODE_TS_VECTORS=<jsonl>.
+    #[test]
+    #[ignore]
+    fn tree_sitter_vectors_match_on_a_corpus() {
+        let Ok(path) = std::env::var("SNIFF_CODE_TS_VECTORS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut checked, mut bad_files) = (0usize, 0usize);
+        let (mut miss_i, mut extra_i, mut miss_a, mut extra_a) = (0, 0, 0, 0);
+        let mut shown = Vec::new();
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let file = v.get("path").and_then(|p| p.as_str()).unwrap().to_string();
+            let ext = file.rsplit('.').next().unwrap_or("");
+            let Some(lang) = language_of(ext) else {
+                continue;
+            };
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let f = analyze(lang, &src);
+            let mut got_i: Vec<(String, bool)> = f
+                .imports
+                .iter()
+                .map(|i| (i.module.clone(), i.dynamic))
+                .collect();
+            let mut want_i: Vec<(String, bool)> = v
+                .get("imports")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    let a = i.as_array().unwrap();
+                    (a[0].as_str().unwrap().to_string(), a[1].as_bool().unwrap())
+                })
+                .collect();
+            let mut got_a: Vec<(String, bool)> = f
+                .accesses
+                .iter()
+                .map(|a| (norm_path(&a.path), a.write))
+                .collect();
+            let mut want_a: Vec<(String, bool)> = v
+                .get("accesses")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    let a = a.as_array().unwrap();
+                    (norm_path(a[0].as_str().unwrap()), a[1].as_bool().unwrap())
+                })
+                .collect();
+            if want_i.len() >= 450 || want_a.len() >= 450 {
+                continue;
+            }
+            for l in [&mut got_i, &mut want_i, &mut got_a, &mut want_a] {
+                l.sort();
+                l.dedup();
+            }
+            checked += 1;
+            let mi: Vec<_> = want_i.iter().filter(|w| !got_i.contains(w)).collect();
+            let ei: Vec<_> = got_i.iter().filter(|g| !want_i.contains(g)).collect();
+            let ma: Vec<_> = want_a.iter().filter(|w| !got_a.contains(w)).collect();
+            let mut ea: Vec<_> = got_a.iter().filter(|g| !want_a.contains(g)).collect();
+            // tree-sitter doesn't parse inside macro arguments (`assert_eq!(fs::read(..))`),
+            // where this finds calls; every such extra was read by hand.
+            if lang == Lang::Rust {
+                ea.clear();
+            }
+            if !(mi.is_empty() && ei.is_empty() && ma.is_empty() && ea.is_empty()) {
+                bad_files += 1;
+                miss_i += mi.len();
+                extra_i += ei.len();
+                miss_a += ma.len();
+                extra_a += ea.len();
+                if shown.len() < 14 {
+                    shown.push(format!("{file}\n  imports missing {mi:?} extra {ei:?}\n  accesses missing {ma:?} extra {ea:?}"));
+                }
+            }
+        }
+        eprintln!(
+            "checked {checked} files, {bad_files} differ: imports -{miss_i} +{extra_i}, accesses -{miss_a} +{extra_a}"
+        );
+        for b in &shown {
+            eprintln!("{b}");
+        }
+        assert_eq!(bad_files, 0);
+    }
+
+    /// Reads a vectors file made by `tools/gen_code_vectors.py` from the
+    /// Python standard library with `ast`, and checks every file's imports.
+    /// Run with SNIFF_CODE_VECTORS=<jsonl>.
+    #[test]
+    #[ignore]
+    fn python_imports_match_ast_on_a_corpus() {
+        let Ok(path) = std::env::var("SNIFF_CODE_VECTORS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut checked = 0;
+        let mut bad = Vec::new();
+        for line in text.lines() {
+            let v = json_support::from_str(line).unwrap();
+            let file = v.get("path").and_then(|p| p.as_str()).unwrap().to_string();
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let f = analyze(Lang::Python, &src);
+            let mut got: Vec<(String, Vec<String>, usize)> = f
+                .imports
+                .iter()
+                .filter(|i| !i.dynamic)
+                .map(|i| (i.module.clone(), i.names.clone(), i.dots))
+                .collect();
+            let mut want: Vec<(String, Vec<String>, usize)> = v
+                .get("imports")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    let a = i.as_array().unwrap();
+                    (
+                        a[0].as_str().unwrap().to_string(),
+                        a[1].as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|n| n.as_str().unwrap().to_string())
+                            .collect(),
+                        a[2].as_u64().unwrap() as usize,
+                    )
+                })
+                .collect();
+            // The cap on facts per file makes huge files incomparable.
+            if want.len() >= 500 {
+                continue;
+            }
+            got.sort();
+            want.sort();
+            got.dedup();
+            want.dedup();
+            checked += 1;
+            if got != want {
+                if bad.len() < 6 {
+                    let missing: Vec<_> = want.iter().filter(|w| !got.contains(w)).collect();
+                    let extra: Vec<_> = got.iter().filter(|g| !want.contains(g)).collect();
+                    eprintln!("DIFF {file}\n  missing {missing:?}\n  extra {extra:?}");
+                }
+                bad.push(file);
+            }
+        }
+        eprintln!("checked {checked} files, {} differ", bad.len());
+        for b in bad.iter().take(20) {
+            eprintln!("  {b}");
+        }
+        assert!(bad.is_empty());
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -113371,6 +115880,9 @@ mod content_scan {
 //   joins       two tables whose columns line up by name and/or values
 //   mentions    a file to a shared identifier found in its content
 //   references  a file naming another file (`read_csv("sales.csv")`)
+//   imports     a source file to the file it imports (directed)
+//   reads       a script or query to the file or table it reads (directed)
+//   writes      a script or query to the file or table it writes (directed)
 //   similar_to  two files whose wording overlaps (TF-IDF cosine)
 //   same_name   two files sharing a name stem (`report.pdf`/`report.docx`)
 //
@@ -113381,6 +115893,7 @@ mod content_scan {
 // instead. Communities come from Louvain modularity (deterministic node
 // order and tie-breaks), labelled by the words their files share.
 mod knowledge_graph {
+    use super::code_facts::{self, CodeFacts};
     use super::content_scan::{
         self, ColumnContent, CustomPattern, EntityKind, KnownFiles, Normalize, ScanGuard,
         register_custom_kind,
@@ -113472,6 +115985,9 @@ mod knowledge_graph {
         /// `organization` entries from a PDF's information dictionary or
         /// an office document's properties.
         pub(crate) meta: Vec<(String, String)>,
+        /// What source code or SQL says about files and tables: what it
+        /// imports, reads and writes.
+        pub(crate) code: Option<CodeFacts>,
     }
 
     pub(crate) struct CollectOptions {
@@ -113643,7 +116159,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 1;
+    const CACHE_FORMAT: u64 = 2;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -114149,7 +116665,103 @@ mod knowledge_graph {
             "truncated_scan".to_string(),
             JsonValue::from(f.truncated_scan),
         );
+        if let Some(c) = &f.code {
+            o.insert("code".to_string(), code_to_json(c));
+        }
         JsonValue::Object(o)
+    }
+
+    fn code_to_json(c: &CodeFacts) -> JsonValue {
+        let strs =
+            |v: &[String]| JsonValue::Array(v.iter().cloned().map(JsonValue::from).collect());
+        let mut o = json_support::Map::new();
+        o.insert("language".to_string(), JsonValue::from(c.language.clone()));
+        o.insert(
+            "imports".to_string(),
+            JsonValue::Array(
+                c.imports
+                    .iter()
+                    .map(|i| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(i.module.clone()),
+                            strs(&i.names),
+                            JsonValue::from(i.dots),
+                            JsonValue::from(i.dynamic),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        o.insert(
+            "accesses".to_string(),
+            JsonValue::Array(
+                c.accesses
+                    .iter()
+                    .map(|a| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(a.path.clone()),
+                            JsonValue::from(a.write),
+                            JsonValue::from(a.call.clone()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        o.insert(
+            "sql".to_string(),
+            JsonValue::Array(
+                c.sql
+                    .iter()
+                    .map(|r| {
+                        JsonValue::Array(vec![
+                            JsonValue::from(r.table.clone()),
+                            JsonValue::from(r.write),
+                            JsonValue::from(r.origin.clone()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        );
+        JsonValue::Object(o)
+    }
+
+    fn code_from_json(v: &JsonValue) -> Option<CodeFacts> {
+        let list = |x: &JsonValue| -> Option<Vec<JsonValue>> { Some(x.as_array()?.to_vec()) };
+        let mut c = CodeFacts {
+            language: v.get("language")?.as_str()?.to_string(),
+            ..CodeFacts::default()
+        };
+        for i in list(v.get("imports")?)? {
+            let i = i.as_array()?;
+            c.imports.push(code_facts::Import {
+                module: i.first()?.as_str()?.to_string(),
+                names: i
+                    .get(1)?
+                    .as_array()?
+                    .iter()
+                    .map(|n| n.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?,
+                dots: i.get(2)?.as_u64()? as usize,
+                dynamic: i.get(3)?.as_bool()?,
+            });
+        }
+        for a in list(v.get("accesses")?)? {
+            let a = a.as_array()?;
+            c.accesses.push(code_facts::Access {
+                path: a.first()?.as_str()?.to_string(),
+                write: a.get(1)?.as_bool()?,
+                call: a.get(2)?.as_str()?.to_string(),
+            });
+        }
+        for r in list(v.get("sql")?)? {
+            let r = r.as_array()?;
+            c.sql.push(code_facts::SqlRef {
+                table: r.first()?.as_str()?.to_string(),
+                write: r.get(1)?.as_bool()?,
+                origin: r.get(2)?.as_str()?.to_string(),
+            });
+        }
+        Some(c)
     }
 
     fn file_from_json(v: &JsonValue) -> Option<KgFile> {
@@ -114216,6 +116828,10 @@ mod knowledge_graph {
                     ))
                 }
             },
+            code: match v.get("code") {
+                None => None,
+                Some(c) => Some(code_from_json(c)?),
+            },
         })
     }
 
@@ -114268,10 +116884,67 @@ mod knowledge_graph {
         known: &Arc<KnownFiles>,
     ) -> KgFile {
         let mut file = read_one_inner(root, path, opts, known);
+        let ext = extension_of(&file.name);
         if file.kind != FileKind::Failed {
-            file.meta = file_metadata(path, &extension_of(&file.name));
+            file.meta = file_metadata(path, &ext);
         }
+        file.code = code_facts_of(path, &ext);
         file
+    }
+
+    /// What a source file, a SQL script or a notebook's code cells say
+    /// about files and tables; `None` for anything else.
+    fn code_facts_of(path: &Path, ext: &str) -> Option<CodeFacts> {
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        if ext == "ipynb" {
+            if fs::metadata(path).ok()?.len() > LIMIT {
+                return None;
+            }
+            let doc = json_support::from_str(&fs::read_to_string(path).ok()?).ok()?;
+            let lang = doc
+                .get("metadata")
+                .and_then(|m| {
+                    m.get("kernelspec")
+                        .and_then(|k| k.get("language"))
+                        .or_else(|| m.get("language_info").and_then(|k| k.get("name")))
+                })
+                .and_then(|l| l.as_str())
+                .unwrap_or("python")
+                .to_ascii_lowercase();
+            let lang = match lang.as_str() {
+                "python" | "python3" => code_facts::Lang::Python,
+                "r" => code_facts::Lang::R,
+                _ => return None,
+            };
+            let mut src = String::new();
+            for cell in doc.get("cells")?.as_array()? {
+                if cell.get("cell_type").and_then(|t| t.as_str()) != Some("code") {
+                    continue;
+                }
+                let text = match cell.get("source")? {
+                    JsonValue::String(s) => s.clone(),
+                    JsonValue::Array(parts) => parts.iter().filter_map(|p| p.as_str()).collect(),
+                    _ => continue,
+                };
+                for line in text.lines() {
+                    // IPython magics and shell escapes aren't Python.
+                    let t = line.trim_start();
+                    if !(t.starts_with('%') || t.starts_with('!') || t.starts_with('?')) {
+                        src.push_str(line);
+                    }
+                    src.push('\n');
+                }
+            }
+            let facts = code_facts::analyze(lang, &src);
+            return Some(facts)
+                .filter(|f| !(f.imports.is_empty() && f.accesses.is_empty() && f.sql.is_empty()));
+        }
+        let lang = code_facts::language_of(ext)?;
+        if fs::metadata(path).ok()?.len() > 2 * 1024 * 1024 {
+            return None;
+        }
+        let src = String::from_utf8_lossy(&fs::read(path).ok()?).into_owned();
+        Some(code_facts::analyze(lang, &src))
     }
 
     /// Who made the file, from its own properties: a PDF's information
@@ -114843,6 +117516,7 @@ mod knowledge_graph {
             truncated_scan: false,
             hash: None,
             meta: Vec::new(),
+            code: None,
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -115254,6 +117928,12 @@ mod knowledge_graph {
         HasSchema,
         Joins,
         References,
+        /// A source file importing another (directed, importer to imported).
+        Imports,
+        /// A script, notebook or query reading a file or table (directed).
+        Reads,
+        /// A script, notebook or query writing a file or table (directed).
+        Writes,
         Mentions,
         SharesIds,
         SimilarTo,
@@ -115274,11 +117954,14 @@ mod knowledge_graph {
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 13] = [
+        pub(crate) const ALL: [Relation; 16] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
             Relation::References,
+            Relation::Imports,
+            Relation::Reads,
+            Relation::Writes,
             Relation::Mentions,
             Relation::SharesIds,
             Relation::SimilarTo,
@@ -115296,6 +117979,9 @@ mod knowledge_graph {
                 Relation::HasSchema => "has_schema",
                 Relation::Joins => "joins",
                 Relation::References => "references",
+                Relation::Imports => "imports",
+                Relation::Reads => "reads",
+                Relation::Writes => "writes",
                 Relation::Mentions => "mentions",
                 Relation::SharesIds => "shares_identifiers",
                 Relation::SimilarTo => "similar_to",
@@ -115692,6 +118378,12 @@ mod knowledge_graph {
             if file.truncated_scan {
                 attrs.insert("scan_truncated".to_string(), JsonValue::from(true));
             }
+            if let Some(code) = &file.code {
+                attrs.insert(
+                    "language".to_string(),
+                    JsonValue::from(code.language.clone()),
+                );
+            }
             if fc.entities_truncated {
                 // A column held more distinct identifiers than the scan
                 // keeps (1,024 per column): some went unlinked.
@@ -115743,7 +118435,8 @@ mod knowledge_graph {
         }
 
         link_entities(&mut b, &files, &contents, &file_node, &opts.overrides);
-        let unresolved = link_references(&mut b, &files, &contents, &file_node);
+        let typed = link_code(&mut b, &files, &file_node, &table_nodes);
+        let unresolved = link_references(&mut b, &files, &contents, &file_node, &typed);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
@@ -115983,6 +118676,7 @@ mod knowledge_graph {
         files: &[KgFile],
         contents: &[FileContent],
         file_node: &[usize],
+        typed: &HashSet<(usize, usize)>,
     ) -> usize {
         let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (fi, f) in files.iter().enumerate() {
@@ -115992,7 +118686,23 @@ mod knowledge_graph {
         let mut unresolved = 0;
         for (fi, fc) in contents.iter().enumerate() {
             let mut linked: BTreeSet<usize> = BTreeSet::new();
+            // What an import statement names is a module, not a file name.
+            let specs: HashSet<String> = files[fi]
+                .code
+                .iter()
+                .flat_map(|c| c.imports.iter())
+                .map(|i| {
+                    i.module
+                        .to_lowercase()
+                        .trim_start_matches("./")
+                        .trim_start_matches("../")
+                        .to_string()
+                })
+                .collect();
             for reference in &fc.refs {
+                if specs.contains(reference.trim_start_matches("./").trim_start_matches("../")) {
+                    continue;
+                }
                 let base = reference.rsplit('/').next().unwrap_or(reference);
                 let candidates: Vec<usize> = by_name
                     .get(base)
@@ -116035,7 +118745,8 @@ mod knowledge_graph {
                 };
                 let n = targets.len();
                 for t in targets {
-                    if !linked.insert(t) {
+                    // A code link already says what the file does with it.
+                    if typed.contains(&(fi, t)) || !linked.insert(t) {
                         continue;
                     }
                     let mut evidence = vec![format!("names {reference:?}")];
@@ -116059,6 +118770,544 @@ mod knowledge_graph {
             }
         }
         unresolved
+    }
+
+    // ---- Source code and SQL ----
+
+    /// A relative path with `.` and `..` resolved and slashes forward,
+    /// lower-cased; `None` when it climbs above the root.
+    fn join_rel(dir: &str, path: &str) -> Option<String> {
+        let mut parts: Vec<&str> = if path.starts_with('/') || dir.is_empty() {
+            Vec::new()
+        } else {
+            dir.split('/').collect()
+        };
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                s => parts.push(s),
+            }
+        }
+        Some(parts.join("/").to_lowercase())
+    }
+
+    /// The part of a path a program wrote that names a real place:
+    /// forward slashes, no drive letter, and nothing before a component
+    /// holding a placeholder or wildcard (`{base}/sales.csv` is
+    /// `sales.csv`). `None` when the last component is itself a pattern.
+    fn clean_code_path(raw: &str) -> Option<String> {
+        let p = raw.trim().replace('\\', "/");
+        let p = match p.as_bytes() {
+            [d, b':', ..] if d.is_ascii_alphabetic() => p[2..].to_string(),
+            _ => p,
+        };
+        let comps: Vec<&str> = p.split('/').collect();
+        let pattern = |c: &str| c.contains(['*', '?', '{', '}', '$', '[', '%']);
+        if comps.last().is_none_or(|l| l.is_empty() || pattern(l)) {
+            return None;
+        }
+        let start = comps.iter().rposition(|c| pattern(c)).map_or(0, |i| i + 1);
+        let tail = comps[start..].join("/");
+        let absolute = start == 0 && p.starts_with('/');
+        Some(if absolute {
+            format!("/{}", tail.trim_start_matches('/'))
+        } else {
+            tail
+        })
+    }
+
+    struct CodeIndex {
+        rel: Vec<String>,
+        by_rel: HashMap<String, usize>,
+        by_name: HashMap<String, Vec<usize>>,
+    }
+
+    impl CodeIndex {
+        fn new(files: &[KgFile]) -> CodeIndex {
+            let rel: Vec<String> = files.iter().map(|f| f.rel.to_lowercase()).collect();
+            let mut by_rel = HashMap::new();
+            let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, r) in rel.iter().enumerate() {
+                by_rel.entry(r.clone()).or_insert(i);
+                by_name
+                    .entry(r.rsplit('/').next().unwrap_or(r).to_string())
+                    .or_default()
+                    .push(i);
+            }
+            CodeIndex {
+                rel,
+                by_rel,
+                by_name,
+            }
+        }
+
+        fn dir(&self, fi: usize) -> &str {
+            self.rel[fi].rsplit_once('/').map_or("", |(d, _)| d)
+        }
+
+        /// The file a program means by a path it reads or writes: next to
+        /// the program, then from the root, then by the end of the path or
+        /// the name alone. A name several files share links to each as
+        /// AMBIGUOUS (up to five).
+        fn resolve_path(&self, from: usize, raw: &str) -> Option<(Vec<usize>, Conf)> {
+            let p = clean_code_path(raw)?.to_lowercase();
+            let rel_form = p.trim_start_matches('/');
+            for exact in [join_rel(self.dir(from), rel_form), join_rel("", rel_form)]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(&t) = self.by_rel.get(&exact)
+                    && t != from
+                    && !p.starts_with("../../../")
+                {
+                    return Some((vec![t], Conf::Extracted));
+                }
+            }
+            let base = rel_form.rsplit('/').next().unwrap_or(rel_form);
+            let tail: Vec<&str> = rel_form
+                .split('/')
+                .filter(|c| !matches!(*c, "" | "." | ".."))
+                .collect();
+            let tail = tail.join("/");
+            let cands: Vec<usize> = self
+                .by_name
+                .get(base)?
+                .iter()
+                .copied()
+                .filter(|&c| c != from)
+                .filter(|&c| self.rel[c] == tail || self.rel[c].ends_with(&format!("/{tail}")))
+                .collect();
+            match cands.len() {
+                0 => None,
+                1 => Some((cands, Conf::Extracted)),
+                2..=5 => {
+                    let here = self.dir(from);
+                    let near: Vec<usize> = cands
+                        .iter()
+                        .copied()
+                        .filter(|&c| self.dir(c) == here)
+                        .collect();
+                    if near.len() == 1 {
+                        Some((near, Conf::Extracted))
+                    } else {
+                        Some((cands, Conf::Ambiguous))
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        /// The files an import statement brings in.
+        fn resolve_import(
+            &self,
+            from: usize,
+            language: &str,
+            imp: &code_facts::Import,
+        ) -> Option<(Vec<usize>, Conf)> {
+            let dir = self.dir(from).to_string();
+            let join = |base: &str, rest: &str| -> String {
+                match (base.is_empty(), rest.is_empty()) {
+                    (_, true) => base.to_string(),
+                    (true, false) => rest.to_string(),
+                    _ => format!("{base}/{rest}"),
+                }
+            };
+            let hit = |cands: Vec<String>| -> Vec<usize> {
+                let mut found: Vec<usize> = Vec::new();
+                for c in cands {
+                    if let Some(&t) = self.by_rel.get(&c)
+                        && t != from
+                        && !found.contains(&t)
+                    {
+                        found.push(t);
+                    }
+                }
+                found
+            };
+            match language {
+                "python" => {
+                    let parts = imp.module.to_lowercase().replace('.', "/");
+                    let names: Vec<String> = imp
+                        .names
+                        .iter()
+                        .filter(|n| *n != "*")
+                        .map(|n| n.to_lowercase())
+                        .collect();
+                    let mut bases: Vec<(String, bool)> = Vec::new();
+                    if imp.dots > 0 {
+                        let mut d = dir.as_str();
+                        for _ in 1..imp.dots {
+                            d = d.rsplit_once('/').map_or("", |(up, _)| up);
+                        }
+                        bases.push((d.to_string(), true));
+                    } else {
+                        let mut d = dir.as_str();
+                        bases.push((d.to_string(), true));
+                        while let Some((up, _)) = d.rsplit_once('/') {
+                            d = up;
+                            bases.push((d.to_string(), false));
+                        }
+                        if !dir.is_empty() {
+                            bases.push((String::new(), false));
+                        }
+                    }
+                    for (base, near) in bases {
+                        let prefix = join(&base, &parts);
+                        let mut cands: Vec<String> = Vec::new();
+                        if !parts.is_empty() {
+                            cands.push(format!("{prefix}.py"));
+                            cands.push(format!("{prefix}/__init__.py"));
+                        }
+                        for n in &names {
+                            cands.push(format!("{}.py", join(&prefix, n)));
+                            cands.push(format!("{}/__init__.py", join(&prefix, n)));
+                        }
+                        let found = hit(cands);
+                        if !found.is_empty() {
+                            return Some((
+                                found,
+                                if near {
+                                    Conf::Extracted
+                                } else {
+                                    Conf::Inferred
+                                },
+                            ));
+                        }
+                    }
+                    None
+                }
+                "javascript" => {
+                    if !imp.module.starts_with('.') {
+                        return None;
+                    }
+                    let target = join_rel(&dir, &imp.module)?;
+                    let mut cands = vec![target.clone()];
+                    for ext in ["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "json"] {
+                        cands.push(format!("{target}.{ext}"));
+                    }
+                    for ext in ["js", "jsx", "ts", "tsx", "mjs", "cjs"] {
+                        cands.push(format!("{target}/index.{ext}"));
+                    }
+                    // TypeScript names the compiled file in an import.
+                    for (from_ext, to) in [
+                        (".js", [".ts", ".tsx"]),
+                        (".mjs", [".mts", ".mts"]),
+                        (".cjs", [".cts", ".cts"]),
+                    ] {
+                        if let Some(stem) = target.strip_suffix(from_ext) {
+                            for e in to {
+                                cands.push(format!("{stem}{e}"));
+                            }
+                        }
+                    }
+                    let found = hit(cands);
+                    (!found.is_empty())
+                        .then(|| (found.into_iter().take(1).collect(), Conf::Extracted))
+                }
+                "rust" => {
+                    let name = imp.module.to_lowercase();
+                    let file = self.rel[from].rsplit('/').next().unwrap_or("");
+                    let base = if matches!(file, "mod.rs" | "lib.rs" | "main.rs") {
+                        dir.clone()
+                    } else {
+                        join(&dir, file.trim_end_matches(".rs"))
+                    };
+                    let found = hit(vec![
+                        format!("{}.rs", join(&base, &name)),
+                        format!("{}/mod.rs", join(&base, &name)),
+                    ]);
+                    (!found.is_empty())
+                        .then(|| (found.into_iter().take(1).collect(), Conf::Extracted))
+                }
+                "java" => {
+                    let parts: Vec<String> =
+                        imp.module.split('.').map(|p| p.to_lowercase()).collect();
+                    // `a.b.C.member` for a static import: drop members until a file matches.
+                    for k in (1..=parts.len()).rev() {
+                        let class = format!("{}.java", parts[k - 1]);
+                        let suffix = format!("{}.java", parts[..k].join("/"));
+                        let cands: Vec<usize> = self
+                            .by_name
+                            .get(&class)
+                            .map(|v| {
+                                v.iter()
+                                    .copied()
+                                    .filter(|&c| {
+                                        c != from
+                                            && (self.rel[c] == suffix
+                                                || self.rel[c].ends_with(&format!("/{suffix}")))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        match cands.len() {
+                            0 => continue,
+                            1 => return Some((cands, Conf::Extracted)),
+                            2..=5 => return Some((cands, Conf::Ambiguous)),
+                            _ => return None,
+                        }
+                    }
+                    None
+                }
+                "r" => self.resolve_path(from, &imp.module),
+                _ => None,
+            }
+        }
+    }
+
+    fn add_directed(
+        b: &mut Builder,
+        source: usize,
+        target: usize,
+        relation: Relation,
+        confidence: Conf,
+        evidence: Vec<String>,
+    ) {
+        b.add_edge(
+            source,
+            target,
+            relation,
+            confidence,
+            if confidence == Conf::Ambiguous {
+                0.5
+            } else {
+                1.0
+            },
+            if confidence == Conf::Ambiguous {
+                1.0
+            } else {
+                3.0
+            },
+            evidence,
+        );
+        b.edges.last_mut().expect("just pushed").directed = true;
+    }
+
+    /// `imports`, `reads`, `writes`: what source code, notebooks and SQL
+    /// say about files and tables (see `code_facts`). A path or table
+    /// naming a file or table in the input links to it; one nothing in the
+    /// input has but two or more code files name becomes a `path:` or
+    /// `table:` node between them, so a script that writes `clean.csv`
+    /// and one that reads it connect though the file isn't there. A link
+    /// here replaces the plain `references` link between the same two
+    /// files. Returns those (file, file) pairs.
+    fn link_code(
+        b: &mut Builder,
+        files: &[KgFile],
+        file_node: &[usize],
+        table_nodes: &[(usize, usize, usize)],
+    ) -> HashSet<(usize, usize)> {
+        let mut typed: HashSet<(usize, usize)> = HashSet::new();
+        if files.iter().all(|f| f.code.is_none()) {
+            return typed;
+        }
+        let index = CodeIndex::new(files);
+        // Data tables by name: a CSV's stem, a SQLite or Excel table.
+        let mut tables: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        for &(node, fi, ti) in table_nodes {
+            if files[fi].fixed_schema || files[fi].kind != FileKind::Data {
+                continue;
+            }
+            tables
+                .entry(files[fi].tables[ti].0.to_lowercase())
+                .or_default()
+                .push((node, fi));
+        }
+        // dbt models: SQL files by name.
+        let mut models: HashMap<String, Vec<usize>> = HashMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            if f.code.as_ref().is_some_and(|c| c.language == "sql") {
+                let stem = f.name.rsplit_once('.').map_or(f.name.as_str(), |(s, _)| s);
+                models.entry(stem.to_lowercase()).or_default().push(fi);
+            }
+        }
+
+        // A phantom is a path or table that one code file writes or reads
+        // and no input file is: (key) -> (label, [(file, write, evidence)]).
+        type Phantom = (String, Vec<(usize, bool, String)>);
+        let mut phantoms: BTreeMap<(&'static str, String), Phantom> = BTreeMap::new();
+
+        for (fi, f) in files.iter().enumerate() {
+            let Some(code) = &f.code else { continue };
+            // (target node, relation) -> (confidence, evidence), in order.
+            let mut edges: BTreeMap<(usize, Relation), (Conf, Vec<String>)> = BTreeMap::new();
+            let note = |edges: &mut BTreeMap<(usize, Relation), (Conf, Vec<String>)>,
+                        node: usize,
+                        rel: Relation,
+                        conf: Conf,
+                        ev: String| {
+                let e = edges.entry((node, rel)).or_insert((conf, Vec::new()));
+                if e.1.len() < 3 && !e.1.contains(&ev) {
+                    e.1.push(ev);
+                }
+                if conf > e.0 {
+                    e.0 = conf;
+                }
+            };
+
+            for imp in &code.imports {
+                let Some((targets, conf)) = index.resolve_import(fi, &code.language, imp) else {
+                    continue;
+                };
+                let what = match code.language.as_str() {
+                    "python" => {
+                        let dots = ".".repeat(imp.dots);
+                        if imp.names.is_empty() {
+                            format!("import {dots}{}", imp.module)
+                        } else {
+                            format!("from {dots}{} import {}", imp.module, imp.names.join(", "))
+                        }
+                    }
+                    "rust" => format!("mod {};", imp.module),
+                    "r" => format!("source({:?})", imp.module),
+                    _ => format!("imports {:?}", imp.module),
+                };
+                for t in targets {
+                    typed.insert((fi, t));
+                    note(
+                        &mut edges,
+                        file_node[t],
+                        Relation::Imports,
+                        conf,
+                        what.clone(),
+                    );
+                }
+            }
+
+            for acc in &code.accesses {
+                let rel = if acc.write {
+                    Relation::Writes
+                } else {
+                    Relation::Reads
+                };
+                let ev = format!("{}({:?})", acc.call, acc.path);
+                match index.resolve_path(fi, &acc.path) {
+                    Some((targets, conf)) => {
+                        for t in targets {
+                            typed.insert((fi, t));
+                            note(&mut edges, file_node[t], rel, conf, ev.clone());
+                        }
+                    }
+                    None => {
+                        if let Some(key) = clean_code_path(&acc.path)
+                            && code_facts::known_extension(&key)
+                        {
+                            let label = key.rsplit('/').next().unwrap_or(&key).to_string();
+                            phantoms
+                                .entry(("path", key.to_lowercase()))
+                                .or_insert_with(|| (label, Vec::new()))
+                                .1
+                                .push((fi, acc.write, ev));
+                        }
+                    }
+                }
+            }
+
+            for r in &code.sql {
+                let rel = if r.write {
+                    Relation::Writes
+                } else {
+                    Relation::Reads
+                };
+                let lower = r.table.to_lowercase();
+                let last = lower.rsplit('.').next().unwrap_or(&lower).to_string();
+                let ev = match r.origin.as_str() {
+                    "sql" => format!(
+                        "sql {} table {:?}",
+                        if r.write { "writes" } else { "reads" },
+                        r.table
+                    ),
+                    o => format!("{o}({:?})", r.table),
+                };
+                // dbt: a ref is a model, a source is a table.
+                if r.origin == "dbt ref"
+                    && let Some(ms) = models.get(&last)
+                {
+                    let ms: Vec<usize> = ms.iter().copied().filter(|&m| m != fi).collect();
+                    if !ms.is_empty() {
+                        let conf = if ms.len() == 1 {
+                            Conf::Extracted
+                        } else {
+                            Conf::Ambiguous
+                        };
+                        for m in ms.into_iter().take(5) {
+                            typed.insert((fi, m));
+                            note(&mut edges, file_node[m], rel, conf, ev.clone());
+                        }
+                        continue;
+                    }
+                }
+                match tables.get(&last).map(|v| {
+                    v.iter()
+                        .copied()
+                        .filter(|&(_, tfi)| tfi != fi)
+                        .collect::<Vec<_>>()
+                }) {
+                    Some(ts) if !ts.is_empty() && ts.len() <= 5 => {
+                        let conf = if ts.len() == 1 {
+                            Conf::Extracted
+                        } else {
+                            Conf::Ambiguous
+                        };
+                        for (node, tfi) in ts {
+                            typed.insert((fi, tfi));
+                            note(&mut edges, node, rel, conf, ev.clone());
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        phantoms
+                            .entry(("table", lower.clone()))
+                            .or_insert_with(|| (r.table.clone(), Vec::new()))
+                            .1
+                            .push((fi, r.write, ev));
+                    }
+                }
+            }
+
+            for ((node, rel), (conf, evidence)) in edges {
+                add_directed(b, file_node[fi], node, rel, conf, evidence);
+            }
+        }
+
+        for ((kind, key), (label, uses)) in phantoms {
+            let distinct: BTreeSet<usize> = uses.iter().map(|u| u.0).collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+            let mut attrs = json_support::Map::new();
+            attrs.insert("entity_kind".to_string(), JsonValue::from(kind));
+            attrs.insert("files".to_string(), JsonValue::from(distinct.len()));
+            attrs.insert("in_input".to_string(), JsonValue::from(false));
+            let node = b.add_node(
+                format!("{kind}:{key}"),
+                label,
+                NodeType::Entity,
+                kind.to_string(),
+                None,
+                attrs,
+            );
+            let mut per_file: BTreeMap<(usize, Relation), Vec<String>> = BTreeMap::new();
+            for (fi, write, ev) in uses {
+                let rel = if write {
+                    Relation::Writes
+                } else {
+                    Relation::Reads
+                };
+                let e = per_file.entry((fi, rel)).or_default();
+                if e.len() < 3 && !e.contains(&ev) {
+                    e.push(ev);
+                }
+            }
+            for ((fi, rel), evidence) in per_file {
+                // Not in the input, so named rather than seen: INFERRED.
+                add_directed(b, file_node[fi], node, rel, Conf::Inferred, evidence);
+            }
+        }
+        typed
     }
 
     /// Generic stems that say nothing when two files share them.
@@ -119185,7 +122434,7 @@ mod knowledge_graph {
                 continue;
             }
             let rank = match e.relation {
-                Relation::References => 0,
+                Relation::References | Relation::Imports | Relation::Reads | Relation::Writes => 0,
                 Relation::DuplicateOf => 0,
                 Relation::Joins | Relation::SharesIds | Relation::SharesKey => 1,
                 Relation::SimilarTo => 3,
@@ -119813,6 +123062,9 @@ mod knowledge_graph {
                 let other = if e.source == i { e.target } else { e.source };
                 let dir_mark = match (e.relation, e.source == i) {
                     (Relation::References, false) => "referenced by ",
+                    (Relation::Imports, false) => "imported by ",
+                    (Relation::Reads, false) => "read by ",
+                    (Relation::Writes, false) => "written by ",
                     (Relation::Contains, false) => "part of ",
                     _ => "",
                 };
@@ -121172,6 +124424,9 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     {
                         let arrow = match (*direction, rel, kg.edges[*ei].directed) {
                             ("in", Relation::References, _) => "referenced by ",
+                            ("in", Relation::Imports, _) => "imported by ",
+                            ("in", Relation::Reads, _) => "read by ",
+                            ("in", Relation::Writes, _) => "written by ",
                             ("in", Relation::Contains, _) => "part of ",
                             ("out", Relation::Joins, true) => "references → ",
                             ("in", Relation::Joins, true) => "referenced by ← ",
@@ -121675,6 +124930,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 truncated_scan: false,
                 hash: None,
                 meta: Vec::new(),
+                code: None,
             }
         }
 
@@ -123179,6 +126435,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 truncated_scan: false,
                 hash: None,
                 meta: Vec::new(),
+                code: None,
             }
         }
 
@@ -123295,6 +126552,16 @@ USAGE:
                    one
       references   a file naming another file (a notebook's
                    read_csv("sales.csv"), a page's <img src="plot.png">)
+      imports      a source file to the file it imports (Python, JS/TS,
+                   Rust, Java, R source(); notebooks' code cells too);
+                   directed
+      reads        a script, notebook or query to the file or table it
+                   reads (pd.read_csv, fs.readFile, File::open,
+                   SELECT ... FROM, dbt ref()); directed
+      writes       the same for what it writes (df.to_csv, open(.., "w"),
+                   INSERT INTO, CREATE TABLE); a path or table that no
+                   input file has but two code files name becomes a
+                   path: or table: node between them
       similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED)
       same_name    files sharing a name stem (report.pdf / report.docx)
       duplicate_of byte-identical files (EXTRACTED, found by content hash)

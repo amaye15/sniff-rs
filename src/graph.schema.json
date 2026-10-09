@@ -60,7 +60,8 @@
           "target": { "type": "string", "description": "A node id." },
           "relation": {
             "enum": [
-              "contains", "has_schema", "joins", "references", "mentions", "shares_identifiers",
+              "contains", "has_schema", "joins", "references", "imports", "reads", "writes", "mentions",
+              "shares_identifiers",
               "similar_to", "same_name", "shares_key", "duplicate_of", "metadata", "in_folder",
               "related_to"
             ]

@@ -18535,6 +18535,97 @@ evidence, by}`.
   `HashMap`. Checked on the real corpus (aggregate): the graph is identical
   to the previous build apart from that and the new `version` field.
 
+### Phase 2: code to data - imports, reads, writes (`code_facts`)
+
+A script that reads `sales.csv`, a query that selects from `sales`, and a
+module that imports another are connected to that data, and none of it is
+in the data. Three directed relations carry it: `imports` (a source file to
+the file it imports), `reads` and `writes` (a program, notebook or query to
+the file or table it reads or writes). They replace the plain `references`
+link between the same two files (`link_references` takes the pairs
+`link_code` already typed), so nothing is said twice.
+
+**How it reads.** `mod code_facts` is a lexer per language family plus a
+small call engine, not a parser. The lexer skips comments and finds string
+literals (Python prefixes, triple quotes, line continuations and implicit
+concatenation; JS template literals and regex literals; Rust raw strings,
+nested block comments and `r#ident`; Java text blocks; Go raw strings; R
+backticks). The engine keeps a stack of the calls and brackets a literal
+sits in, with each string's argument index and `name=` keyword: a string is
+a path when it is a direct argument of a call in a per-language table
+(`pd.read_csv`, `df.to_csv`, `open` - its mode is the second positional or
+`mode=` - `fs.readFile`, `File::open`, `include_str!`, `os.Open`,
+`new FileReader`, `read.csv`, `ggsave`, ...) and looks like a path. A
+string inside a list, dict or object literal is not. `os.path.join`,
+`Path(...)`, `path.join`, `Paths.get`, `file.path`, `filepath.Join` join
+their string arguments (`data/raw/x.csv`); a path nothing consumes
+(`p = Path("x.csv")`) is left to the plain references; keyword options
+(`encoding`, `sep`, `mode`, ...) never name files. `.ipynb` files read their
+code cells (IPython `%magic` and `!shell` lines dropped; R kernels too).
+Imports: Python statements resolved against the importer's directory, its
+ancestors (a source root) and relative dots, submodules of `from x import y`
+included; JS/TS relative specifiers with extensions, `index`, and TypeScript's
+`.js` naming a `.ts` file; Rust `mod x;` (also inside `cfg_if!`); Java
+`import a.b.C` by path suffix; R `source()`. Facts are cached per file
+(`CACHE_FORMAT` 2).
+
+**SQL** (`.sql` files and SQL-looking strings in other code, dbt's
+`{{ ref() }}` and `{{ source() }}`): `FROM`/`JOIN`/comma lists (including
+parenthesized join lists and `USING`) read; `INSERT INTO`, `UPDATE`,
+`DELETE FROM`, `CREATE TABLE|VIEW`, `DROP`, `ALTER`, `TRUNCATE`,
+`SELECT ... INTO` write. CTE names, `EXTRACT/TRIM/SUBSTRING ... FROM`,
+table functions, `GRANT`/`REVOKE` and comments are not tables. A name
+resolves to a data table (a CSV's stem, a SQLite or Excel table) first;
+a dbt `ref` to the model file; otherwise it is a node.
+
+**What links, and how sure.** A path resolves next to the program, then from
+the input root, then by the end of the path or the bare name (several
+candidates: AMBIGUOUS, up to five; a wildcard or a `{placeholder}` keeps only
+the clean tail). A relative import is EXTRACTED; a Python import found only
+at an ancestor directory is INFERRED. A path or table that no input file has
+but two or more code files name becomes a `path:` or `table:` node (INFERRED)
+between them, so the script that writes `clean.csv` and the one that reads
+it connect though the file is not there; one file alone makes no node.
+
+**Also changed.** A file with a source extension (`is_source_extension`) is
+never sniffed as a table by its commas (a short `.js` file used to profile as
+a two-column CSV and lose its text). An import specifier is not matched as a
+file name by the generic reference scanner (`./lib/math.js` no longer links
+the TypeScript importer to an unrelated `web/lib/math.js`).
+
+**Verified** against independent parsers, each with its generator in `tools/`:
+Python imports against `ast` on 22,209 standard-library and site-packages
+files (0 differences); Python reads and writes against `ast` on the same
+files (22,210, 0 differences) and on 5,180 generated programs (nesting,
+keywords, f-strings, comments, docstrings, adjacent literals) plus 668
+committed; SQL tables against `sqlglot` on 1,500 committed and 6,000 more
+generated statements and 2,003 real PostgreSQL statements (0 differences);
+JavaScript, Rust, Java and Go imports and accesses against tree-sitter on
+31,526 files (`mod` declarations, `import`/`require`, `include_str!`,
+`File::open`, `fs.readFile`, ...; 0 differences, after reading by hand the
+11 calls inside Rust macro arguments that tree-sitter does not parse and
+this reads). Running them found real bugs: `from . import x` read `import`
+as a module name; `open("a", encoding="ascii")` counted as a write (any
+second string was taken for the mode); a `(` grouping hid its strings;
+adjacent literals were two paths; `\u00e9` escapes; comma-joined and
+parenthesized table lists; `r#gen` raw identifiers; a `Path.open("w")` mode.
+Graph output on the fixture tree and on the 1,340-file real corpus differs
+from before only by the new relations and the `references` links they
+replaced (corpus: +23 `reads`, +7 `writes`, 4 `path:` and 4 `table:` nodes,
+no change in run time or memory). Test: `graph_links_code_to_the_data_it_imports_reads_and_writes`
+on `tests/fixtures/edge_graph_code`.
+
+**Disclosed.** R has no independent parser oracle here (its tables are
+checked by hand-written cases only); the oracle for Rust accesses cannot see
+inside macro arguments. A path built in a variable first (`p = DIR + name;
+read_csv(p)`), `import *`, packages outside the input, `require` of a
+computed name, a Go package import, C/C++ includes and Java classpath
+resources are not followed. A path joined across a `/` operator
+(`Path("data") / "x.csv"`) or a method on a path variable (`d.join("x")`)
+names only its last part. Table names resolve by their last part, so
+`schema.orders` and `other.orders` both mean a table `orders`. A program that
+reads a name through a wrapper (`load(name)`) is not a read.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

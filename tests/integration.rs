@@ -15566,19 +15566,41 @@ fn knowledge_graph_links_every_data_type_in_a_folder() {
             .any(|e| e.as_str().unwrap().contains("foreign-key naming"))
     );
 
-    for (from, to) in [
-        ("analysis/analysis.ipynb", "crm/customers.csv"),
-        ("analysis/analysis.ipynb", "analysis/plot.png"),
-        ("docs/notes.md", "docs/report.pdf"),
+    // A notebook that reads a CSV says so (`reads`, directed, and in place
+    // of the plain reference); a file named any other way stays a
+    // `references` link.
+    for (relation, from, to) in [
+        ("reads", "analysis/analysis.ipynb", "crm/customers.csv"),
+        ("writes", "analysis/analysis.ipynb", "analysis/plot.png"),
+        ("references", "docs/notes.md", "docs/report.pdf"),
     ] {
-        let link =
-            kg_link(&doc, "references", from, to).unwrap_or_else(|| panic!("{from} -> {to}"));
+        let link = kg_link(&doc, relation, from, to).unwrap_or_else(|| panic!("{from} -> {to}"));
         assert_eq!(
             link["source"], from,
             "a reference points from the naming file"
         );
         assert_eq!(link["confidence"], "EXTRACTED");
     }
+    assert!(
+        kg_link(
+            &doc,
+            "references",
+            "analysis/analysis.ipynb",
+            "crm/customers.csv"
+        )
+        .is_none(),
+        "a typed link replaces the plain reference"
+    );
+    assert_eq!(
+        kg_link(
+            &doc,
+            "reads",
+            "analysis/analysis.ipynb",
+            "crm/customers.csv"
+        )
+        .unwrap()["directed"],
+        true
+    );
 
     for (entity, files) in [
         (
@@ -15701,10 +15723,7 @@ fn graph_queries_accept_graph_json_and_directories() {
     let text = String::from_utf8_lossy(&explained.stdout);
     assert!(text.starts_with("# customers.csv"), "{text}");
     assert!(text.contains("### joins (1)"), "{text}");
-    assert!(
-        text.contains("referenced by `analysis/analysis.ipynb`"),
-        "{text}"
-    );
+    assert!(text.contains("read by `analysis/analysis.ipynb`"), "{text}");
 
     let path = run_graph(&[
         "path",
@@ -19920,4 +19939,103 @@ fn matlab_v73_matrices_are_rows_and_char_arrays_are_strings() {
     assert_eq!(table(&more, "wide")[0]["row_count"], 5000);
     assert_eq!(table(&more, "big")[0]["row_count"], 6000);
     assert_eq!(sample_names(&more, "i64", "col_0"), ["1099511627776"]);
+}
+
+#[test]
+fn graph_links_code_to_the_data_it_imports_reads_and_writes() {
+    let tmp = TempDir::new();
+    let out = tmp.path().join("out");
+    let input = format!(
+        "{}/tests/fixtures/edge_graph_code",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let run = || {
+        let r = run_graph(&["graph", &input, out.to_str().unwrap()]);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        std::fs::read_to_string(out.join("graph.json")).unwrap()
+    };
+    let first = run();
+    // The second run answers from the cache, code facts included.
+    assert_eq!(first, run(), "a cached run must give the same graph");
+    let doc: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let directed = |relation: &str, from: &str, to: &str| -> bool {
+        doc["links"].as_array().unwrap().iter().any(|l| {
+            l["relation"] == relation
+                && l["source"] == from
+                && l["target"] == to
+                && l["directed"] == true
+        })
+    };
+    for (relation, from, to) in [
+        // Python: a read by literal path, one through os.path.join, a
+        // relative and a package import (the comment's ghost.csv is nothing).
+        ("reads", "etl/clean.py", "data/sales.csv"),
+        ("reads", "etl/clean.py", "data/customers.csv"),
+        ("imports", "etl/clean.py", "etl/lib/util.py"),
+        ("imports", "etl/clean.py", "etl/config.py"),
+        // A notebook's code cells, without its %magic lines.
+        ("reads", "notebooks/analysis.ipynb", "data/sales.csv"),
+        // R, Rust, JavaScript, TypeScript (".js" names the ".ts" file), Java.
+        ("imports", "r/report.R", "etl/helper.R"),
+        ("reads", "src/main.rs", "data/customers.csv"),
+        ("imports", "src/main.rs", "src/parser.rs"),
+        ("reads", "web/app.js", "data/sales.csv"),
+        ("imports", "web/app.js", "web/lib/math.js"),
+        ("imports", "ts/main.ts", "ts/lib/math.ts"),
+        ("imports", "ts/main.ts", "ts/lib/shapes.ts"),
+        (
+            "imports",
+            "app/com/acme/Main.java",
+            "app/com/acme/util/Strings.java",
+        ),
+        ("reads", "app/com/acme/Main.java", "data/customers.csv"),
+        // SQL names tables; dbt names models and sources.
+        ("reads", "sql/summary.sql", "data/sales.csv"),
+        ("reads", "sql/summary.sql", "data/customers.csv"),
+        ("reads", "models/orders.sql", "models/stg_orders.sql"),
+        ("reads", "models/orders.sql", "models/customers.sql"),
+        ("reads", "models/stg_orders.sql", "data/sales.csv"),
+        // A file nothing in the input has, written and read by several
+        // programs: one node between them.
+        ("writes", "etl/clean.py", "path:out/clean.csv"),
+        ("writes", "notebooks/analysis.ipynb", "path:out/clean.csv"),
+        ("writes", "web/app.js", "path:out/clean.csv"),
+        ("reads", "r/report.R", "path:out/clean.csv"),
+    ] {
+        assert!(directed(relation, from, to), "{relation}: {from} -> {to}");
+    }
+    // A file only one program writes is no node.
+    let ids: Vec<&str> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        !ids.iter()
+            .any(|i| i.contains("log.txt") || i.contains("ghost")),
+        "{ids:?}"
+    );
+    // A typed link replaces the plain reference between the same files.
+    for l in doc["links"].as_array().unwrap() {
+        if l["relation"] == "references" {
+            let pair = (l["source"].as_str().unwrap(), l["target"].as_str().unwrap());
+            assert!(
+                !["imports", "reads", "writes"]
+                    .iter()
+                    .any(|r| directed(r, pair.0, pair.1)),
+                "{pair:?} is linked twice"
+            );
+        }
+    }
+    // The module an import names is not also a file name to match.
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "references"
+                && l["source"] == "ts/main.ts"
+                && l["target"] == "web/lib/math.js")
+    );
 }
