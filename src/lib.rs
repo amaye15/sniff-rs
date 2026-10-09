@@ -77909,6 +77909,15 @@ mod mbox_support {
                 if self.body_has_line {
                     self.body.push(b'\n');
                 }
+                // mboxrd: a writer quotes a body line that reads as an
+                // envelope (`From ...`, or `>From ...` already) with one more
+                // `>`; this takes that one back.
+                let quoted = line.iter().take_while(|b| **b == b'>').count();
+                let line = if quoted > 0 && line[quoted..].starts_with(b"From ") {
+                    &line[1..]
+                } else {
+                    line
+                };
                 self.body.extend_from_slice(line);
                 self.body_has_line = true;
                 return Ok(());
@@ -84290,7 +84299,7 @@ const FORMAT_CATALOG: &[FormatInfo] = &[
     },
     FormatInfo {
         name: "mbox",
-        extensions: &["mbox"],
+        extensions: &["mbox", "eml", "msg"],
         feature: Some("mbox"),
         compiled_in: cfg!(feature = "mbox"),
         directory: false,
@@ -85199,7 +85208,10 @@ fn detect_format(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if let Some(format) = format_from_extension(&ext) {
+    // `.msg` is Outlook mail only if it is an OLE2 file; other things use the name.
+    let by_extension =
+        format_from_extension(&ext).filter(|_| ext != "msg" || is_ole2_file(read_path));
+    if let Some(format) = by_extension {
         // `.vcf` is vCard contacts or Variant Call Format; the content says which.
         if matches!(format, InputFormat::Vcard) && sniff_variant_calls(read_path) {
             return Ok(InputFormat::Vcf);
@@ -85289,7 +85301,8 @@ fn format_from_extension(ext: &str) -> Option<InputFormat> {
         "json5" | "jsonc" => InputFormat::Json5,
         "har" => InputFormat::Har,
         "geojson" => InputFormat::GeoJson,
-        "mbox" => InputFormat::Mbox,
+        // One message per file: read as an mbox of one (`convert_message_to_mbox`).
+        "mbox" | "eml" | "msg" => InputFormat::Mbox,
         "vcf" => InputFormat::Vcard,
         "bed" => InputFormat::Bed,
         "gff" | "gff3" | "gtf" => InputFormat::Gff,
@@ -94599,6 +94612,11 @@ mod xlsx_support {
         object_type: u8, // 0 = unused, 1 = storage, 2 = stream, 5 = root storage
         start_sector: u32,
         stream_size: u64,
+        /// Directory ids of the red-black tree siblings and of the first
+        /// child, `0xFFFF_FFFF` for none ([MS-CFB] 2.6.1).
+        left: u32,
+        right: u32,
+        child: u32,
     }
 
     impl CfbFile {
@@ -94789,7 +94807,18 @@ mod xlsx_support {
                 }
                 let name_len = u16::from_le_bytes([entry[64], entry[65]]) as usize;
                 if name_len < 2 {
-                    continue; // unused entry
+                    // An unused entry still holds its slot: the sibling and
+                    // child links of the others are indices into this list.
+                    directory.push(CfbDirEntry {
+                        name: String::new(),
+                        object_type: 0,
+                        start_sector: CFB_ENDOFCHAIN,
+                        stream_size: 0,
+                        left: CFB_FREESECT,
+                        right: CFB_FREESECT,
+                        child: CFB_FREESECT,
+                    });
+                    continue;
                 }
                 // name_len includes the trailing UTF-16 null terminator.
                 let name_utf16: Vec<u16> = entry[0..name_len - 2]
@@ -94805,6 +94834,9 @@ mod xlsx_support {
                     object_type,
                     start_sector,
                     stream_size,
+                    left: u32::from_le_bytes(entry[68..72].try_into().unwrap()),
+                    right: u32::from_le_bytes(entry[72..76].try_into().unwrap()),
+                    child: u32::from_le_bytes(entry[76..80].try_into().unwrap()),
                 });
             }
             cfb.directory = directory;
@@ -94845,6 +94877,62 @@ mod xlsx_support {
                 self.read_chain(start_sector)?
             };
             bytes.truncate(stream_size as usize);
+            Ok(bytes)
+        }
+
+        /// The entries directly inside storage `id` (0 is the root), in
+        /// tree order: an in-order walk of the sibling tree under its
+        /// first child, with a visit cap so a corrupt (cyclic) tree ends.
+        pub(crate) fn children_of(&self, id: usize) -> Vec<usize> {
+            let mut out = Vec::new();
+            let Some(entry) = self.directory.get(id) else {
+                return out;
+            };
+            let mut stack: Vec<usize> = Vec::new();
+            let mut node = entry.child;
+            let mut budget = self.directory.len() * 2 + 2;
+            loop {
+                while node != CFB_FREESECT && (node as usize) < self.directory.len() {
+                    if budget == 0 {
+                        return out;
+                    }
+                    budget -= 1;
+                    stack.push(node as usize);
+                    node = self.directory[node as usize].left;
+                }
+                let Some(top) = stack.pop() else {
+                    break;
+                };
+                out.push(top);
+                node = self.directory[top].right;
+            }
+            out
+        }
+
+        /// `(name, is_storage)` of directory entry `id`.
+        pub(crate) fn entry_info(&self, id: usize) -> Option<(&str, bool)> {
+            let e = self.directory.get(id)?;
+            match e.object_type {
+                1 | 5 => Some((e.name.as_str(), true)),
+                2 => Some((e.name.as_str(), false)),
+                _ => None,
+            }
+        }
+
+        /// The bytes of stream entry `id`.
+        pub(crate) fn read_entry(&mut self, id: usize) -> Result<Vec<u8>> {
+            let entry = self
+                .directory
+                .get(id)
+                .filter(|e| e.object_type == 2)
+                .context("not a stream in this OLE2 file")?;
+            let (start, size) = (entry.start_sector, entry.stream_size);
+            let mut bytes = if size < u64::from(self.mini_stream_cutoff) {
+                self.read_mini_chain(start)?
+            } else {
+                self.read_chain(start)?
+            };
+            bytes.truncate(size as usize);
             Ok(bytes)
         }
 
@@ -96636,6 +96724,252 @@ mod xlsx_support {
             &is_date_by_xf,
             sink,
         )
+    }
+
+    // --- Outlook `.msg` (an OLE2 container of MAPI properties) ---
+    //
+    // A `.msg` is a Compound File: the message's properties sit in the root
+    // storage, each recipient in a `__recip_version1.0_#N` storage and each
+    // attachment in an `__attach_version1.0_#N` one ([MS-OXMSG]). Text
+    // properties are streams named `__substg1.0_<id><type>` (type 001F is
+    // UTF-16LE, 001E is the 8-bit code page); numbers and times are in the
+    // 16-byte records of `__properties_version1.0`. The message is rewritten
+    // as an RFC 5322 message, so the mailbox reader and its people, headers
+    // and body handling do the rest.
+
+    #[derive(Default)]
+    struct MsgProps {
+        strings: HashMap<u16, String>,
+        ints: HashMap<u16, i32>,
+        times: HashMap<u16, u64>,
+    }
+
+    /// The properties held directly in storage `children` (the entries of
+    /// a message, recipient or attachment storage). `header` is the length
+    /// of the property stream's fixed head: 32 for the message, 8 for a
+    /// recipient or attachment.
+    fn msg_read_props(cfb: &mut CfbFile, children: &[usize], header: usize) -> MsgProps {
+        let mut props = MsgProps::default();
+        let mut names: Vec<(String, usize)> = Vec::new();
+        for &c in children {
+            if let Some((name, false)) = cfb.entry_info(c) {
+                names.push((name.to_string(), c));
+            }
+        }
+        for (name, id) in &names {
+            if name == "__properties_version1.0" {
+                let Ok(bytes) = cfb.read_entry(*id) else {
+                    continue;
+                };
+                for rec in bytes.get(header..).unwrap_or(&[]).chunks_exact(16) {
+                    let tag = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
+                    let (prop, ty) = ((tag >> 16) as u16, (tag & 0xFFFF) as u16);
+                    match ty {
+                        0x0003 => {
+                            props.ints.insert(
+                                prop,
+                                i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]),
+                            );
+                        }
+                        0x0040 => {
+                            props.times.insert(
+                                prop,
+                                u64::from_le_bytes([
+                                    rec[8], rec[9], rec[10], rec[11], rec[12], rec[13], rec[14],
+                                    rec[15],
+                                ]),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for (name, id) in &names {
+            let Some(rest) = name.strip_prefix("__substg1.0_") else {
+                continue;
+            };
+            if rest.len() != 8 {
+                continue;
+            }
+            let (Ok(prop), Ok(ty)) = (
+                u16::from_str_radix(&rest[..4], 16),
+                u16::from_str_radix(&rest[4..], 16),
+            ) else {
+                continue;
+            };
+            if ty != 0x001F && ty != 0x001E {
+                continue;
+            }
+            let Ok(bytes) = cfb.read_entry(*id) else {
+                continue;
+            };
+            let text = if ty == 0x001F {
+                let units: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                String::from_utf16_lossy(&units)
+            } else {
+                match super::codepage_support::table("windows-1252") {
+                    Some(table) => super::codepage_support::decode(table, &bytes),
+                    None => String::from_utf8_lossy(&bytes).into_owned(),
+                }
+            };
+            // Streams are padded with NULs; the value ends at the first.
+            let text = text.split('\0').next().unwrap_or("").to_string();
+            props.strings.entry(prop).or_insert(text);
+        }
+        props
+    }
+
+    /// `"Name" <address>`, a bare address, or just a name; `None` when
+    /// there is neither.
+    fn msg_mailbox(name: Option<&str>, address: Option<&str>) -> Option<String> {
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        let address = address
+            .map(str::trim)
+            .filter(|a| a.contains('@') && !a.contains(char::is_whitespace));
+        match (name, address) {
+            (Some(n), Some(a)) if !n.eq_ignore_ascii_case(a) => {
+                let quoted = n.replace('\\', "\\\\").replace('"', "\\\"");
+                Some(format!("\"{quoted}\" <{a}>"))
+            }
+            (_, Some(a)) => Some(a.to_string()),
+            (Some(n), None) => {
+                let quoted = n.replace('\\', "\\\\").replace('"', "\\\"");
+                Some(format!("\"{quoted}\""))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// An RFC 5322 `Date:` value for a Windows FILETIME (100 ns ticks since
+    /// 1601-01-01 UTC).
+    fn msg_filetime_date(ticks: u64) -> Option<String> {
+        const EPOCH_DIFF: u64 = 11_644_473_600;
+        let secs = (ticks / 10_000_000).checked_sub(EPOCH_DIFF)? as i64;
+        let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+        let (y, m, d) = civil_from_days(days);
+        const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        Some(format!(
+            "{}, {:02} {} {} {:02}:{:02}:{:02} +0000",
+            DAYS[days.rem_euclid(7) as usize],
+            d,
+            MONTHS[m as usize - 1],
+            y,
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        ))
+    }
+
+    /// Rewrites an Outlook `.msg` file as an RFC 5322 message (CRLF line
+    /// ends, UTF-8): `From`, `To`, `Cc`, `Bcc`, `Subject`, `Date`,
+    /// `Message-ID`, `In-Reply-To` and the plain-text body (the HTML body,
+    /// labelled so, when that is all there is). Not carried: attachments
+    /// and the compressed-RTF body.
+    pub(crate) fn msg_to_rfc822(path: &Path) -> Result<Vec<u8>> {
+        let mut cfb = CfbFile::open(path)?;
+        let top = cfb.children_of(0);
+        let has_props = top
+            .iter()
+            .any(|&c| cfb.entry_info(c) == Some(("__properties_version1.0", false)));
+        if !has_props {
+            bail!("not an Outlook .msg message (it has no property stream)");
+        }
+        let msg = msg_read_props(&mut cfb, &top, 32);
+        let text = |p: u16| msg.strings.get(&p).map(String::as_str);
+        // The sender: the SMTP address when the message has one, else the
+        // plain address of an SMTP-typed or at-sign-bearing field.
+        let from_addr = |smtp: u16, addr: u16, kind: u16| -> Option<&str> {
+            text(smtp).or_else(|| {
+                let a = text(addr)?;
+                (text(kind).is_some_and(|k| k.eq_ignore_ascii_case("SMTP")) || a.contains('@'))
+                    .then_some(a)
+            })
+        };
+        let from = msg_mailbox(text(0x0C1A), from_addr(0x5D01, 0x0C1F, 0x0C1E))
+            .or_else(|| msg_mailbox(text(0x0042), from_addr(0x5D02, 0x0065, 0x0064)));
+        let (mut to, mut cc, mut bcc) = (Vec::new(), Vec::new(), Vec::new());
+        for &c in &top {
+            let Some((name, true)) = cfb.entry_info(c).map(|(n, s)| (n.to_string(), s)) else {
+                continue;
+            };
+            if !name.starts_with("__recip_version1.0_#") {
+                continue;
+            }
+            let inside = cfb.children_of(c);
+            let r = msg_read_props(&mut cfb, &inside, 8);
+            let rt = |p: u16| r.strings.get(&p).map(String::as_str);
+            let address = rt(0x39FE).or_else(|| {
+                let a = rt(0x3003)?;
+                (rt(0x3002).is_some_and(|k| k.eq_ignore_ascii_case("SMTP")) || a.contains('@'))
+                    .then_some(a)
+            });
+            let Some(mailbox) = msg_mailbox(rt(0x3001), address) else {
+                continue;
+            };
+            match r.ints.get(&0x0C15) {
+                Some(2) => cc.push(mailbox),
+                Some(3) => bcc.push(mailbox),
+                _ => to.push(mailbox),
+            }
+        }
+        let mut out = String::new();
+        let header = |out: &mut String, key: &str, value: &str| {
+            // A header value is one line.
+            let value: String = value
+                .chars()
+                .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+                .collect();
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(value.trim());
+            out.push_str("\r\n");
+        };
+        if let Some(f) = &from {
+            header(&mut out, "From", f);
+        }
+        for (key, list) in [("To", &to), ("Cc", &cc), ("Bcc", &bcc)] {
+            if !list.is_empty() {
+                header(&mut out, key, &list.join(", "));
+            }
+        }
+        if let Some(subject) = text(0x0037) {
+            header(&mut out, "Subject", subject);
+        }
+        if let Some(date) = msg.times.get(&0x0039).and_then(|t| msg_filetime_date(*t)) {
+            header(&mut out, "Date", &date);
+        }
+        if let Some(id) = text(0x1035) {
+            header(&mut out, "Message-ID", id);
+        }
+        if let Some(id) = text(0x1042) {
+            header(&mut out, "In-Reply-To", id);
+        }
+        let (body, html) = match (text(0x1000), text(0x1013)) {
+            (Some(b), _) => (b, false),
+            (None, Some(h)) => (h, true),
+            (None, None) => ("", false),
+        };
+        header(
+            &mut out,
+            "Content-Type",
+            if html {
+                "text/html; charset=utf-8"
+            } else {
+                "text/plain; charset=utf-8"
+            },
+        );
+        out.push_str("\r\n");
+        // Lines the body already ends with are not doubled.
+        out.push_str(&body.replace("\r\n", "\n").replace('\n', "\r\n"));
+        out.push_str("\r\n");
+        Ok(out.into_bytes())
     }
 } // mod xlsx_support
 
@@ -102802,6 +103136,74 @@ fn normalize_text_bytes(
     Ok(Some(tmp))
 }
 
+/// The lower-cased extension of a path, or an empty string.
+fn lowercase_extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Rewrites one mail message (`.eml`, or an Outlook `.msg`) as an mbox of
+/// one message: an envelope line, then the message with every line that
+/// reads as an envelope (`From `, after any number of `>`) quoted with one
+/// more `>` (mboxrd), which the mailbox reader takes back.
+fn convert_message_to_mbox(src: &Path, ext: &str) -> Result<TempFile> {
+    use std::io::{BufRead, Write};
+
+    let mut tmp = TempFile::new()?;
+    let mut out = std::io::BufWriter::with_capacity(64 * 1024, tmp.as_file_mut());
+    out.write_all(b"From sniff-rs@localhost Thu Jan  1 00:00:00 1970\n")?;
+    let mut copy = |mut input: Box<dyn BufRead>| -> Result<()> {
+        let mut line = Vec::new();
+        let mut last_newline = true;
+        loop {
+            line.clear();
+            if input
+                .read_until(b'\n', &mut line)
+                .with_context(|| format!("failed to read {src:?}"))?
+                == 0
+            {
+                break;
+            }
+            // mboxrd: every line that is `From ` after any number of `>`.
+            let quoted = line.iter().take_while(|b| **b == b'>').count();
+            if line[quoted..].starts_with(b"From ") {
+                out.write_all(b">")?;
+            }
+            out.write_all(&line)?;
+            last_newline = line.ends_with(b"\n");
+        }
+        if !last_newline {
+            out.write_all(b"\n")?;
+        }
+        Ok(())
+    };
+    if ext == "msg" {
+        #[cfg(feature = "xlsx")]
+        {
+            let bytes = xlsx_support::msg_to_rfc822(src)?;
+            copy(Box::new(std::io::Cursor::new(bytes)))?;
+        }
+        #[cfg(not(feature = "xlsx"))]
+        bail!(
+            "{src:?} is an Outlook .msg file, which needs --features xlsx (it is an OLE2 container)"
+        );
+    } else {
+        let file = fs::File::open(src).with_context(|| format!("failed to open {src:?}"))?;
+        copy(Box::new(std::io::BufReader::with_capacity(
+            STREAM_CHUNK_SIZE,
+            file,
+        )))?;
+    }
+    // The blank line an mbox puts after every message, so the body reads
+    // as it would from a mailbox written by any other tool.
+    out.write_all(b"\n")?;
+    out.flush()?;
+    drop(out);
+    Ok(tmp)
+}
+
 /// What `try_detect_and_normalize` yields: the format, the path to
 /// actually read (the original, or a UTF-8 temporary copy), and that
 /// copy's guard.
@@ -102824,6 +103226,15 @@ fn try_detect_and_normalize(
 ) -> Result<std::result::Result<DetectedInput, Error>> {
     match detect_format(read_path, logical_path, format_override) {
         Ok(format) => {
+            // An `.eml` or `.msg` is one message: read it as an mbox of one.
+            if matches!(format, InputFormat::Mbox)
+                && let ext = lowercase_extension(logical_path)
+                && (ext == "eml" || ext == "msg")
+            {
+                let converted = convert_message_to_mbox(read_path, &ext)?;
+                let path = converted.path().to_path_buf();
+                return Ok(Ok((format, path, Some(converted))));
+            }
             let tmp = if is_text_format(&format) {
                 let encoding = encoding.or_else(|| declared_text_encoding(&format, read_path));
                 normalize_text_bytes(read_path, encoding, reader_skips_utf8_bom(&format))?
@@ -103493,6 +103904,15 @@ fn declared_text_encoding(format: &InputFormat, path: &Path) -> Option<TextEncod
 }
 
 /// Whether a file begins with the HDF5 signature.
+/// Whether the file begins with the OLE2 / Compound File signature.
+fn is_ole2_file(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    matches!(
+        fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head)),
+        Ok(())
+    ) && head == [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]
+}
+
 fn file_starts_with_hdf5_signature(path: &Path) -> bool {
     let mut head = [0u8; 8];
     matches!(
@@ -118566,7 +118986,12 @@ mod knowledge_graph {
             }
         };
         if let Some((format, read_path, _text_tmp)) = detected {
-            file.file_type = format.as_str().to_string();
+            file.file_type =
+                if matches!(format, InputFormat::Mbox) && (ext == "eml" || ext == "msg") {
+                    ext.clone()
+                } else {
+                    format.as_str().to_string()
+                };
             file.fixed_schema = has_fixed_schema(&format);
             let args = graph_args(path, opts.samples);
             let _scan = ScanGuard::new(Some(known.clone()));
