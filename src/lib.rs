@@ -85084,7 +85084,8 @@ fn sniff_format(path: &Path) -> Option<InputFormat> {
         idx += 1;
     }
     if let Some(&first) = head.get(idx) {
-        if first == b'{' || first == b'[' {
+        // `{\rtf1` opens a Rich Text Format document, not a JSON object.
+        if (first == b'{' || first == b'[') && !head[idx..].starts_with(b"{\\rtf") {
             return Some(InputFormat::Json);
         }
         // An HTML page: a doctype or an `<html>` root. (An XHTML page opens
@@ -113062,7 +113063,7 @@ mod code_facts {
         "tif", "tiff", "bmp", "webp", "mp3", "mp4", "wav", "docx", "pptx", "rtf", "tex", "bib",
         "fasta", "fa", "fastq", "vcf", "bed", "gff", "sam", "bam", "xpt", "sas7bdat", "zst", "tar",
         "mbox", "eml", "ics", "vcf", "har", "plist", "msgpack", "cbor", "bson", "env", "cfg",
-        "conf",
+        "conf", "msg", "odt", "odp", "epub",
     ];
 
     /// Whether a string reads as a path to a file: no URL scheme, a final
@@ -115720,6 +115721,15 @@ mod people_facts_tests {
         eprintln!("checked {checked}");
         assert!(bad.is_empty(), "differ:\n{}", bad.join("\n"));
     }
+}
+
+/// The text the knowledge graph reads from a Word, PowerPoint, OpenDocument,
+/// EPUB or RTF document: one string per paragraph. Exists for
+/// `examples/doc_text.rs` and `tools/check_doc_text.py`; not a supported
+/// interface.
+#[doc(hidden)]
+pub fn graph_document_text(path: &Path) -> Option<Vec<String>> {
+    knowledge_graph::document_text(path)
 }
 
 // --- SQL schema (DDL) reading, for the knowledge graph ---
@@ -119526,6 +119536,7 @@ mod knowledge_graph {
             raw = image_meta::read(path);
         } else {
             raw.extend(package_metadata(path, ext));
+            raw.extend(doc_text::properties(path, ext));
         }
         let mut out: Vec<(String, String)> = Vec::new();
         for (k, v) in raw {
@@ -120168,6 +120179,830 @@ mod knowledge_graph {
         file
     }
 
+    // --- Text of documents the graph reads (RTF, OpenDocument, EPUB) ---
+    //
+    // These are not formats sniff-rs profiles as data; the graph reads their
+    // text for identifiers, links and similar wording, and their properties for
+    // the author. Each reader returns the text as lines (a paragraph each) and
+    // leaves out anything that is not words a person wrote.
+    mod doc_text {
+        use super::*;
+
+        /// What a document says: its paragraphs, and who wrote it.
+        #[derive(Default, Debug, PartialEq)]
+        pub(crate) struct DocText {
+            pub lines: Vec<String>,
+            /// `("author", name)`, `("organization", name)`.
+            pub meta: Vec<(String, String)>,
+        }
+
+        /// Most bytes of a document read.
+        const MAX_DOCUMENT_BYTES: u64 = 256 * 1024 * 1024;
+
+        // ---------------------------------------------------------------- RTF
+
+        #[derive(Clone)]
+        struct RtfGroup {
+            /// Text in this group is not document text (a font table, a
+            /// picture, an unknown `{\*...}` destination).
+            skip: bool,
+            /// Characters to drop after a `\uN` (`\ucN`, default 1).
+            uc: usize,
+            /// Where this group's text goes instead of the document.
+            sink: Sink,
+        }
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Sink {
+            Body,
+            /// Field instruction text (`HYPERLINK "url"`).
+            Field,
+            /// An `\info` property: author, company, operator.
+            Info(&'static str),
+        }
+
+        fn rtf_codepage(n: u32) -> &'static str {
+            match n {
+                437 => "CP437",
+                737 => "CP737",
+                775 => "CP775",
+                850 => "CP850",
+                852 => "CP852",
+                855 => "CP855",
+                857 => "CP857",
+                858 => "CP858",
+                860 => "CP860",
+                861 => "CP861",
+                862 => "CP862",
+                863 => "CP863",
+                864 => "CP864",
+                865 => "CP865",
+                866 => "CP866",
+                869 => "CP869",
+                874 => "WINDOWS-874",
+                1250 => "WINDOWS-1250",
+                1251 => "WINDOWS-1251",
+                1253 => "WINDOWS-1253",
+                1254 => "WINDOWS-1254",
+                1255 => "WINDOWS-1255",
+                1256 => "WINDOWS-1256",
+                1257 => "WINDOWS-1257",
+                1258 => "WINDOWS-1258",
+                10000 => "MACINTOSH",
+                _ => "WINDOWS-1252",
+            }
+        }
+
+        /// The text of an RTF document: one line per paragraph, with
+        /// hyperlink targets as lines of their own and the properties of the
+        /// `\info` group. `None` when the file is not RTF.
+        pub(crate) fn rtf(path: &Path) -> Option<DocText> {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::open(path)
+                .ok()?
+                .take(MAX_DOCUMENT_BYTES)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            rtf_bytes(&bytes)
+        }
+
+        pub(crate) fn rtf_bytes(b: &[u8]) -> Option<DocText> {
+            if !b.starts_with(b"{\\rtf") {
+                return None;
+            }
+            let mut out = DocText::default();
+            let mut stack: Vec<RtfGroup> = Vec::new();
+            let mut cur = RtfGroup {
+                skip: false,
+                uc: 1,
+                sink: Sink::Body,
+            };
+            let mut codepage = "WINDOWS-1252";
+            let mut para = String::new();
+            let mut field = String::new();
+            let mut info = String::new();
+            let mut high_surrogate: Option<u16> = None;
+            let mut links: Vec<String> = Vec::new();
+            let mut skip_chars = 0usize;
+            let mut i = 0usize;
+            let hex = |c: u8| (c as char).to_digit(16);
+            let flush = |para: &mut String, out: &mut DocText| {
+                let t = para.trim();
+                if !t.is_empty() {
+                    out.lines.push(t.to_string());
+                }
+                para.clear();
+            };
+            // Text goes to the group's sink.
+            macro_rules! put {
+                ($s:expr) => {{
+                    match cur.sink {
+                        Sink::Body if !cur.skip => para.push_str($s),
+                        Sink::Field => field.push_str($s),
+                        Sink::Info(_) => info.push_str($s),
+                        _ => {}
+                    }
+                }};
+            }
+            while i < b.len() {
+                let c = b[i];
+                match c {
+                    b'{' => {
+                        stack.push(cur.clone());
+                        i += 1;
+                    }
+                    b'}' => {
+                        // A closing group hands its collected text over.
+                        match cur.sink {
+                            Sink::Field => {
+                                let inst = field.trim();
+                                if let Some(rest) = inst
+                                    .strip_prefix("HYPERLINK")
+                                    .or_else(|| inst.strip_prefix("hyperlink"))
+                                {
+                                    let url = rest
+                                        .trim()
+                                        .trim_start_matches("\\l")
+                                        .trim()
+                                        .trim_matches('"');
+                                    if !url.is_empty() {
+                                        links.push(url.to_string());
+                                    }
+                                }
+                                field.clear();
+                            }
+                            Sink::Info(kind) => {
+                                let v = info.trim();
+                                if !v.is_empty() {
+                                    out.meta.push((kind.to_string(), v.to_string()));
+                                }
+                                info.clear();
+                            }
+                            Sink::Body => {}
+                        }
+                        cur = stack.pop().unwrap_or(RtfGroup {
+                            skip: false,
+                            uc: 1,
+                            sink: Sink::Body,
+                        });
+                        i += 1;
+                    }
+                    b'\\' => {
+                        i += 1;
+                        let Some(&n) = b.get(i) else { break };
+                        match n {
+                            b'\\' | b'{' | b'}' => {
+                                if skip_chars > 0 {
+                                    skip_chars -= 1;
+                                } else {
+                                    put!(std::str::from_utf8(&[n]).unwrap_or(""));
+                                }
+                                i += 1;
+                            }
+                            b'\n' | b'\r' => {
+                                if cur.sink == Sink::Body && !cur.skip {
+                                    flush(&mut para, &mut out);
+                                }
+                                i += 1;
+                            }
+                            b'~' => {
+                                put!(" ");
+                                i += 1;
+                            }
+                            b'_' => {
+                                put!("-");
+                                i += 1;
+                            }
+                            b'-' | b'|' | b':' => i += 1,
+                            b'*' => {
+                                // An ignorable destination: skipped unless it is
+                                // one we read (`\*\fldinst`).
+                                i += 1;
+                                let rest = &b[i..];
+                                if !rest.starts_with(b"\\fldinst")
+                                    && !rest.starts_with(b"\\footnote")
+                                {
+                                    cur.skip = true;
+                                }
+                            }
+                            b'\'' => {
+                                let (Some(h), Some(l)) = (
+                                    b.get(i + 1).copied().and_then(hex),
+                                    b.get(i + 2).copied().and_then(hex),
+                                ) else {
+                                    i += 1;
+                                    continue;
+                                };
+                                i += 3;
+                                if skip_chars > 0 {
+                                    skip_chars -= 1;
+                                    continue;
+                                }
+                                let byte = (h * 16 + l) as u8;
+                                let table = codepage_support::table(codepage);
+                                let s = match table {
+                                    Some(t) => codepage_support::decode(t, &[byte]),
+                                    None => String::from_utf8_lossy(&[byte]).into_owned(),
+                                };
+                                put!(&s);
+                            }
+                            n if n.is_ascii_alphabetic() => {
+                                let start = i;
+                                while i < b.len() && b[i].is_ascii_alphabetic() {
+                                    i += 1;
+                                }
+                                let word = std::str::from_utf8(&b[start..i]).unwrap_or("");
+                                // An optional signed parameter.
+                                let (mut neg, mut num, mut has_num) = (false, 0i64, false);
+                                if b.get(i) == Some(&b'-') {
+                                    neg = true;
+                                    i += 1;
+                                }
+                                while let Some(d) = b.get(i).filter(|d| d.is_ascii_digit()) {
+                                    num = (num * 10 + i64::from(d - b'0')).min(1 << 40);
+                                    has_num = true;
+                                    i += 1;
+                                }
+                                if !has_num && neg {
+                                    // A lone `-` after the word is text.
+                                    i -= 1;
+                                }
+                                if neg {
+                                    num = -num;
+                                }
+                                // One space ends the word.
+                                if b.get(i) == Some(&b' ') {
+                                    i += 1;
+                                }
+                                match word {
+                                    "ansicpg" if has_num => {
+                                        codepage = rtf_codepage(num as u32);
+                                    }
+                                    "uc" if has_num => cur.uc = num.max(0) as usize,
+                                    "u" if has_num => {
+                                        let unit = (num as i32).rem_euclid(65536) as u16;
+                                        if (0xD800..0xDC00).contains(&unit) {
+                                            high_surrogate = Some(unit);
+                                        } else {
+                                            let ch = match high_surrogate.take() {
+                                                Some(h) if (0xDC00..0xE000).contains(&unit) => {
+                                                    char::decode_utf16([h, unit])
+                                                        .next()
+                                                        .and_then(|r| r.ok())
+                                                }
+                                                _ => char::from_u32(u32::from(unit)),
+                                            };
+                                            let ch = ch.unwrap_or('\u{FFFD}');
+                                            let mut buf = [0u8; 4];
+                                            put!(ch.encode_utf8(&mut buf));
+                                        }
+                                        skip_chars = cur.uc;
+                                    }
+                                    "par" | "sect" | "page" | "row" => {
+                                        if cur.sink == Sink::Body && !cur.skip {
+                                            flush(&mut para, &mut out);
+                                        }
+                                    }
+                                    "line" | "cell" | "nestcell" => put!(" "),
+                                    "tab" => put!("\t"),
+                                    "emdash" => put!("\u{2014}"),
+                                    "endash" => put!("\u{2013}"),
+                                    "lquote" => put!("\u{2018}"),
+                                    "rquote" => put!("\u{2019}"),
+                                    "ldblquote" => put!("\u{201C}"),
+                                    "rdblquote" => put!("\u{201D}"),
+                                    "bullet" => put!("\u{2022}"),
+                                    "emspace" | "enspace" | "qmspace" => put!(" "),
+                                    "fonttbl" | "colortbl" | "stylesheet" | "listtable"
+                                    | "listoverridetable" | "pict" | "themedata"
+                                    | "colorschememapping" | "datastore" | "latentstyles"
+                                    | "rsidtbl" | "generator" | "xmlnstbl" | "filetbl"
+                                    | "revtbl" | "template" | "mmathPr" | "pgptbl"
+                                    | "protusertbl" | "userprops" | "falt" | "panose"
+                                    | "private" | "bkmkstart" | "bkmkend" | "objdata"
+                                    | "blipuid" | "listtext" | "pntext" | "pnseclvl" | "ftnsep"
+                                    | "ftnsepc" | "aftnsep" | "aftnsepc" => cur.skip = true,
+                                    "bin" if has_num => i = (i + num.max(0) as usize).min(b.len()),
+                                    "fldinst" => {
+                                        cur.sink = Sink::Field;
+                                        cur.skip = false;
+                                        field.clear();
+                                    }
+                                    "author" | "manager" | "operator" if cur.sink == Sink::Body => {
+                                        cur.sink = Sink::Info("author");
+                                        cur.skip = false;
+                                        info.clear();
+                                    }
+                                    "company" if cur.sink == Sink::Body => {
+                                        cur.sink = Sink::Info("organization");
+                                        cur.skip = false;
+                                        info.clear();
+                                    }
+                                    "title" | "subject" | "keywords" | "comment" | "doccomm"
+                                    | "category" | "hlinkbase" | "buptim" | "creatim"
+                                    | "revtim" | "printim" => {
+                                        // Properties we don't keep and don't
+                                        // want mixed into the text.
+                                        cur.skip = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => i += 1,
+                        }
+                    }
+                    b'\r' | b'\n' => i += 1,
+                    _ => {
+                        // A run of plain characters.
+                        let start = i;
+                        while i < b.len() && !matches!(b[i], b'{' | b'}' | b'\\' | b'\r' | b'\n') {
+                            i += 1;
+                        }
+                        let mut run = &b[start..i];
+                        if skip_chars > 0 {
+                            let drop = skip_chars.min(run.len());
+                            run = &run[drop..];
+                            skip_chars -= drop;
+                        }
+                        if run.is_empty() {
+                            continue;
+                        }
+                        let s = if run.is_ascii() {
+                            String::from_utf8_lossy(run).into_owned()
+                        } else {
+                            match codepage_support::table(codepage) {
+                                Some(t) => codepage_support::decode(t, run),
+                                None => String::from_utf8_lossy(run).into_owned(),
+                            }
+                        };
+                        put!(&s);
+                    }
+                }
+            }
+            flush(&mut para, &mut out);
+            out.lines.extend(links);
+            Some(out)
+        }
+
+        // ------------------------------------------------------- OpenDocument
+
+        /// Text of an OpenDocument text, presentation or drawing (`.odt`,
+        /// `.odp`, `.odg` and their templates): `content.xml`'s paragraphs and
+        /// headings in order, with each hyperlink target as a line of its own.
+        /// A spreadsheet is data, not text, so it is not read here.
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        pub(crate) fn odf(path: &Path) -> Option<DocText> {
+            let mut zip = zip_support::ZipArchive::open(path).ok()?;
+            let mime = zip.read("mimetype").ok()?;
+            let mime = String::from_utf8_lossy(&mime);
+            if !mime.starts_with("application/vnd.oasis.opendocument.")
+                || mime.contains("spreadsheet")
+            {
+                return None;
+            }
+            let xml = zip.read("content.xml").ok()?;
+            Some(DocText {
+                lines: odf_paragraphs(&String::from_utf8_lossy(&xml)),
+                meta: Vec::new(),
+            })
+        }
+
+        /// An attribute's value in the text of one tag.
+        fn attr(tag: &str, name: &str) -> Option<String> {
+            let mut from = 0;
+            while let Some(at) = tag[from..].find(name) {
+                let at = from + at;
+                let before_ok = at == 0 || tag.as_bytes()[at - 1].is_ascii_whitespace();
+                let rest = &tag[at + name.len()..];
+                if before_ok && let Some(rest) = rest.strip_prefix('=') {
+                    let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+                    let rest = &rest[1..];
+                    let end = rest.find(q)?;
+                    return Some(xml_unescape_text(&rest[..end]));
+                }
+                from = at + name.len();
+            }
+            None
+        }
+
+        pub(crate) fn odf_paragraphs(xml: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut links = Vec::new();
+            let mut para = String::new();
+            let mut depth = 0usize;
+            let mut in_citation = false;
+            let mut i = 0usize;
+            let flush = |para: &mut String, out: &mut Vec<String>| {
+                let t = para.trim();
+                if !t.is_empty() {
+                    out.push(t.to_string());
+                }
+                para.clear();
+            };
+            while i < xml.len() {
+                let Some(lt) = xml[i..].find('<') else {
+                    break;
+                };
+                if depth > 0 && lt > 0 && !in_citation {
+                    para.push_str(&xml_unescape_text(&xml[i..i + lt]));
+                }
+                i += lt;
+                if xml[i..].starts_with("<!--") {
+                    i = xml[i..].find("-->").map_or(xml.len(), |e| i + e + 3);
+                    continue;
+                }
+                if xml[i..].starts_with("<![CDATA[") {
+                    let end = xml[i..].find("]]>").map_or(xml.len(), |e| i + e);
+                    if depth > 0 {
+                        para.push_str(&xml[i + 9..end]);
+                    }
+                    i = (end + 3).min(xml.len());
+                    continue;
+                }
+                let Some(gt) = xml[i..].find('>') else {
+                    break;
+                };
+                let tag = &xml[i + 1..i + gt];
+                i += gt + 1;
+                let closing = tag.starts_with('/');
+                let self_closing = tag.ends_with('/');
+                // The name: after a closing `/`, up to a space or `/`.
+                let bare = tag.strip_prefix('/').unwrap_or(tag);
+                let name = &bare[..bare
+                    .find(|c: char| c.is_whitespace() || c == '/')
+                    .unwrap_or(bare.len())];
+                match name {
+                    "text:p" | "text:h" => {
+                        if closing {
+                            flush(&mut para, &mut out);
+                            depth = depth.saturating_sub(1);
+                        } else if !self_closing {
+                            flush(&mut para, &mut out);
+                            depth += 1;
+                        }
+                    }
+                    "text:note-citation" => in_citation = !closing,
+                    "text:tab" if depth > 0 => para.push(' '),
+                    "text:line-break" if depth > 0 => para.push(' '),
+                    "text:s" if depth > 0 => {
+                        let n = attr(tag, "text:c")
+                            .and_then(|c| c.parse::<usize>().ok())
+                            .unwrap_or(1);
+                        para.extend(std::iter::repeat_n(' ', n.min(100)));
+                    }
+                    "text:a" if !closing => {
+                        if let Some(href) = attr(tag, "xlink:href")
+                            && !href.starts_with('#')
+                        {
+                            links.push(href);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            flush(&mut para, &mut out);
+            out.extend(links);
+            out
+        }
+
+        // --------------------------------------------------------------- EPUB
+
+        /// Text of an EPUB: the spine's XHTML documents in reading order,
+        /// markup removed, with link targets as lines of their own, and the
+        /// package's `dc:creator` and `dc:publisher`.
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        pub(crate) fn epub(path: &Path) -> Option<DocText> {
+            let mut zip = zip_support::ZipArchive::open(path).ok()?;
+            let read = |zip: &mut zip_support::ZipArchive, name: &str| -> Option<String> {
+                zip.read(name)
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            };
+            let mime = read(&mut zip, "mimetype")?;
+            if !mime.trim().starts_with("application/epub+zip") {
+                return None;
+            }
+            let container = read(&mut zip, "META-INF/container.xml")?;
+            let opf_path = container
+                .split('<')
+                .filter(|t| t.starts_with("rootfile"))
+                .find_map(|t| attr(t, "full-path"))?;
+            let opf = read(&mut zip, &opf_path)?;
+            let base = opf_path.rsplit_once('/').map_or("", |(d, _)| d);
+            let join = |href: &str| -> String {
+                let href = href.split('#').next().unwrap_or(href);
+                let decoded = percent_decode(href);
+                let mut parts: Vec<&str> = if base.is_empty() {
+                    Vec::new()
+                } else {
+                    base.split('/').collect()
+                };
+                for seg in decoded.split('/') {
+                    match seg {
+                        ".." => {
+                            parts.pop();
+                        }
+                        "." | "" => {}
+                        s => parts.push(s),
+                    }
+                }
+                parts.join("/")
+            };
+            // manifest id -> (href, media type)
+            let mut manifest: Vec<(String, String, String)> = Vec::new();
+            let mut spine: Vec<String> = Vec::new();
+            for t in opf.split('<') {
+                if t.starts_with("item ") || t.starts_with("item\n") {
+                    if let (Some(id), Some(href)) = (attr(t, "id"), attr(t, "href")) {
+                        manifest.push((id, href, attr(t, "media-type").unwrap_or_default()));
+                    }
+                } else if t.starts_with("itemref")
+                    && let Some(idref) = attr(t, "idref")
+                {
+                    spine.push(idref);
+                }
+            }
+            let mut names: Vec<String> = spine
+                .iter()
+                .filter_map(|id| manifest.iter().find(|m| &m.0 == id))
+                .filter(|m| m.2.contains("html") || m.2.is_empty())
+                .map(|m| join(&m.1))
+                .collect();
+            if names.is_empty() {
+                names = zip
+                    .names()
+                    .filter(|n| {
+                        n.ends_with(".xhtml") || n.ends_with(".html") || n.ends_with(".htm")
+                    })
+                    .map(str::to_string)
+                    .collect();
+                names.sort();
+            }
+            let mut lines = Vec::new();
+            for name in names {
+                if let Some(html) = read(&mut zip, &name) {
+                    lines.extend(html_lines(&html));
+                }
+            }
+            let mut meta = Vec::new();
+            for (tag, kind) in [("dc:creator", "author"), ("dc:publisher", "organization")] {
+                for part in opf.split(&format!("<{tag}")).skip(1) {
+                    let Some(open_end) = part.find('>') else {
+                        continue;
+                    };
+                    if part[..open_end].ends_with('/')
+                        || !part
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_whitespace() || c == '>')
+                    {
+                        continue;
+                    }
+                    if let Some(close) = part[open_end..].find('<') {
+                        let v = xml_unescape_text(&part[open_end + 1..open_end + close]);
+                        let v = v.trim();
+                        if !v.is_empty() {
+                            meta.push((kind.to_string(), v.to_string()));
+                        }
+                    }
+                }
+            }
+            Some(DocText { lines, meta })
+        }
+
+        fn percent_decode(s: &str) -> String {
+            let b = s.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%'
+                    && i + 2 < b.len() + 0
+                    && let (Some(h), Some(l)) = (
+                        (b[i + 1] as char).to_digit(16),
+                        (b[i + 2] as char).to_digit(16),
+                    )
+                {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                } else {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        /// The text of an (X)HTML document: block elements end a line, scripts
+        /// and styles are dropped, and `href` targets that leave the document
+        /// become lines of their own.
+        pub(crate) fn html_lines(html: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut links = Vec::new();
+            let mut line = String::new();
+            let mut skip_until: Option<&'static str> = None;
+            let mut i = 0usize;
+            let body_start = html
+                .find("<body")
+                .or_else(|| html.find("<BODY"))
+                .unwrap_or(0);
+            let html = &html[body_start..];
+            let flush = |line: &mut String, out: &mut Vec<String>| {
+                let t: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !t.is_empty() {
+                    out.push(t);
+                }
+                line.clear();
+            };
+            while i < html.len() {
+                let Some(lt) = html[i..].find('<') else {
+                    if skip_until.is_none() {
+                        line.push_str(&xml_unescape_text(&html[i..]));
+                    }
+                    break;
+                };
+                if skip_until.is_none() && lt > 0 {
+                    line.push_str(&xml_unescape_text(&html[i..i + lt]));
+                }
+                i += lt;
+                if html[i..].starts_with("<!--") {
+                    i = html[i..].find("-->").map_or(html.len(), |e| i + e + 3);
+                    continue;
+                }
+                let Some(gt) = html[i..].find('>') else {
+                    break;
+                };
+                let tag = &html[i + 1..i + gt];
+                i += gt + 1;
+                let closing = tag.starts_with('/');
+                let bare = tag.strip_prefix('/').unwrap_or(tag);
+                let name = bare[..bare
+                    .find(|c: char| c.is_whitespace() || c == '/')
+                    .unwrap_or(bare.len())]
+                    .to_ascii_lowercase();
+                let name = name.rsplit(':').next().unwrap_or("").to_string();
+                if let Some(end) = skip_until {
+                    if closing && name == end {
+                        skip_until = None;
+                    }
+                    continue;
+                }
+                match name.as_str() {
+                    "script" if !closing => skip_until = Some("script"),
+                    "style" if !closing => skip_until = Some("style"),
+                    "br" | "p" | "div" | "li" | "tr" | "td" | "th" | "h1" | "h2" | "h3" | "h4"
+                    | "h5" | "h6" | "blockquote" | "section" | "article" | "table" | "ul"
+                    | "ol" | "hr" | "pre" | "figure" | "figcaption" | "header" | "footer"
+                    | "dt" | "dd" => {
+                        flush(&mut line, &mut out);
+                    }
+                    "a" if !closing => {
+                        if let Some(href) = attr(tag, "href") {
+                            let lower = href.to_ascii_lowercase();
+                            if lower.starts_with("http://")
+                                || lower.starts_with("https://")
+                                || lower.starts_with("mailto:")
+                                || lower.starts_with("ftp://")
+                            {
+                                links.push(href);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            flush(&mut line, &mut out);
+            out.extend(links);
+            out
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn rtf_lines(rtf: &str) -> Vec<String> {
+                rtf_bytes(rtf.as_bytes()).expect("rtf").lines
+            }
+
+            #[test]
+            fn rtf_escapes_unicode_and_code_pages() {
+                // A surrogate pair is one character; `\uc1` drops the fallback.
+                assert_eq!(
+                    rtf_lines(
+                        r"{\rtf1\ansi\ansicpg1252\uc1 caf\'e9 \u55357?\u56832? \u8217?s\par}"
+                    ),
+                    ["café 😀 ’s"]
+                );
+                // The code page decides what a high byte is.
+                assert_eq!(
+                    rtf_lines(r"{\rtf1\ansi\ansicpg1251 \'cf\'f0\'e8\par}"),
+                    ["При"]
+                );
+                // `\uc0` has no fallback character to drop.
+                assert_eq!(rtf_lines(r"{\rtf1\uc0 \u233 e\par}"), ["ée"]);
+            }
+
+            #[test]
+            fn rtf_skips_what_is_not_text() {
+                let rtf = r"{\rtf1{\fonttbl{\f0 Arial;}}{\*\generator X;}{\stylesheet{\s0 Normal;}}\pard Hello{\pict\bin3 }}}}world\par}";
+                assert_eq!(rtf_lines(rtf), ["Helloworld"]);
+                assert!(rtf_bytes(b"not rtf").is_none());
+            }
+
+            #[test]
+            fn rtf_collects_hyperlinks_and_properties() {
+                let d = rtf_bytes(
+                    br#"{\rtf1{\info{\author Jane Smith}{\company Acme}}{\field{\*\fldinst HYPERLINK "https://x.org/a"}{\fldrslt link text}} end\par}"#,
+                )
+                .unwrap();
+                assert_eq!(d.lines, ["link text end", "https://x.org/a"]);
+                assert_eq!(
+                    d.meta,
+                    [
+                        ("author".to_string(), "Jane Smith".to_string()),
+                        ("organization".to_string(), "Acme".to_string())
+                    ]
+                );
+            }
+
+            #[test]
+            fn rtf_survives_broken_input() {
+                for rtf in [
+                    r"{\rtf1 {{{{",
+                    r"{\rtf1 \",
+                    r"{\rtf1 \u",
+                    r"{\rtf1 \'",
+                    r"{\rtf1 \bin99999999999 x}",
+                    r"{\rtf1 }}}}",
+                ] {
+                    let _ = rtf_bytes(rtf.as_bytes());
+                }
+            }
+
+            #[test]
+            fn odf_paragraphs_in_order_with_spaces_tabs_and_links() {
+                let xml = "<office:text><text:p>a<text:s text:c=\"2\"/>b<text:tab/>c</text:p>\
+                    <text:h>Head &amp; <text:span>span</text:span></text:h>\
+                    <text:p><text:a xlink:href=\"https://x.org/\">l</text:a><text:note><text:note-citation>1</text:note-citation>\
+                    <text:note-body><text:p>note</text:p></text:note-body></text:note></text:p></office:text>";
+                assert_eq!(
+                    odf_paragraphs(xml),
+                    ["a  b c", "Head & span", "l", "note", "https://x.org/"]
+                );
+            }
+
+            #[test]
+            fn html_lines_drop_scripts_and_keep_block_breaks() {
+                let html = "<html><head><title>no</title></head><body><h1>Title</h1><script>var a = '<p>x</p>';</script>\
+                    <p>One <b>two</b><br/>three &amp; four</p><style>p { }</style><p><a href=\"https://x.org/q\">link</a> <a href=\"#top\">top</a></p></body></html>";
+                assert_eq!(
+                    html_lines(html),
+                    [
+                        "Title",
+                        "One two",
+                        "three & four",
+                        "link top",
+                        "https://x.org/q"
+                    ]
+                );
+            }
+
+            #[test]
+            fn the_word_style_rtf_fixture_reads_as_expected() {
+                let d = rtf(Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/edge_rtf_word_style.rtf"
+                )))
+                .unwrap();
+                assert_eq!(
+                    d.lines[0],
+                    "Café résumé –  em dash ’s apostrophe and 😀 emoji."
+                );
+                assert_eq!(d.lines[2], "after picture");
+                assert_eq!(d.lines[4], "cd");
+                assert_eq!(d.lines.last().unwrap(), "https://acme-corp.com/budget");
+                let authors: Vec<&str> = d
+                    .meta
+                    .iter()
+                    .filter(|(k, _)| k == "author")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                assert_eq!(authors, ["Jane Smith", "Tom Brown"]);
+            }
+        }
+
+        /// Author and organization of a document whose properties are not in
+        /// a zip package: RTF's `\info` group and an EPUB's package file.
+        pub(crate) fn properties(path: &Path, ext: &str) -> Vec<(String, String)> {
+            match ext {
+                "rtf" => rtf(path).map(|d| d.meta).unwrap_or_default(),
+                #[cfg(any(feature = "xlsx", feature = "npy"))]
+                "epub" => epub(path).map(|d| d.meta).unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+    }
+
     /// The text of an Office Open XML document or presentation (`.docx`,
     /// `.pptx`, and their macro-enabled and template variants), one
     /// string per paragraph, plus the targets of its external
@@ -120177,7 +121012,7 @@ mod knowledge_graph {
     /// PowerPoint: every slide and its speaker notes, in slide order.
     /// `None` for anything else, or a file that isn't a readable zip.
     #[cfg(any(feature = "xlsx", feature = "npy"))]
-    fn office_text(path: &Path, ext: &str) -> Option<Vec<String>> {
+    fn ooxml_text(path: &Path, ext: &str) -> Option<Vec<String>> {
         let word = matches!(ext, "docx" | "docm" | "dotx" | "dotm");
         let slides = matches!(ext, "pptx" | "pptm" | "potx" | "potm" | "ppsx");
         if !word && !slides {
@@ -120249,8 +121084,31 @@ mod knowledge_graph {
     }
 
     #[cfg(not(any(feature = "xlsx", feature = "npy")))]
-    fn office_text(_path: &Path, _ext: &str) -> Option<Vec<String>> {
+    fn ooxml_text(_path: &Path, _ext: &str) -> Option<Vec<String>> {
         None
+    }
+
+    /// What the graph reads of a document, for tools/check_doc_text.py.
+    pub(crate) fn document_text(path: &Path) -> Option<Vec<String>> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        office_text(path, &extension_of(&name))
+    }
+
+    /// The text of a document the graph reads without profiling: Word and
+    /// PowerPoint (OOXML), OpenDocument text, presentations and drawings,
+    /// EPUB and RTF. `None` for anything else.
+    fn office_text(path: &Path, ext: &str) -> Option<Vec<String>> {
+        match ext {
+            "rtf" => doc_text::rtf(path).map(|d| d.lines),
+            #[cfg(any(feature = "xlsx", feature = "npy"))]
+            "odt" | "odp" | "odg" | "ott" | "otp" | "otg" => doc_text::odf(path).map(|d| d.lines),
+            #[cfg(any(feature = "xlsx", feature = "npy"))]
+            "epub" => doc_text::epub(path).map(|d| d.lines),
+            _ => ooxml_text(path, ext),
+        }
     }
 
     #[cfg(any(feature = "xlsx", feature = "npy"))]

@@ -1,0 +1,28 @@
+From: "Jane Smith" <jane.smith@acme-corp.com>
+To: "Tom Brown" <tom@acme-corp.com>, pat@example.net
+Subject: Budget for Q3 =?utf-8?b?4oCTIHLDqXVuaW9u?=
+Date: Tue, 05 Mar 2024 10:00:00 +0000
+Message-ID: <budget-q3@acme-corp.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============0932653797848298655=="
+
+--===============0932653797848298655==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+Hi Tom,
+
+Please see the attached sheet.
+
+From the desk of Jane
+>From a quoted line
+
+--===============0932653797848298655==
+Content-Type: text/csv
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="budget.csv"
+MIME-Version: 1.0
+
+aWQsYW1vdW50CjEsMTAK
+
+--===============0932653797848298655==--
