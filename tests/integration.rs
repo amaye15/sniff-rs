@@ -20039,3 +20039,150 @@ fn graph_links_code_to_the_data_it_imports_reads_and_writes() {
                 && l["target"] == "web/lib/math.js")
     );
 }
+
+#[test]
+fn graph_columns_adds_column_nodes_for_what_tables_share_and_queries_use() {
+    let tmp = TempDir::new();
+    let input = format!(
+        "{}/tests/fixtures/edge_graph_columns",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let plain = graph_doc(&["graph", &input, "-", "--no-cache"]);
+    assert!(
+        !plain["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["type"] == "column"),
+        "column nodes are opt-in"
+    );
+    let doc = graph_doc(&["graph", &input, "-", "--no-cache", "--columns"]);
+    let columns: Vec<&str> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "column")
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    // Shared by two or more tables (or schema groups), or used by a query
+    // or a join; `id`, `name`, `status` and the like get none.
+    for want in [
+        "column:customer_id",
+        "column:amount",
+        "column:order_id",
+        "column:email",
+        "column:contact_email",
+        "column:placed",
+    ] {
+        assert!(columns.contains(&want), "{want} in {columns:?}");
+    }
+    for generic in ["column:id", "column:name", "column:status", "column:price"] {
+        assert!(
+            !columns.contains(&generic),
+            "{generic} is generic or unshared"
+        );
+    }
+    let node = |id: &str| {
+        doc["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == id)
+            .unwrap()
+    };
+    // Three identical invoice tables count once as a schema; the other
+    // three tables with the column make six tables, five of them integer.
+    let cid = node("column:customer_id");
+    assert_eq!(cid["tables"], 6);
+    assert_eq!(cid["drift"], true);
+    assert_eq!(cid["types"]["String"], 1);
+    assert_eq!(cid["types"]["i64"], 5);
+    let link = |relation: &str, from: &str, to: &str| -> Option<&serde_json::Value> {
+        doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["relation"] == relation && l["source"] == from && l["target"] == to)
+    };
+    let schema = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["type"] == "schema")
+        .expect("the invoices share a schema")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        link("has_column", &schema, "column:customer_id").is_some(),
+        "the group, once"
+    );
+    for table in ["orders.csv", "shipments.csv", "legacy_orders.csv"] {
+        assert!(
+            link("has_column", table, "column:customer_id").is_some(),
+            "{table}"
+        );
+    }
+    assert!(
+        !link("has_column", "invoices_2024.csv", "column:customer_id").is_some(),
+        "a schema group's members don't each link"
+    );
+    let drift = link("type_drift", "legacy_orders.csv", "column:customer_id").expect("drift");
+    assert!(
+        drift["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("String here, i64 in 5")
+    );
+    assert_eq!(
+        doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|l| l["relation"] == "type_drift")
+            .count(),
+        1
+    );
+    // The same thing under two names.
+    let same = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == "same_column")
+        .expect("customers.email and shipments.contact_email");
+    let ends = [
+        same["source"].as_str().unwrap(),
+        same["target"].as_str().unwrap(),
+    ];
+    assert!(
+        ends.contains(&"column:email") && ends.contains(&"column:contact_email"),
+        "{ends:?}"
+    );
+    // A query uses the columns of the tables it reads.
+    for used in ["customer_id", "amount", "placed", "cust_id", "region"] {
+        let l = link("uses_column", "report.sql", &format!("column:{used}"))
+            .unwrap_or_else(|| panic!("report.sql uses {used}"));
+        assert_eq!(l["directed"], true);
+    }
+    // The settings file can ask for it, and a second run is the same graph.
+    let data = tmp.path().join("copy");
+    std::fs::create_dir_all(&data).unwrap();
+    for f in ["orders.csv", "shipments.csv", "legacy_orders.csv"] {
+        std::fs::copy(format!("{input}/{f}"), data.join(f)).unwrap();
+    }
+    std::fs::write(
+        data.join(".sniff-rs.json"),
+        r#"{"graph": {"columns": true}}"#,
+    )
+    .unwrap();
+    let via_config = graph_doc(&["graph", data.to_str().unwrap(), "-", "--no-cache"]);
+    assert!(
+        via_config["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == "column:customer_id")
+    );
+    let again = graph_doc(&["graph", &input, "-", "--no-cache", "--columns"]);
+    assert_eq!(doc, again, "the same input gives the same graph");
+}

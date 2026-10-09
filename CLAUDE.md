@@ -18626,6 +18626,72 @@ names only its last part. Table names resolve by their last part, so
 `schema.orders` and `other.orders` both mean a table `orders`. A program that
 reads a name through a wrapper (`load(name)`) is not a read.
 
+### Phase 3: column nodes (`--columns`)
+
+Joins link tables; they do not say which *column* ties them, which tables
+hold `customer_id`, or that one of them holds it as text. `sniff-rs graph
+--columns` (or `columns = true` under `[graph]` in the config file) adds a
+node per column that two or more tables share, that a join matches under
+two names, or that a query uses. Off by default: it adds a few hundred
+nodes and a few thousand links to a large input, and without the flag the
+graph is byte-identical to before (checked on the fixture tree and the
+1,340-file corpus).
+
+A column is named by `canon_name` (`CustomerID`, `customer id` and
+`customer_id` are one node `column:customer_id`; its label is the most used
+spelling). Generic names get no node: surrogate ids (`id`, `index`, `pk`),
+positional names (`col_3`, `unnamed_0`), and the attributes nearly every
+table has (`name`, `date`, `status`, `created_at`, `description`, ...,
+`generic_column`). A name in more than 200 tables is dropped as noise.
+
+- **`has_column`** (directed, structural, weight 0.5): a table to the column.
+  Tables of a near-duplicate schema group (`has_schema`) that all have the
+  column link once, from the schema node, so twelve monthly exports are one
+  holder, not twelve.
+- **`type_drift`** (directed, derived: left out of degree counts): a table
+  whose type for the column differs from the one most other tables have
+  ("`customer_id` is String here, i64 in 5 other tables"). A category column
+  and a `mixed(...)` one vote for nothing; a tie makes no link (the node
+  carries `drift: true` and a `types` count either way).
+- **`same_column`**: two column nodes a join matched under different names -
+  a value-overlap or foreign-key-naming join (`customers.email` and
+  `shipments.contact_email`) or a declared SQLite foreign key between
+  differently named columns. Evidence is the join's.
+- **`uses_column`** (directed, INFERRED): a SQL file, or code holding SQL
+  strings, to a column of a table it reads or writes that its SQL names
+  (`code_facts` keeps the SQL's possible column words; the linker keeps those
+  that are columns of the tables `link_code` resolved).
+
+Louvain sees the new links at low weight (`has_column` 0.5, `type_drift`
+0.1, `same_column` 2.0, `uses_column` 1.0): on the corpus, 260 of 283
+file/table communities came out unchanged and a few merged.
+
+**Verified** with three independent oracles (each a script in `tools/`, none
+run by `cargo test` because they need pandas or sqlglot):
+`check_columns.py` writes 40 random folders of CSV tables (three spellings of
+a shared vocabulary, mostly consistent types, identical twins) and recomputes
+from what *pandas* reads which names are shared, which tables hold them and
+where the types differ - node set, `tables` counts, every `has_column` link
+(schema-collapsed) and every pandas-visible type difference as `type_drift`
+all agree, and a deliberately wrong generic list makes it fail;
+`check_uses_column.py` writes tables and random SQL files and compares the
+`uses_column` links with the columns *sqlglot* finds in each statement (60
+seeds, 1,106 links, exact); `check_renames.py` plants 49 foreign keys under
+other names and finds exactly those `same_column` pairs and no others. The
+committed test is `graph_columns_adds_column_nodes_for_what_tables_share_and_queries_use`
+on `tests/fixtures/edge_graph_columns`.
+
+**Disclosed.** `uses_column` reads SQL only (files, SQL strings, dbt); a
+pandas `df["amount"]` or an R `$amount` is not followed. It is per file, not
+per statement: a word that is a column of any table the file reads counts. A
+rename needs a join the existing detector finds (integer columns with
+ordinary names, such as `cust_id` beside `customer_id`, are not joined, so
+they are not paired); `same_column` is only as good as `joins`. A
+column is matched by name, so two unrelated tables' `amount` columns share a
+node - the node says "tables have this", the `joins` links say which tables
+relate. Type drift uses this tool's value-derived types, so an integer column
+with a text value in one table is drift because it is.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

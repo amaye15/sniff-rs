@@ -111866,6 +111866,10 @@ mod code_facts {
         pub(crate) imports: Vec<Import>,
         pub(crate) accesses: Vec<Access>,
         pub(crate) sql: Vec<SqlRef>,
+        /// Words in its SQL that could be column names (lower-cased, no
+        /// keywords, functions, qualifiers or the tables it names): matched
+        /// against the columns of the tables it reads.
+        pub(crate) columns: Vec<String>,
     }
 
     /// A module a file imports. Python: `module` is dotted, `dots` its
@@ -111901,6 +111905,7 @@ mod code_facts {
 
     const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
     const MAX_FACTS: usize = 500;
+    const MAX_COLUMN_WORDS: usize = 600;
 
     /// Extensions of programs and scripts, whatever their language: a file
     /// with one is source, never a table, however many commas it has.
@@ -113221,6 +113226,7 @@ mod code_facts {
         }
         if lang == Lang::Sql {
             facts.sql = sql_refs(src);
+            facts.columns = sql_columns(src, &facts.sql);
             return facts;
         }
         let toks = lex(lang, src);
@@ -113233,13 +113239,17 @@ mod code_facts {
             Lang::Go => go_embeds(src, &mut facts),
             Lang::R | Lang::Sql => {}
         }
+        let mut columns: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for s in sql_strings {
-            for r in sql_refs(&s) {
+            let refs = sql_refs(&s);
+            columns.extend(sql_columns(&s, &refs));
+            for r in refs {
                 if facts.sql.len() < MAX_FACTS && !facts.sql.contains(&r) {
                     facts.sql.push(r);
                 }
             }
         }
+        facts.columns = columns.into_iter().take(MAX_COLUMN_WORDS).collect();
         facts
     }
 
@@ -113806,6 +113816,202 @@ mod code_facts {
             i += 1;
         }
         refs
+    }
+
+    /// Words in SQL that are not keywords or functions of the kind a column
+    /// is never called.
+    const SQL_NOT_COLUMN: &[&str] = &[
+        "select",
+        "from",
+        "where",
+        "group",
+        "order",
+        "by",
+        "having",
+        "limit",
+        "offset",
+        "union",
+        "intersect",
+        "except",
+        "all",
+        "distinct",
+        "as",
+        "on",
+        "using",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "outer",
+        "cross",
+        "natural",
+        "lateral",
+        "and",
+        "or",
+        "not",
+        "in",
+        "is",
+        "null",
+        "like",
+        "ilike",
+        "between",
+        "exists",
+        "case",
+        "when",
+        "then",
+        "else",
+        "end",
+        "asc",
+        "desc",
+        "with",
+        "recursive",
+        "insert",
+        "into",
+        "values",
+        "update",
+        "set",
+        "delete",
+        "merge",
+        "create",
+        "table",
+        "view",
+        "drop",
+        "alter",
+        "add",
+        "truncate",
+        "primary",
+        "key",
+        "foreign",
+        "references",
+        "default",
+        "if",
+        "unique",
+        "index",
+        "over",
+        "partition",
+        "rows",
+        "range",
+        "unbounded",
+        "preceding",
+        "following",
+        "current",
+        "row",
+        "interval",
+        "true",
+        "false",
+        "any",
+        "some",
+        "cast",
+        "extract",
+        "returning",
+        "only",
+        "window",
+        "qualify",
+        "fetch",
+        "next",
+        "first",
+        "last",
+        "nulls",
+        "filter",
+        "within",
+        "int",
+        "integer",
+        "bigint",
+        "smallint",
+        "varchar",
+        "char",
+        "text",
+        "real",
+        "float",
+        "double",
+        "precision",
+        "decimal",
+        "numeric",
+        "boolean",
+        "bool",
+        "date",
+        "timestamp",
+        "time",
+        "json",
+        "jsonb",
+        "temp",
+        "temporary",
+        "replace",
+        "materialized",
+        "concurrently",
+        "overwrite",
+        "external",
+        "location",
+        "stored",
+        "format",
+        "partitioned",
+        "clustered",
+        "tablesample",
+        "pivot",
+        "unpivot",
+        "for",
+        "to",
+        "of",
+        "at",
+        "zone",
+        "both",
+        "leading",
+        "trailing",
+        "collate",
+        "escape",
+        "similar",
+        "glob",
+        "regexp",
+        "rlike",
+        "div",
+        "mod",
+    ];
+
+    /// Words that may name a column in `src`'s SQL: not keywords, not
+    /// followed by `(` (functions) or `.` (a table or alias in front of a
+    /// column), and not the tables the statements name.
+    pub(crate) fn sql_columns(src: &str, refs: &[SqlRef]) -> Vec<String> {
+        let cleaned = if src.contains("{{") || src.contains("{%") {
+            dbt_pass(src, &mut Vec::new())
+        } else {
+            src.to_string()
+        };
+        let t = sql_lex(&cleaned);
+        let tables: std::collections::BTreeSet<String> = refs
+            .iter()
+            .flat_map(|r| {
+                r.table
+                    .rsplit('.')
+                    .map(str::to_lowercase)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (i, tok) in t.iter().enumerate() {
+            let name = match tok {
+                SqlTok::Word(w) => {
+                    if SQL_NOT_COLUMN.iter().any(|k| k.eq_ignore_ascii_case(w)) {
+                        continue;
+                    }
+                    w
+                }
+                SqlTok::Quoted(w) => w,
+                _ => continue,
+            };
+            if matches!(t.get(i + 1), Some(SqlTok::Punct(b'(' | b'.'))) {
+                continue;
+            }
+            let lower = name.to_lowercase();
+            if lower == "__jinja__" || tables.contains(&lower) || lower.is_empty() {
+                continue;
+            }
+            out.insert(lower);
+            if out.len() >= MAX_COLUMN_WORDS {
+                break;
+            }
+        }
+        out.into_iter().collect()
     }
 
     fn skip_balanced(t: &[SqlTok], open: usize) -> usize {
@@ -116159,7 +116365,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 2;
+    const CACHE_FORMAT: u64 = 3;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -116722,6 +116928,9 @@ mod knowledge_graph {
                     .collect(),
             ),
         );
+        if !c.columns.is_empty() {
+            o.insert("columns".to_string(), strs(&c.columns));
+        }
         JsonValue::Object(o)
     }
 
@@ -116760,6 +116969,13 @@ mod knowledge_graph {
                 write: r.get(1)?.as_bool()?,
                 origin: r.get(2)?.as_str()?.to_string(),
             });
+        }
+        if let Some(cols) = v.get("columns") {
+            c.columns = cols
+                .as_array()?
+                .iter()
+                .map(|n| n.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
         }
         Some(c)
     }
@@ -117897,6 +118113,9 @@ mod knowledge_graph {
         Schema,
         /// A directory of the input (only with `--folders`).
         Folder,
+        /// A column shared by tables, or one a query uses (only with
+        /// `--columns`).
+        Column,
     }
 
     impl NodeType {
@@ -117907,6 +118126,7 @@ mod knowledge_graph {
                 NodeType::Entity => "entity",
                 NodeType::Schema => "schema",
                 NodeType::Folder => "folder",
+                NodeType::Column => "column",
             }
         }
 
@@ -117917,6 +118137,7 @@ mod knowledge_graph {
                 "entity" => Some(NodeType::Entity),
                 "schema" => Some(NodeType::Schema),
                 "folder" => Some(NodeType::Folder),
+                "column" => Some(NodeType::Column),
                 _ => None,
             }
         }
@@ -117951,10 +118172,20 @@ mod knowledge_graph {
         /// file) under a name this tool has no relation for; the name rides
         /// on the link as its `label`.
         RelatedTo,
+        /// A table (or a schema) to a column node it has (`--columns`).
+        HasColumn,
+        /// Two column nodes that hold the same thing under two names - a
+        /// join between `cust_id` and `customer_id` (`--columns`).
+        SameColumn,
+        /// A table whose column has another type than the same column in
+        /// most other tables (`--columns`).
+        TypeDrift,
+        /// A program or query to a column it uses (`--columns`).
+        UsesColumn,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 16] = [
+        pub(crate) const ALL: [Relation; 20] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -117971,6 +118202,10 @@ mod knowledge_graph {
             Relation::Metadata,
             Relation::InFolder,
             Relation::RelatedTo,
+            Relation::HasColumn,
+            Relation::SameColumn,
+            Relation::TypeDrift,
+            Relation::UsesColumn,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -117991,6 +118226,10 @@ mod knowledge_graph {
                 Relation::Metadata => "metadata",
                 Relation::InFolder => "in_folder",
                 Relation::RelatedTo => "related_to",
+                Relation::HasColumn => "has_column",
+                Relation::SameColumn => "same_column",
+                Relation::TypeDrift => "type_drift",
+                Relation::UsesColumn => "uses_column",
             }
         }
 
@@ -118002,14 +118241,17 @@ mod knowledge_graph {
         /// to anything else. Degree rankings ("god nodes") and the
         /// isolated-file check leave it out.
         pub(crate) fn structural(self) -> bool {
-            matches!(self, Relation::Contains | Relation::InFolder)
+            matches!(
+                self,
+                Relation::Contains | Relation::InFolder | Relation::HasColumn
+            )
         }
 
         /// A link implied by two others (two tables referencing one
         /// owner): real, kept, and left out of degree counts so a hub
         /// with forty spokes doesn't read as forty-one mutual hubs.
         pub(crate) fn derived(self) -> bool {
-            matches!(self, Relation::SharesKey)
+            matches!(self, Relation::SharesKey | Relation::TypeDrift)
         }
     }
 
@@ -118320,6 +118562,8 @@ mod knowledge_graph {
         pub(crate) folders: bool,
         /// Community resolution (see `louvain`); 1.0 is standard.
         pub(crate) resolution: f64,
+        /// Column nodes for the columns tables share or queries use.
+        pub(crate) columns: bool,
         /// Links from outside, rejects, aliases and ignored identifiers.
         pub(crate) overrides: Overrides,
     }
@@ -118329,6 +118573,7 @@ mod knowledge_graph {
             BuildOptions {
                 folders: false,
                 resolution: 1.0,
+                columns: false,
                 overrides: Overrides::default(),
             }
         }
@@ -118435,8 +118680,8 @@ mod knowledge_graph {
         }
 
         link_entities(&mut b, &files, &contents, &file_node, &opts.overrides);
-        let typed = link_code(&mut b, &files, &file_node, &table_nodes);
-        let unresolved = link_references(&mut b, &files, &contents, &file_node, &typed);
+        let code_links = link_code(&mut b, &files, &file_node, &table_nodes);
+        let unresolved = link_references(&mut b, &files, &contents, &file_node, &code_links.typed);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
@@ -118444,7 +118689,10 @@ mod knowledge_graph {
             link_folders(&mut b, &files, &file_node);
         }
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
-        link_schemas_and_joins(&mut b, &files, &table_nodes);
+        let column_ctx = link_schemas_and_joins(&mut b, &files, &table_nodes);
+        if opts.columns {
+            link_columns(&mut b, &files, &file_node, &column_ctx, &code_links);
+        }
         apply_overrides(&mut b.nodes, &mut b.edges, &opts.overrides)?;
 
         // Top terms on each file node, for labels and notes.
@@ -119099,14 +119347,16 @@ mod knowledge_graph {
         files: &[KgFile],
         file_node: &[usize],
         table_nodes: &[(usize, usize, usize)],
-    ) -> HashSet<(usize, usize)> {
+    ) -> CodeLinks {
         let mut typed: HashSet<(usize, usize)> = HashSet::new();
+        // Code file -> the data tables its SQL names (file, table index).
+        let mut used: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
         if files.iter().all(|f| f.code.is_none()) {
-            return typed;
+            return CodeLinks { typed, used };
         }
         let index = CodeIndex::new(files);
         // Data tables by name: a CSV's stem, a SQLite or Excel table.
-        let mut tables: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut tables: HashMap<String, Vec<(usize, usize, usize)>> = HashMap::new();
         for &(node, fi, ti) in table_nodes {
             if files[fi].fixed_schema || files[fi].kind != FileKind::Data {
                 continue;
@@ -119114,7 +119364,7 @@ mod knowledge_graph {
             tables
                 .entry(files[fi].tables[ti].0.to_lowercase())
                 .or_default()
-                .push((node, fi));
+                .push((node, fi, ti));
         }
         // dbt models: SQL files by name.
         let mut models: HashMap<String, Vec<usize>> = HashMap::new();
@@ -119243,7 +119493,7 @@ mod knowledge_graph {
                 match tables.get(&last).map(|v| {
                     v.iter()
                         .copied()
-                        .filter(|&(_, tfi)| tfi != fi)
+                        .filter(|&(_, tfi, _)| tfi != fi)
                         .collect::<Vec<_>>()
                 }) {
                     Some(ts) if !ts.is_empty() && ts.len() <= 5 => {
@@ -119252,8 +119502,12 @@ mod knowledge_graph {
                         } else {
                             Conf::Ambiguous
                         };
-                        for (node, tfi) in ts {
+                        for (node, tfi, ti) in ts {
                             typed.insert((fi, tfi));
+                            let u = used.entry(fi).or_default();
+                            if !u.contains(&(tfi, ti)) {
+                                u.push((tfi, ti));
+                            }
                             note(&mut edges, node, rel, conf, ev.clone());
                         }
                     }
@@ -119307,7 +119561,346 @@ mod knowledge_graph {
                 add_directed(b, file_node[fi], node, rel, Conf::Inferred, evidence);
             }
         }
-        typed
+        CodeLinks { typed, used }
+    }
+
+    /// What `link_code` found that later passes use.
+    struct CodeLinks {
+        /// (file, file) pairs now linked by a typed link, so the plain
+        /// `references` link is not added a second time.
+        typed: HashSet<(usize, usize)>,
+        /// Code file -> the data tables its SQL names, as (file, table).
+        used: BTreeMap<usize, Vec<(usize, usize)>>,
+    }
+
+    // ---- Column nodes ----
+
+    /// Column names that mean nothing when two tables share them: row ids
+    /// and the attributes nearly every table has.
+    fn generic_column(canon: &str) -> bool {
+        if canon.len() < 2 || is_surrogate_key_name(canon) {
+            return true;
+        }
+        // Positional names (`col_3`, `unnamed_0`, `field12`) and bare numbers.
+        let digits = canon.trim_end_matches(|c: char| c.is_ascii_digit());
+        if digits.len() < canon.len()
+            && matches!(
+                digits.trim_end_matches('_'),
+                "" | "col" | "column" | "field" | "unnamed" | "var" | "v" | "x" | "c"
+            )
+        {
+            return true;
+        }
+        matches!(
+            canon,
+            "name"
+                | "names"
+                | "date"
+                | "time"
+                | "datetime"
+                | "timestamp"
+                | "type"
+                | "value"
+                | "values"
+                | "status"
+                | "description"
+                | "notes"
+                | "note"
+                | "comment"
+                | "comments"
+                | "title"
+                | "label"
+                | "year"
+                | "month"
+                | "day"
+                | "week"
+                | "count"
+                | "total"
+                | "created"
+                | "created_at"
+                | "created_on"
+                | "updated"
+                | "updated_at"
+                | "updated_on"
+                | "modified"
+                | "modified_at"
+                | "deleted_at"
+                | "text"
+                | "data"
+                | "flag"
+                | "active"
+                | "is_active"
+                | "order"
+                | "rank"
+                | "level"
+                | "size"
+                | "version"
+                | "source"
+        )
+    }
+
+    /// A column type for comparing across tables. A category column holds
+    /// whatever its values are, so it votes for nothing.
+    fn drift_type(ideal: &str) -> Option<&str> {
+        match ideal {
+            "enum / category" | "" => None,
+            t if t.starts_with("mixed(") => None,
+            t => Some(t),
+        }
+    }
+
+    /// Where a table has a column: the table, or - when every table of a
+    /// schema group has it - the group's schema node, once.
+    struct ColumnHolder {
+        node: usize,
+        /// Tables this stands for.
+        tables: usize,
+        /// This column's type there, and the evidence line for the link.
+        ideal: String,
+        spelling: String,
+        evidence: String,
+    }
+
+    #[derive(Default)]
+    struct ColumnConcept {
+        holders: Vec<ColumnHolder>,
+        /// Counted by the tables behind them.
+        forced: bool,
+    }
+
+    /// Most tables a column can be in and still be worth a node: a name in
+    /// hundreds of tables says "tables have this", not "these are related".
+    const MAX_COLUMN_TABLES: usize = 200;
+
+    /// `--columns`: a node for each column that two or more tables (or
+    /// schema groups) share, that a join matches under two names, or that
+    /// a query uses; generic names (`id`, `name`, `date`, ...) get none.
+    ///
+    /// `has_column` joins a table - or, for a column every member of a
+    /// schema group has, the group's schema node - to the column node.
+    /// `type_drift` joins a table whose type for the column differs from the
+    /// one most other tables have. `same_column` joins two column nodes a
+    /// join matched under different names (`cust_id` and `customer_id`).
+    /// `uses_column` joins a SQL file to a column of a table it reads or
+    /// writes that its SQL mentions.
+    fn link_columns(
+        b: &mut Builder,
+        files: &[KgFile],
+        file_node: &[usize],
+        ctx: &ColumnContext,
+        code: &CodeLinks,
+    ) {
+        let mut concepts: BTreeMap<String, ColumnConcept> = BTreeMap::new();
+        let mut schema_seen: HashSet<(usize, String)> = HashSet::new();
+        for (idx, &(node, fi, ti)) in ctx.tables.iter().enumerate() {
+            let (table, cols) = &files[fi].tables[ti];
+            let mut seen_here: HashSet<String> = HashSet::new();
+            for c in cols {
+                let canon = canon_name(&c.name);
+                if generic_column(&canon) || !seen_here.insert(canon.clone()) {
+                    continue;
+                }
+                let concept = concepts.entry(canon.clone()).or_default();
+                let missing = if c.missing_pct > 0.0 {
+                    format!(", {:.1}% missing", c.missing_pct)
+                } else {
+                    String::new()
+                };
+                match ctx.schema_of[idx] {
+                    Some(sn) if ctx.schema_common[&sn].contains(&canon) => {
+                        // Once for the group; the group's tables stand behind it.
+                        if schema_seen.insert((sn, canon.clone())) {
+                            let members = ctx.schema_of.iter().filter(|s| **s == Some(sn)).count();
+                            concept.holders.push(ColumnHolder {
+                                node: sn,
+                                tables: members,
+                                ideal: c.ideal_type.clone(),
+                                spelling: c.name.clone(),
+                                evidence: format!(
+                                    "all {members} tables of the schema have {}: {}{missing}",
+                                    c.name, c.ideal_type
+                                ),
+                            });
+                        }
+                    }
+                    _ => concept.holders.push(ColumnHolder {
+                        node,
+                        tables: 1,
+                        ideal: c.ideal_type.clone(),
+                        spelling: c.name.clone(),
+                        evidence: format!("{table}.{}: {}{missing}", c.name, c.ideal_type),
+                    }),
+                }
+            }
+        }
+        // Columns a join matched under two names, and columns a query uses.
+        let mut renames: Vec<&Rename> = Vec::new();
+        for r in &ctx.renames {
+            if concepts.contains_key(&r.a.1) && concepts.contains_key(&r.b.1) {
+                concepts.get_mut(&r.a.1).expect("checked").forced = true;
+                concepts.get_mut(&r.b.1).expect("checked").forced = true;
+                renames.push(r);
+            }
+        }
+        let mut uses: Vec<(usize, String, String)> = Vec::new();
+        for (&fi, used_tables) in &code.used {
+            let Some(facts) = &files[fi].code else {
+                continue;
+            };
+            let words: BTreeSet<String> = facts.columns.iter().map(|w| canon_name(w)).collect();
+            for &(tfi, ti) in used_tables {
+                let (table, cols) = &files[tfi].tables[ti];
+                for c in cols {
+                    let canon = canon_name(&c.name);
+                    if words.contains(&canon)
+                        && let Some(concept) = concepts.get_mut(&canon)
+                    {
+                        concept.forced = true;
+                        uses.push((
+                            fi,
+                            canon,
+                            format!("mentions {}, a column of {table}", c.name),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut node_of: BTreeMap<String, usize> = BTreeMap::new();
+        for (canon, concept) in &concepts {
+            let tables: usize = concept.holders.iter().map(|h| h.tables).sum();
+            let enough = concept.holders.len() >= 2 && tables <= MAX_COLUMN_TABLES;
+            if !(enough || concept.forced) {
+                continue;
+            }
+            // Spelling and type by vote, ties to the first in order.
+            let mut spellings: BTreeMap<&str, usize> = BTreeMap::new();
+            let mut types: BTreeMap<&str, usize> = BTreeMap::new();
+            for h in &concept.holders {
+                *spellings.entry(h.spelling.as_str()).or_default() += h.tables;
+                if let Some(t) = drift_type(&h.ideal) {
+                    *types.entry(t).or_default() += h.tables;
+                }
+            }
+            let top = |m: &BTreeMap<&str, usize>| -> Option<String> {
+                m.iter()
+                    .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                    .map(|(k, _)| (*k).to_string())
+            };
+            let label = top(&spellings).unwrap_or_else(|| canon.clone());
+            let majority = top(&types);
+            let tie = majority.as_ref().is_some_and(|m| {
+                types
+                    .iter()
+                    .filter(|(_, n)| **n == types[m.as_str()])
+                    .count()
+                    > 1
+            });
+            let mut attrs = json_support::Map::new();
+            attrs.insert("tables".to_string(), JsonValue::from(tables));
+            attrs.insert(
+                "holders".to_string(),
+                JsonValue::from(concept.holders.len()),
+            );
+            if types.len() > 1 {
+                attrs.insert("drift".to_string(), JsonValue::from(true));
+                let mut tm = json_support::Map::new();
+                for (t, n) in &types {
+                    tm.insert((*t).to_string(), JsonValue::from(*n));
+                }
+                attrs.insert("types".to_string(), JsonValue::Object(tm));
+            }
+            if spellings.len() > 1 {
+                attrs.insert(
+                    "spellings".to_string(),
+                    JsonValue::Array(
+                        spellings
+                            .keys()
+                            .take(6)
+                            .map(|k| JsonValue::from(*k))
+                            .collect(),
+                    ),
+                );
+            }
+            let node = b.add_node(
+                format!("column:{canon}"),
+                label.clone(),
+                NodeType::Column,
+                majority.clone().unwrap_or_else(|| "column".to_string()),
+                None,
+                attrs,
+            );
+            node_of.insert(canon.clone(), node);
+            for h in &concept.holders {
+                b.add_edge(
+                    h.node,
+                    node,
+                    Relation::HasColumn,
+                    Conf::Extracted,
+                    1.0,
+                    0.5,
+                    vec![h.evidence.clone()],
+                );
+                b.edges.last_mut().expect("just pushed").directed = true;
+                if let (Some(m), false) = (&majority, tie)
+                    && let Some(t) = drift_type(&h.ideal)
+                    && t != m
+                {
+                    let others = types[m.as_str()];
+                    b.add_edge(
+                        h.node,
+                        node,
+                        Relation::TypeDrift,
+                        Conf::Extracted,
+                        1.0,
+                        0.1,
+                        vec![format!(
+                            "{label} is {t} here, {m} in {others} other table{}",
+                            if others == 1 { "" } else { "s" }
+                        )],
+                    );
+                    b.edges.last_mut().expect("just pushed").directed = true;
+                }
+            }
+        }
+
+        let mut renamed: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for r in renames {
+            let (Some(&x), Some(&y)) = (node_of.get(&r.a.1), node_of.get(&r.b.1)) else {
+                continue;
+            };
+            if x == y || !renamed.insert((x.min(y), x.max(y))) {
+                continue;
+            }
+            b.add_edge(
+                x,
+                y,
+                Relation::SameColumn,
+                r.confidence,
+                (r.score * 1000.0).round() / 1000.0,
+                2.0,
+                vec![r.evidence.clone()],
+            );
+        }
+        let mut used_seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (fi, canon, evidence) in uses {
+            let Some(&node) = node_of.get(&canon) else {
+                continue;
+            };
+            if !used_seen.insert((fi, node)) {
+                continue;
+            }
+            b.add_edge(
+                file_node[fi],
+                node,
+                Relation::UsesColumn,
+                Conf::Inferred,
+                0.6,
+                1.0,
+                vec![evidence],
+            );
+            b.edges.last_mut().expect("just pushed").directed = true;
+        }
     }
 
     /// Generic stems that say nothing when two files share them.
@@ -119762,16 +120355,25 @@ mod knowledge_graph {
         b: &mut Builder,
         files: &[KgFile],
         table_nodes: &[(usize, usize, usize)],
-    ) {
-        let tables: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = table_nodes
+    ) -> ColumnContext {
+        let authored: Vec<&(usize, usize, usize)> = table_nodes
             .iter()
             .filter(|(_, fi, _)| !files[*fi].fixed_schema && files[*fi].kind == FileKind::Data)
+            .filter(|(_, fi, ti)| !files[*fi].tables[*ti].1.is_empty())
+            .collect();
+        let tables: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = authored
+            .iter()
             .map(|(node, fi, ti)| {
                 let (name, cols) = &files[*fi].tables[*ti];
                 (*node, *fi, name.as_str(), cols)
             })
-            .filter(|(_, _, _, cols)| !cols.is_empty())
             .collect();
+        let mut ctx = ColumnContext {
+            tables: authored.iter().map(|t| **t).collect(),
+            schema_of: vec![None; tables.len()],
+            schema_common: HashMap::new(),
+            renames: Vec::new(),
+        };
         // Schema groups: tables sharing at least 80% of their column
         // names, grouped transitively.
         let canon: Vec<BTreeSet<String>> = tables
@@ -119837,8 +120439,16 @@ mod knowledge_graph {
                 None,
                 attrs,
             );
+            ctx.schema_common.insert(
+                snode,
+                common
+                    .iter()
+                    .map(|c| canon_name(c))
+                    .collect::<BTreeSet<String>>(),
+            );
             for m in members {
                 group_of[*m] = *gid;
+                ctx.schema_of[*m] = Some(snode);
                 let others = members.len() - 1;
                 b.add_edge(
                     tables[*m].0,
@@ -119888,6 +120498,10 @@ mod knowledge_graph {
         let mut pending = evaluate_joins(&tables, &sigs, &stems, &link_index, plans);
         add_declared_joins(&tables, &mut pending);
         relabel_shared_keys(&mut pending, &tables);
+        ctx.renames = pending
+            .iter()
+            .flat_map(|e| e.renames.iter().cloned())
+            .collect();
         for e in pending {
             let weight = match (e.relation, e.confidence) {
                 (Relation::SharesKey, _) => SHARES_KEY_WEIGHT,
@@ -119907,6 +120521,20 @@ mod knowledge_graph {
                 b.edges.last_mut().expect("just pushed").directed = true;
             }
         }
+        ctx
+    }
+
+    /// What the schema and join pass found that column nodes build on.
+    struct ColumnContext {
+        /// The authored data tables, as (node, file, table index).
+        tables: Vec<(usize, usize, usize)>,
+        /// For each of them, the schema node of the group it is in.
+        schema_of: Vec<Option<usize>>,
+        /// For each schema node, the canonical names of the columns every
+        /// member has.
+        schema_common: HashMap<usize, BTreeSet<String>>,
+        /// Columns the joins matched under two names.
+        renames: Vec<Rename>,
     }
 
     /// Looks at each planned table pair and returns the joins found, one
@@ -119990,6 +120618,17 @@ mod knowledge_graph {
                 confidence,
                 score,
                 evidence,
+                renames: found
+                    .iter()
+                    .filter(|f| f.canon_a != f.canon_b)
+                    .map(|f| Rename {
+                        a: (na, f.canon_a.clone()),
+                        b: (nb, f.canon_b.clone()),
+                        confidence: f.conf,
+                        score: f.score,
+                        evidence: f.evidence.clone(),
+                    })
+                    .collect(),
             });
         }
         pending
@@ -120014,6 +120653,19 @@ mod knowledge_graph {
         confidence: Conf,
         score: f64,
         evidence: Vec<String>,
+        /// Column pairs the join matched under two different names.
+        renames: Vec<Rename>,
+    }
+
+    /// Two columns of two tables that hold the same thing under two names:
+    /// (table node, canonical name) on each side.
+    #[derive(Clone)]
+    struct Rename {
+        a: (usize, String),
+        b: (usize, String),
+        confidence: Conf,
+        score: f64,
+        evidence: String,
     }
 
     /// Tables whose column-name sets are `threshold`-similar or more
@@ -120409,7 +121061,8 @@ mod knowledge_graph {
         }
         // (referencing node, referenced node) -> declared evidence, in
         // table order.
-        let mut declared: Vec<((usize, usize), String, Vec<String>)> = Vec::new();
+        type Declared = ((usize, usize), String, Vec<String>, Vec<Rename>);
+        let mut declared: Vec<Declared> = Vec::new();
         for (node, fi, tname, cols) in tables.iter() {
             for col in cols.iter() {
                 for r in &col.references {
@@ -120431,14 +121084,30 @@ mod knowledge_graph {
                         text.push_str(" (one column pair of a composite key)");
                     }
                     let key = canon_name(&r.column);
+                    let own = canon_name(&col.name);
+                    let renamed = (own != key).then(|| Rename {
+                        a: (*node, own),
+                        b: (tnode, key.clone()),
+                        confidence: Conf::Extracted,
+                        score: 1.0,
+                        evidence: text.clone(),
+                    });
                     match declared.iter_mut().find(|d| d.0 == (*node, tnode)) {
-                        Some(d) => d.2.push(text),
-                        None => declared.push(((*node, tnode), key, vec![text])),
+                        Some(d) => {
+                            d.2.push(text);
+                            d.3.extend(renamed);
+                        }
+                        None => declared.push((
+                            (*node, tnode),
+                            key,
+                            vec![text],
+                            renamed.into_iter().collect(),
+                        )),
                     }
                 }
             }
         }
-        for ((from, to), key, mut evidence) in declared {
+        for ((from, to), key, mut evidence, renames) in declared {
             if evidence.len() > 5 {
                 let more = evidence.len() - 5;
                 evidence.truncate(5);
@@ -120459,6 +121128,7 @@ mod knowledge_graph {
                     p.confidence = Conf::Extracted;
                     p.score = 1.0;
                     p.evidence = merged;
+                    p.renames.extend(renames);
                 }
                 None => pending.push(PendingJoin {
                     from,
@@ -120470,6 +121140,7 @@ mod knowledge_graph {
                     confidence: Conf::Extracted,
                     score: 1.0,
                     evidence,
+                    renames,
                 }),
             }
         }
@@ -121176,6 +121847,7 @@ mod knowledge_graph {
                 NodeType::Entity => "entity",
                 NodeType::Schema => "schema",
                 NodeType::Folder => "folder",
+                NodeType::Column => "column",
             }
         }))
     }
@@ -122077,6 +122749,7 @@ mod knowledge_graph {
             pub(crate) include: Vec<String>,
             pub(crate) exclude: Vec<String>,
             pub(crate) folders: Option<bool>,
+            pub(crate) columns: Option<bool>,
             pub(crate) resolution: Option<f64>,
             pub(crate) samples: Option<usize>,
             pub(crate) jobs: Option<usize>,
@@ -122207,6 +122880,7 @@ mod knowledge_graph {
                         "include",
                         "exclude",
                         "folders",
+                        "columns",
                         "resolution",
                         "samples",
                         "jobs",
@@ -122219,6 +122893,11 @@ mod knowledge_graph {
                 if let Some(f) = g.get("folders") {
                     cfg.folders = Some(f.as_bool().ok_or_else(|| {
                         anyhow!("{origin}: [graph] folders must be true or false")
+                    })?);
+                }
+                if let Some(c) = g.get("columns") {
+                    cfg.columns = Some(c.as_bool().ok_or_else(|| {
+                        anyhow!("{origin}: [graph] columns must be true or false")
                     })?);
                 }
                 if let Some(r) = g.get("resolution") {
@@ -122397,6 +123076,7 @@ mod knowledge_graph {
             NodeType::Entity => format!("`{}` ({})", md(&n.label), n.file_type),
             NodeType::Schema => format!("`{}`", md(&n.label)),
             NodeType::Folder => format!("`{}` (folder)", md(&n.label)),
+            NodeType::Column => format!("`{}` (column)", md(&n.label)),
         }
     }
 
@@ -122888,6 +123568,10 @@ mod knowledge_graph {
                     "schemas/{}",
                     sanitize_component(n.label.strip_prefix("schema: ").unwrap_or(&n.label))
                 ),
+                NodeType::Column => format!(
+                    "columns/{}",
+                    sanitize_component(n.id.strip_prefix("column:").unwrap_or(&n.id))
+                ),
                 NodeType::Folder => {
                     let parts: Vec<String> =
                         n.id.trim_start_matches("folder:")
@@ -122991,6 +123675,7 @@ mod knowledge_graph {
                 }
                 NodeType::Schema => note.push_str("  - schema\n"),
                 NodeType::Folder => note.push_str("  - folder\n"),
+                NodeType::Column => note.push_str("  - column\n"),
             }
             note.push_str(&format!("  - node/{}\n", n.node_type.as_str()));
             note.push_str(&format!("  - community/{}\n", n.community));
@@ -123024,6 +123709,12 @@ mod knowledge_graph {
                 NodeType::Schema => {
                     if let Some(t) = n.attrs.get("tables").and_then(JsonValue::as_u64) {
                         facts.push(format!("shared by {t} tables"));
+                    }
+                }
+                NodeType::Column => {
+                    facts.push(format!("**{}**", n.file_type));
+                    if let Some(t) = n.attrs.get("tables").and_then(JsonValue::as_u64) {
+                        facts.push(format!("in {t} tables"));
                     }
                 }
                 NodeType::Folder => {
@@ -123417,6 +124108,7 @@ mod knowledge_graph {
                 NodeType::Entity => "ellipse",
                 NodeType::Schema => "hexagon",
                 NodeType::Folder => "folder",
+                NodeType::Column => "note",
             };
             out.push_str(&format!(
                 "  n{i} [label=\"{}\", shape={shape}, fillcolor=\"{}\"];\n",
@@ -123470,6 +124162,7 @@ mod knowledge_graph {
                 NodeType::Entity => "Entity",
                 NodeType::Schema => "Schema",
                 NodeType::Folder => "Folder",
+                NodeType::Column => "Column",
             };
             out.push_str(&format!(
                 "CREATE (n{i}:{label} {{id: {}, label: {}, file_type: {}, community: {}, degree: {}}})\n",
@@ -125335,6 +126028,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     confidence: Conf::Extracted,
                     score: 1.0,
                     evidence: Vec::new(),
+                    renames: Vec::new(),
                 };
                 let mut v = vec![spoke(2, 0), spoke(3, 0), spoke(2, 1), spoke(3, 1)];
                 v.push(PendingJoin {
@@ -125347,6 +126041,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                     confidence: Conf::Extracted,
                     score: 1.0,
                     evidence: Vec::new(),
+                    renames: Vec::new(),
                 });
                 v
             };
@@ -126569,6 +127264,16 @@ USAGE:
                    name in their own properties: a PDF's or office
                    document's, or a photo's EXIF and XMP (INFERRED)
       in_folder    with --folders: a file and the folder it is kept in
+      has_column   with --columns: a table (or a schema shared by several)
+                   to a column node it has; the column is shared by two or
+                   more tables or used by a query; generic names (id,
+                   name, date, status ...) get none
+      same_column  with --columns: two columns that hold the same thing
+                   under two names (a join of cust_id and customer_id)
+      type_drift   with --columns: a table whose column has another type
+                   than the same column in most other tables
+      uses_column  with --columns: a SQL file or query to a column of a
+                   table it reads or writes
       related_to   a link handed in from outside (--links, graph merge, a
                    [[link]] in the config file); its own name is its label
 
@@ -126633,6 +127338,11 @@ OPTIONS:
         --folders               Add a node per directory, so files kept in
                                 one folder pull together when nothing else
                                 links them
+        --columns               Add a node for each column that tables
+                                share or a query uses, so "which tables
+                                hold customer_id" and "which columns
+                                changed type" are links (has_column,
+                                same_column, type_drift, uses_column)
         --config <FILE>         Read settings from FILE (default: the
                                 .sniff-rs.toml or .sniff-rs.json in a
                                 directory INPUT)
@@ -126724,6 +127434,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut jobs: Option<usize> = None;
     let mut no_cache = false;
     let mut folders: Option<bool> = None;
+    let mut columns: Option<bool> = None;
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
     let mut link_files: Vec<PathBuf> = Vec::new();
@@ -126784,6 +127495,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--folders takes no value");
                     }
                     folders = Some(true);
+                }
+                "columns" => {
+                    if inline_value.is_some() {
+                        bail!("--columns takes no value");
+                    }
+                    columns = Some(true);
                 }
                 "resolution" => {
                     let v = value(&mut i)?;
@@ -126909,6 +127626,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let samples = samples.or(cfg.samples).unwrap_or(3);
     let jobs = jobs.or(cfg.jobs);
     let folders = folders.or(cfg.folders).unwrap_or(false);
+    let columns = columns.or(cfg.columns).unwrap_or(false);
     let resolution = resolution.or(cfg.resolution).unwrap_or(1.0);
     let patterns = cfg.patterns()?;
     let patterns_fingerprint = cfg.fingerprint();
@@ -126936,6 +127654,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
         &knowledge_graph::BuildOptions {
             folders,
             resolution,
+            columns,
             overrides,
         },
     )?;
@@ -127190,6 +127909,7 @@ fn load_knowledge_graph_input(
             &knowledge_graph::BuildOptions {
                 folders: cfg.folders.unwrap_or(false),
                 resolution: cfg.resolution.unwrap_or(1.0),
+                columns: cfg.columns.unwrap_or(false),
                 overrides: std::mem::take(&mut cfg.overrides),
             },
         )?));

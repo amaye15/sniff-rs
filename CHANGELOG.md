@@ -7,6 +7,14 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph --columns` (or `columns = true` in the config file): a node
+  for each column that tables share, that a join matches under two names, or
+  that a query uses, with `has_column` (a table, or the schema of identical
+  tables, to the column), `type_drift` (a table whose type for it differs
+  from the other tables'), `same_column` (the same thing under two names, from
+  a join) and `uses_column` (a SQL file to the columns it names). Generic
+  names (`id`, `name`, `date`, ...) get none. Off by default; checked against
+  pandas, sqlglot and planted renames.
 - Code to data links in `sniff-rs graph`: `imports` (Python, JavaScript/
   TypeScript, Rust, Java, R), `reads` and `writes` (the files and tables a
   script, notebook or SQL query reads or writes - `pd.read_csv`, `open`,

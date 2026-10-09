@@ -42,7 +42,7 @@
         "properties": {
           "id": { "type": "string", "description": "A relative path, `file#table`, or `kind:value` for an entity." },
           "label": { "type": "string" },
-          "type": { "enum": ["file", "table", "entity", "schema", "folder"] },
+          "type": { "enum": ["file", "table", "entity", "schema", "folder", "column"] },
           "file_type": { "type": "string", "description": "The data type (csv, pdf, png, ...), or an entity's kind (email, doi, ...)." },
           "source_file": { "type": "string" },
           "community": { "type": "integer", "minimum": 0 },
@@ -63,7 +63,7 @@
               "contains", "has_schema", "joins", "references", "imports", "reads", "writes", "mentions",
               "shares_identifiers",
               "similar_to", "same_name", "shares_key", "duplicate_of", "metadata", "in_folder",
-              "related_to"
+              "related_to", "has_column", "same_column", "type_drift", "uses_column"
             ]
           },
           "confidence": { "enum": ["EXTRACTED", "INFERRED", "AMBIGUOUS"] },
