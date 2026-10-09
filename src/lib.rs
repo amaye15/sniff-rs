@@ -118502,6 +118502,9 @@ mod knowledge_graph {
         /// The people a mailbox, address book or calendar names (only
         /// read with `--people`).
         pub(crate) people: Vec<PersonRef>,
+        /// Which sheets of a workbook its formulas reach (other sheets, or
+        /// sheets of other workbooks).
+        pub(crate) sheet_refs: Vec<doc_text::SheetRef>,
     }
 
     pub(crate) struct CollectOptions {
@@ -118676,7 +118679,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 4;
+    const CACHE_FORMAT: u64 = 5;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -119208,7 +119211,43 @@ mod knowledge_graph {
                 ),
             );
         }
+        if !f.sheet_refs.is_empty() {
+            o.insert(
+                "sheet_refs".to_string(),
+                JsonValue::Array(
+                    f.sheet_refs
+                        .iter()
+                        .map(|r| {
+                            JsonValue::Array(vec![
+                                JsonValue::from(r.from.clone()),
+                                r.external.clone().map_or(JsonValue::Null, JsonValue::from),
+                                JsonValue::from(r.to.clone()),
+                                JsonValue::from(u64::from(r.count)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            );
+        }
         JsonValue::Object(o)
+    }
+
+    fn sheet_refs_from_json(v: &JsonValue) -> Option<Vec<doc_text::SheetRef>> {
+        v.as_array()?
+            .iter()
+            .map(|r| {
+                let r = r.as_array()?;
+                Some(doc_text::SheetRef {
+                    from: r.first()?.as_str()?.to_string(),
+                    external: match r.get(1)? {
+                        x if x.is_null() => None,
+                        x => Some(x.as_str()?.to_string()),
+                    },
+                    to: r.get(2)?.as_str()?.to_string(),
+                    count: u32::try_from(r.get(3)?.as_u64()?).ok()?,
+                })
+            })
+            .collect()
     }
 
     fn people_from_json(v: &JsonValue) -> Option<Vec<PersonRef>> {
@@ -119409,6 +119448,10 @@ mod knowledge_graph {
             people: match v.get("people") {
                 None => Vec::new(),
                 Some(p) => people_from_json(p)?,
+            },
+            sheet_refs: match v.get("sheet_refs") {
+                None => Vec::new(),
+                Some(p) => sheet_refs_from_json(p)?,
             },
         })
     }
@@ -120097,6 +120140,7 @@ mod knowledge_graph {
             meta: Vec::new(),
             code: None,
             people: Vec::new(),
+            sheet_refs: Vec::new(),
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -120144,6 +120188,19 @@ mod knowledge_graph {
                             (t, cols)
                         })
                         .collect();
+                    // A workbook's links to other files, and which of its
+                    // sheets its formulas read.
+                    #[cfg(any(feature = "xlsx", feature = "npy"))]
+                    if let Some(workbook) = doc_text::workbook(&read_path, &ext) {
+                        file.sheet_refs = workbook.refs;
+                        if !workbook.external.is_empty() {
+                            let mut acc = content_scan::ContentAccumulator::new(false);
+                            for target in &workbook.external {
+                                acc.push(target);
+                            }
+                            file.text = Some(acc.finish("String"));
+                        }
+                    }
                 }
                 Err(e) => {
                     file.kind = FileKind::Failed;
@@ -120876,6 +120933,337 @@ mod knowledge_graph {
             out
         }
 
+        // ----------------------------------------------- Excel formulas
+
+        /// How many formulas one sheet may contribute.
+        const MAX_FORMULAS_PER_SHEET: usize = 5_000_000;
+        /// Longest formula text read.
+        const MAX_FORMULA_CHARS: usize = 16 * 1024;
+
+        /// One sheet's references to another sheet, from its formulas.
+        #[derive(Debug, Clone, PartialEq)]
+        pub(crate) struct SheetRef {
+            /// The sheet holding the formulas.
+            pub from: String,
+            /// The external workbook (its target path or URL) the formulas
+            /// reach into, or `None` for another sheet of the same one.
+            pub external: Option<String>,
+            /// The sheet they refer to.
+            pub to: String,
+            /// How many formula cells refer to it (a shared formula counts
+            /// once).
+            pub count: u32,
+        }
+
+        /// What a workbook's formulas and links say about other sheets and
+        /// files.
+        #[derive(Default, Debug, PartialEq)]
+        pub(crate) struct WorkbookFacts {
+            /// Targets of the workbook's external links (other workbooks).
+            pub external: Vec<String>,
+            pub refs: Vec<SheetRef>,
+        }
+
+        /// A reference to a sheet, found in a formula: `[n]` is the
+        /// external workbook's number.
+        #[derive(Debug, PartialEq)]
+        pub(crate) struct FormulaSheet {
+            pub external: Option<usize>,
+            pub sheet: String,
+        }
+
+        /// The sheets a formula's references name: `Data!A1`,
+        /// `'My Sheet'!A1:B2`, `[1]Other!A1`, `'Jan:Mar'!A1` (both ends).
+        /// Text in `"..."` is not a reference; `#REF!` is not a sheet.
+        pub(crate) fn formula_sheets(f: &str) -> Vec<FormulaSheet> {
+            let chars: Vec<char> = f.chars().collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            let is_name = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+            while i < chars.len() {
+                let c = chars[i];
+                if c == '"' {
+                    // A string literal; `""` is a quote inside it.
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '"' {
+                            if chars.get(i + 1) == Some(&'"') {
+                                i += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                let (external, name);
+                if c == '\'' {
+                    // 'quoted name'!  ('' is a quote inside).
+                    let mut j = i + 1;
+                    let mut text = String::new();
+                    let mut closed = false;
+                    while j < chars.len() {
+                        if chars[j] == '\'' {
+                            if chars.get(j + 1) == Some(&'\'') {
+                                text.push('\'');
+                                j += 2;
+                                continue;
+                            }
+                            closed = true;
+                            break;
+                        }
+                        text.push(chars[j]);
+                        j += 1;
+                    }
+                    if !closed || chars.get(j + 1) != Some(&'!') {
+                        i = j + 1;
+                        continue;
+                    }
+                    i = j + 2;
+                    let (ext, rest) = split_external(&text);
+                    external = ext;
+                    name = rest;
+                } else if is_name(c) || c == '[' {
+                    if start > 0 && chars[start - 1] == '#' {
+                        // `#REF!` and friends.
+                        while i < chars.len() && is_name(chars[i]) {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    let mut j = i;
+                    let mut text = String::new();
+                    if chars[j] == '[' {
+                        while j < chars.len() && chars[j] != ']' {
+                            text.push(chars[j]);
+                            j += 1;
+                        }
+                        text.push(']');
+                        j += 1;
+                    }
+                    while j < chars.len() && (is_name(chars[j]) || chars[j] == ':') {
+                        text.push(chars[j]);
+                        j += 1;
+                    }
+                    if chars.get(j) != Some(&'!') || text.is_empty() {
+                        i = j.max(i + 1);
+                        continue;
+                    }
+                    i = j + 1;
+                    let (ext, rest) = split_external(&text);
+                    external = ext;
+                    name = rest;
+                } else {
+                    i += 1;
+                    continue;
+                }
+                // `Sheet1:Sheet3` names the sheets from one to the other;
+                // both ends are kept.
+                for part in name.split(':') {
+                    let part = part.trim();
+                    if !part.is_empty() {
+                        out.push(FormulaSheet {
+                            external,
+                            sheet: part.to_string(),
+                        });
+                    }
+                }
+            }
+            out
+        }
+
+        /// `[3]Sheet` -> (Some(3), "Sheet"); a name with no bracket prefix
+        /// is local. A path form (`C:\dir\[book.xlsx]Sheet`) names no
+        /// numbered link, so it counts as external with number 0.
+        fn split_external(text: &str) -> (Option<usize>, String) {
+            if let Some(rest) = text.strip_prefix('[')
+                && let Some(end) = rest.find(']')
+            {
+                let n = rest[..end].parse::<usize>().unwrap_or(0);
+                return (Some(n), rest[end + 1..].to_string());
+            }
+            if let (Some(open), Some(close)) = (text.find('['), text.find(']'))
+                && open < close
+            {
+                return (Some(0), text[close + 1..].to_string());
+            }
+            (None, text.to_string())
+        }
+
+        /// The formulas in a worksheet's XML, as they are read from `r`.
+        fn each_formula(mut r: impl std::io::Read, mut on_formula: impl FnMut(&str)) {
+            let mut buf = String::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut carry: Vec<u8> = Vec::new();
+            let mut formulas = 0usize;
+            loop {
+                let n = match r.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                carry.extend_from_slice(&chunk[..n]);
+                // Keep an incomplete UTF-8 tail for the next chunk.
+                let valid = match std::str::from_utf8(&carry) {
+                    Ok(_) => carry.len(),
+                    Err(e) => e.valid_up_to(),
+                };
+                buf.push_str(&String::from_utf8_lossy(&carry[..valid]));
+                carry.drain(..valid);
+                let mut pos = 0;
+                loop {
+                    let Some(at) = buf[pos..].find("<f").map(|p| p + pos) else {
+                        // Keep a possible `<` at the very end.
+                        pos = buf.len().saturating_sub(1);
+                        while !buf.is_char_boundary(pos) {
+                            pos -= 1;
+                        }
+                        break;
+                    };
+                    let Some(gt) = buf[at..].find('>').map(|p| p + at) else {
+                        pos = at;
+                        break;
+                    };
+                    let tag = &buf[at + 2..gt];
+                    // `<f>` / `<f t="shared" ...>`, not `<formula1>` or `<fill>`.
+                    let is_f =
+                        tag.is_empty() || tag.starts_with(|c: char| c.is_whitespace() || c == '/');
+                    if !is_f || tag.ends_with('/') {
+                        pos = gt + 1;
+                        continue;
+                    }
+                    let Some(end) = buf[gt..].find("</f>").map(|p| p + gt) else {
+                        // Not all here yet; a formula that never ends is dropped.
+                        if buf.len() - at > 4 * MAX_FORMULA_CHARS {
+                            pos = gt + 1;
+                            continue;
+                        }
+                        pos = at;
+                        break;
+                    };
+                    let text = &buf[gt + 1..end];
+                    if !text.is_empty() && text.chars().count() <= MAX_FORMULA_CHARS {
+                        on_formula(&xml_unescape_text(text));
+                    }
+                    formulas += 1;
+                    pos = end + 4;
+                    if formulas >= MAX_FORMULAS_PER_SHEET {
+                        return;
+                    }
+                }
+                buf.drain(..pos);
+            }
+        }
+
+        /// A spreadsheet's links to other files and between its sheets.
+        /// `.xlsx` and the other Open XML workbooks; `None` for any other
+        /// file.
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
+        pub(crate) fn workbook(path: &Path, ext: &str) -> Option<WorkbookFacts> {
+            if !matches!(ext, "xlsx" | "xlsm" | "xltx" | "xltm" | "xlam") {
+                return None;
+            }
+            let mut zip = zip_support::ZipArchive::open(path).ok()?;
+            let read = |zip: &mut zip_support::ZipArchive, name: &str| -> Option<String> {
+                zip.read(name)
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+            };
+            let workbook = read(&mut zip, "xl/workbook.xml")?;
+            let rels = read(&mut zip, "xl/_rels/workbook.xml.rels").unwrap_or_default();
+            // relationship id -> target
+            let mut target_of: HashMap<String, String> = HashMap::new();
+            for t in rels.split('<').filter(|t| t.starts_with("Relationship ")) {
+                if let (Some(id), Some(target)) = (attr(t, "Id"), attr(t, "Target")) {
+                    target_of.insert(id, target);
+                }
+            }
+            let part = |target: &str| -> String {
+                match target.strip_prefix('/') {
+                    Some(abs) => abs.to_string(),
+                    None => format!("xl/{target}"),
+                }
+            };
+            // The sheets, with the part holding each.
+            let mut sheets: Vec<(String, String)> = Vec::new();
+            for t in workbook.split('<').filter(|t| t.starts_with("sheet ")) {
+                if let (Some(name), Some(id)) = (attr(t, "name"), attr(t, "r:id"))
+                    && let Some(target) = target_of.get(&id)
+                {
+                    sheets.push((name, part(target)));
+                }
+            }
+            // External workbooks, numbered by their place in the list.
+            let mut external: Vec<String> = Vec::new();
+            for t in workbook
+                .split('<')
+                .filter(|t| t.starts_with("externalReference "))
+            {
+                let Some(id) = attr(t, "r:id") else { continue };
+                let target = target_of
+                    .get(&id)
+                    .map(|t| part(t))
+                    .and_then(|link| {
+                        let (dir, file) = link.rsplit_once('/')?;
+                        let rels = read(&mut zip, &format!("{dir}/_rels/{file}.rels"))?;
+                        rels.split('<')
+                            .filter(|t| t.starts_with("Relationship "))
+                            .find_map(|t| attr(t, "Target"))
+                    })
+                    .unwrap_or_default();
+                external.push(target);
+            }
+            let mut facts = WorkbookFacts {
+                external: external.iter().filter(|t| !t.is_empty()).cloned().collect(),
+                refs: Vec::new(),
+            };
+            for (name, part) in &sheets {
+                let Ok(tmp) = zip.read_to_temp(part) else {
+                    continue;
+                };
+                let Ok(file) = fs::File::open(tmp.path()) else {
+                    continue;
+                };
+                let mut counts: BTreeMap<(Option<String>, String), u32> = BTreeMap::new();
+                each_formula(std::io::BufReader::new(file), |formula| {
+                    let mut seen: Vec<(Option<String>, String)> = Vec::new();
+                    for r in formula_sheets(formula) {
+                        let ext = match r.external {
+                            None => None,
+                            Some(n) => Some(
+                                n.checked_sub(1)
+                                    .and_then(|k| external.get(k))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            ),
+                        };
+                        if ext.is_none() && &r.sheet == name {
+                            continue;
+                        }
+                        let key = (ext, r.sheet);
+                        if !seen.contains(&key) {
+                            seen.push(key);
+                        }
+                    }
+                    for key in seen {
+                        let n = counts.entry(key).or_insert(0);
+                        *n = n.saturating_add(1);
+                    }
+                });
+                for ((ext, to), count) in counts {
+                    facts.refs.push(SheetRef {
+                        from: name.clone(),
+                        external: ext,
+                        to,
+                        count,
+                    });
+                }
+            }
+            Some(facts)
+        }
+
         #[cfg(test)]
         mod tests {
             use super::*;
@@ -120937,6 +121325,39 @@ mod knowledge_graph {
                 ] {
                     let _ = rtf_bytes(rtf.as_bytes());
                 }
+            }
+
+            #[test]
+            fn formulas_name_the_sheets_they_read() {
+                let sheets = |f: &str| -> Vec<(Option<usize>, String)> {
+                    formula_sheets(f)
+                        .into_iter()
+                        .map(|r| (r.external, r.sheet))
+                        .collect()
+                };
+                let local = |names: &[&str]| -> Vec<(Option<usize>, String)> {
+                    names.iter().map(|n| (None, n.to_string())).collect()
+                };
+                assert_eq!(sheets("SUM(Data!B2:B6)"), local(&["Data"]));
+                assert_eq!(
+                    sheets("'It''s here'!A1+Data!B1"),
+                    local(&["It's here", "Data"])
+                );
+                assert_eq!(sheets(r#""Data!A1"&Other!B1"#), local(&["Other"]));
+                assert_eq!(sheets(r#"IF(A1>1,"x""y Z!A1",Z!A1)"#), local(&["Z"]));
+                assert_eq!(sheets("[1]Rates!B2"), [(Some(1), "Rates".to_string())]);
+                assert_eq!(
+                    sheets("'[2]My Sheet'!A1"),
+                    [(Some(2), "My Sheet".to_string())]
+                );
+                assert_eq!(sheets("SUM(Jan:Mar!A1)"), local(&["Jan", "Mar"]));
+                assert_eq!(
+                    sheets("#REF!+Sheet1!A1+Sheet2!#REF!"),
+                    local(&["Sheet1", "Sheet2"])
+                );
+                assert!(sheets("Table1[Col]+SUM(A1:B2)+Name").is_empty());
+                assert!(sheets("").is_empty());
+                assert!(sheets("'unterminated!A1").is_empty());
             }
 
             #[test]
@@ -121938,6 +122359,7 @@ mod knowledge_graph {
         link_entities(&mut b, &files, &contents, &file_node, &opts.overrides);
         let code_links = link_code(&mut b, &files, &file_node, &table_nodes);
         let unresolved = link_references(&mut b, &files, &contents, &file_node, &code_links.typed);
+        link_sheet_refs(&mut b, &files, &file_node, &table_nodes);
         link_same_names(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
@@ -123250,6 +123672,76 @@ mod knowledge_graph {
     /// different addresses (AMBIGUOUS, up to five). `member_of` joins a
     /// person to the organization domain of their address when that is
     /// already a node.
+    /// A workbook's formulas that read another sheet become a directed
+    /// `references` link from the sheet to the one it reads; formulas that
+    /// reach into another workbook link to that workbook's sheet (or the
+    /// workbook, when only the file is among the inputs).
+    fn link_sheet_refs(
+        b: &mut Builder,
+        files: &[KgFile],
+        file_node: &[usize],
+        table_nodes: &[(usize, usize, usize)],
+    ) {
+        let mut sheet_node: HashMap<(usize, String), usize> = HashMap::new();
+        for &(node, fi, ti) in table_nodes {
+            sheet_node.insert((fi, files[fi].tables[ti].0.to_lowercase()), node);
+        }
+        let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            by_name.entry(f.name.to_lowercase()).or_default().push(fi);
+        }
+        for (fi, f) in files.iter().enumerate() {
+            // (from node, to node) -> (cells, sheet names)
+            let mut agg: BTreeMap<(usize, usize), (u32, String, String)> = BTreeMap::new();
+            for r in &f.sheet_refs {
+                let Some(&from) = sheet_node.get(&(fi, r.from.to_lowercase())) else {
+                    continue;
+                };
+                let to = match &r.external {
+                    None => sheet_node.get(&(fi, r.to.to_lowercase())).copied(),
+                    Some(target) => {
+                        let base = target
+                            .rsplit(['/', '\\'])
+                            .next()
+                            .unwrap_or(target)
+                            .replace("%20", " ")
+                            .to_lowercase();
+                        match by_name.get(&base).map(Vec::as_slice) {
+                            Some([other]) if *other != fi => sheet_node
+                                .get(&(*other, r.to.to_lowercase()))
+                                .copied()
+                                .or(Some(file_node[*other])),
+                            _ => None,
+                        }
+                    }
+                };
+                let Some(to) = to.filter(|t| *t != from) else {
+                    continue;
+                };
+                let e = agg
+                    .entry((from, to))
+                    .or_insert((0, r.from.clone(), r.to.clone()));
+                e.0 = e.0.saturating_add(r.count);
+            }
+            for ((from, to), (cells, from_name, to_name)) in agg {
+                b.add_edge(
+                    from,
+                    to,
+                    Relation::References,
+                    Conf::Extracted,
+                    1.0,
+                    1.0,
+                    vec![format!(
+                        "{} formula cell{} in sheet \"{from_name}\" read sheet \"{to_name}\"",
+                        cells,
+                        if cells == 1 { "" } else { "s" }
+                    )],
+                );
+                b.edges.last_mut().expect("just pushed").directed = true;
+            }
+        }
+    }
+
     fn link_people(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
         // Identities: an address, or the name of a contact with none.
         let mut key_of: HashMap<String, usize> = HashMap::new();
@@ -129286,6 +129778,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 meta: Vec::new(),
                 code: None,
                 people: Vec::new(),
+                sheet_refs: Vec::new(),
             }
         }
 
@@ -130794,6 +131287,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 meta: Vec::new(),
                 code: None,
                 people: Vec::new(),
+                sheet_refs: Vec::new(),
             }
         }
 
