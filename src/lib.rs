@@ -117129,6 +117129,269 @@ mod git_history {
     }
 }
 
+// --- Live database schemas (for `sniff-rs graph --db`) ---
+//
+// The tables, columns and keys of a running PostgreSQL or MySQL database,
+// read by running that database's own client (`psql`, `mysql`) as
+// `--load-into` does, and turned into the same table shape a SQL dump
+// gives. Only the catalog is read, never the data.
+mod live_db {
+    use super::sql_ddl::{Column, ForeignKey, Table};
+    use super::*;
+
+    /// The field separator asked of the client (ASCII "unit separator").
+    const SEP: char = '\u{1f}';
+
+    /// `schema.table`, or just `table` in the default schema.
+    fn qualified(schema: &str, table: &str, default_schema: &str) -> String {
+        if schema == default_schema || schema.is_empty() {
+            table.to_string()
+        } else {
+            format!("{schema}.{table}")
+        }
+    }
+
+    /// Runs one query through the client and returns its rows as fields.
+    fn query(target: &LoadTarget, sql: &str) -> Result<Vec<Vec<String>>> {
+        let name = target.engine.command_name();
+        let mut cmd = target.command();
+        match target.engine {
+            LoadEngine::Postgres => {
+                cmd.args(["-A", "-t", "-F"])
+                    .arg(SEP.to_string())
+                    .arg("-c")
+                    .arg(sql);
+            }
+            LoadEngine::MySql => {
+                cmd.args(["-N", "-B", "-e"]).arg(sql);
+            }
+            _ => bail!(
+                "--db reads PostgreSQL and MySQL servers; a SQLite or DuckDB file is graphed as a file"
+            ),
+        }
+        let output = cmd
+            .stdin(std::process::Stdio::null())
+            .output()
+            .with_context(|| {
+                format!("failed to launch `{name}` for --db - is it installed and on PATH?")
+            })?;
+        if !output.status.success() {
+            bail!(
+                "{name} could not read the catalog: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let sep = if matches!(target.engine, LoadEngine::MySql) {
+            '\t'
+        } else {
+            SEP
+        };
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split(sep).map(str::to_string).collect())
+            .collect())
+    }
+
+    const PG_USER_TABLES: &str = "c.relkind in ('r','p') \
+        and n.nspname not in ('pg_catalog','information_schema') and n.nspname !~ '^pg_toast'";
+
+    fn postgres(target: &LoadTarget) -> Result<Vec<Table>> {
+        let mut tables: Vec<Table> = Vec::new();
+        let columns = query(
+            target,
+            &format!(
+                "select n.nspname, c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull::int \
+                 from pg_attribute a join pg_class c on c.oid = a.attrelid \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 where a.attnum > 0 and not a.attisdropped and {PG_USER_TABLES} \
+                 order by n.nspname, c.relname, a.attnum"
+            ),
+        )?;
+        for row in columns {
+            let [schema, table, column, ty, not_null] = row.as_slice() else {
+                continue;
+            };
+            let name = qualified(schema, table, "public");
+            if tables.last().is_none_or(|t| t.name != name) {
+                tables.push(Table {
+                    name,
+                    ..Table::default()
+                });
+            }
+            tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(Column {
+                    name: column.clone(),
+                    ty: ty.clone(),
+                    not_null: not_null == "1",
+                });
+        }
+        let keys = query(
+            target,
+            &format!(
+                "select n.nspname, c.relname, a.attname \
+                 from pg_constraint p join pg_class c on c.oid = p.conrelid \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 cross join lateral unnest(p.conkey) with ordinality as k(attnum, ord) \
+                 join pg_attribute a on a.attrelid = c.oid and a.attnum = k.attnum \
+                 where p.contype = 'p' and {PG_USER_TABLES} \
+                 order by n.nspname, c.relname, k.ord"
+            ),
+        )?;
+        for row in keys {
+            let [schema, table, column] = row.as_slice() else {
+                continue;
+            };
+            let name = qualified(schema, table, "public");
+            if let Some(t) = tables.iter_mut().find(|t| t.name == name) {
+                t.primary_key.push(column.clone());
+            }
+        }
+        let fks = query(
+            target,
+            &format!(
+                "select n.nspname, c.relname, f.oid, a.attname, rn.nspname, rc.relname, ra.attname \
+                 from pg_constraint f join pg_class c on c.oid = f.conrelid \
+                 join pg_namespace n on n.oid = c.relnamespace \
+                 join pg_class rc on rc.oid = f.confrelid \
+                 join pg_namespace rn on rn.oid = rc.relnamespace \
+                 cross join lateral unnest(f.conkey, f.confkey) with ordinality as k(ck, fk, ord) \
+                 join pg_attribute a on a.attrelid = c.oid and a.attnum = k.ck \
+                 join pg_attribute ra on ra.attrelid = rc.oid and ra.attnum = k.fk \
+                 where f.contype = 'f' and {PG_USER_TABLES} \
+                 order by f.oid, k.ord"
+            ),
+        )?;
+        let mut last: Option<(String, String)> = None;
+        for row in fks {
+            let [schema, table, oid, column, rschema, rtable, rcolumn] = row.as_slice() else {
+                continue;
+            };
+            let name = qualified(schema, table, "public");
+            let rname = qualified(rschema, rtable, "public");
+            let Some(t) = tables.iter_mut().find(|t| t.name == name) else {
+                continue;
+            };
+            let key = (name.clone(), oid.clone());
+            if last.as_ref() == Some(&key) {
+                let fk = t.foreign_keys.last_mut().expect("same constraint");
+                fk.columns.push(column.clone());
+                fk.target.push(rcolumn.clone());
+            } else {
+                t.foreign_keys.push(ForeignKey {
+                    columns: vec![column.clone()],
+                    table: rname,
+                    target: vec![rcolumn.clone()],
+                });
+                last = Some(key);
+            }
+        }
+        Ok(tables)
+    }
+
+    fn mysql(target: &LoadTarget) -> Result<Vec<Table>> {
+        let probe = query(target, "select database()")?;
+        if probe
+            .first()
+            .and_then(|r| r.first())
+            .is_none_or(|d| d == "NULL")
+        {
+            bail!("a MySQL --db target has to name a database (mysql://user@host/database)");
+        }
+        let mut tables: Vec<Table> = Vec::new();
+        let columns = query(
+            target,
+            "select c.table_name, c.column_name, c.column_type, c.is_nullable \
+             from information_schema.columns c \
+             join information_schema.tables t on t.table_schema = c.table_schema and t.table_name = c.table_name \
+             where c.table_schema = database() and t.table_type = 'BASE TABLE' \
+             order by c.table_name, c.ordinal_position",
+        )?;
+        for row in columns {
+            let [table, column, ty, nullable] = row.as_slice() else {
+                continue;
+            };
+            if tables.last().is_none_or(|t| &t.name != table) {
+                tables.push(Table {
+                    name: table.clone(),
+                    ..Table::default()
+                });
+            }
+            tables
+                .last_mut()
+                .expect("just pushed")
+                .columns
+                .push(Column {
+                    name: column.clone(),
+                    ty: ty.clone(),
+                    not_null: nullable == "NO",
+                });
+        }
+        let keys = query(
+            target,
+            "select table_name, constraint_name, column_name, ifnull(referenced_table_name, ''), \
+             ifnull(referenced_column_name, '') from information_schema.key_column_usage \
+             where table_schema = database() order by table_name, constraint_name, ordinal_position",
+        )?;
+        let mut last: Option<(String, String)> = None;
+        for row in keys {
+            let [table, constraint, column, rtable, rcolumn] = row.as_slice() else {
+                continue;
+            };
+            let Some(t) = tables.iter_mut().find(|t| &t.name == table) else {
+                continue;
+            };
+            if constraint == "PRIMARY" {
+                t.primary_key.push(column.clone());
+            } else if !rtable.is_empty() {
+                let key = (table.clone(), constraint.clone());
+                if last.as_ref() == Some(&key) {
+                    let fk = t.foreign_keys.last_mut().expect("same constraint");
+                    fk.columns.push(column.clone());
+                    fk.target.push(rcolumn.clone());
+                } else {
+                    t.foreign_keys.push(ForeignKey {
+                        columns: vec![column.clone()],
+                        table: rtable.clone(),
+                        target: vec![rcolumn.clone()],
+                    });
+                    last = Some(key);
+                }
+            }
+        }
+        Ok(tables)
+    }
+
+    /// A database named on the command line (`postgresql://...`,
+    /// `mysql://...`, `postgres:name`): its label (engine and database
+    /// name, never a host or password) and its tables.
+    pub(crate) fn read(spec: &str) -> Result<(String, Vec<Table>)> {
+        let target = LoadTarget::parse(spec)
+            .map_err(|e| anyhow!("{}", e.to_string().replace("--load-into", "--db")))?;
+        let tables = match target.engine {
+            LoadEngine::Postgres => postgres(&target)?,
+            LoadEngine::MySql => mysql(&target)?,
+            _ => bail!(
+                "--db reads PostgreSQL and MySQL servers; a SQLite or DuckDB file is graphed as a file"
+            ),
+        };
+        let engine = match target.engine {
+            LoadEngine::Postgres => "postgres",
+            _ => "mysql",
+        };
+        let database = target.database_prefix();
+        let label = if database.is_empty() {
+            format!("{engine}-database")
+        } else {
+            format!("{engine}-{database}")
+        };
+        Ok((label, tables))
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -118807,6 +119070,8 @@ mod knowledge_graph {
         /// Read the git history of the folder: who changed each file and
         /// which files change together.
         pub(crate) git: bool,
+        /// Running databases to read the schema of (`--db`).
+        pub(crate) databases: Vec<String>,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -118944,11 +119209,38 @@ mod knowledge_graph {
         if opts.git {
             attach_git_history(input, &mut out)?;
         }
+        for spec in &opts.databases {
+            let (label, tables) = live_db::read(spec)?;
+            out.push(database_file(label, &tables));
+        }
         let name = input
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| input.display().to_string());
         Ok((name, out))
+    }
+
+    /// A running database as a file of tables: it has no bytes of its own
+    /// to read, only a catalog.
+    fn database_file(label: String, tables: &[sql_ddl::Table]) -> KgFile {
+        KgFile {
+            rel: label.clone(),
+            name: label,
+            file_type: "database".to_string(),
+            kind: FileKind::Data,
+            size: 0,
+            tables: sql_ddl::to_profiles(tables),
+            text: None,
+            error: None,
+            fixed_schema: false,
+            truncated_scan: false,
+            hash: None,
+            meta: Vec::new(),
+            code: None,
+            people: Vec::new(),
+            sheet_refs: Vec::new(),
+            changes_with: Vec::new(),
+        }
     }
 
     /// Reads the git history of the graphed folder and gives each file its
@@ -131900,6 +132192,12 @@ OPTIONS:
                                 git-author) and files that change in the
                                 same commits are linked (changes_with).
                                 Implies --people
+        --db <TARGET>           Read the tables, columns and keys of a
+                                running database, as a file of tables
+                                (repeatable). TARGET is postgresql://...
+                                or mysql://... (or postgres:name,
+                                mysql:name); runs psql or mysql, reads
+                                the catalog only, never the data
         --columns               Add a node for each column that tables
                                 share or a query uses, so "which tables
                                 hold customer_id" and "which columns
@@ -131999,6 +132297,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut columns: Option<bool> = None;
     let mut people: Option<bool> = None;
     let mut git: Option<bool> = None;
+    let mut databases: Vec<String> = Vec::new();
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
     let mut link_files: Vec<PathBuf> = Vec::new();
@@ -132078,6 +132377,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
                     }
                     git = Some(true);
                 }
+                "db" => databases.push(value(&mut i)?),
                 "resolution" => {
                     let v = value(&mut i)?;
                     resolution = Some(
@@ -132224,6 +132524,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             patterns_fingerprint,
             people,
             git,
+            databases,
         },
     )?;
     if files.is_empty() {
@@ -132481,6 +132782,7 @@ fn load_knowledge_graph_input(
                 patterns_fingerprint,
                 people: cfg.people.unwrap_or(false) || cfg.git.unwrap_or(false),
                 git: cfg.git.unwrap_or(false),
+                databases: Vec::new(),
             },
         )?;
         if files.is_empty() {
