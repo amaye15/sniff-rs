@@ -115722,6 +115722,1127 @@ mod people_facts_tests {
     }
 }
 
+// --- SQL schema (DDL) reading, for the knowledge graph ---
+//
+// A SQL dump says what a database holds: its tables, their columns and
+// types, and the keys that tie them together. The reader below pulls those
+// out of a script (`CREATE TABLE`, and `ALTER TABLE ... ADD ... KEY` as
+// `pg_dump` writes foreign keys) without a SQL parser: a scanner that
+// splits statements (quotes, comments, dollar quoting, `COPY ... FROM stdin`
+// data blocks, MySQL conditional comments) and keeps only the DDL, and a
+// small recursive reader of the table body. Data (`INSERT`, `COPY`) is
+// skipped, so a dump of any size reads in constant memory.
+mod sql_ddl {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct Column {
+        pub name: String,
+        pub ty: String,
+        pub not_null: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct ForeignKey {
+        pub columns: Vec<String>,
+        pub table: String,
+        /// Empty when the clause names only the table (the primary key).
+        pub target: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub(crate) struct Table {
+        pub name: String,
+        pub columns: Vec<Column>,
+        pub primary_key: Vec<String>,
+        pub foreign_keys: Vec<ForeignKey>,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Tok {
+        Word(String),
+        Quoted(String),
+        Str(String),
+        Sym(char),
+    }
+
+    /// Longest statement kept (tokens); a bigger one is ignored.
+    const MAX_STATEMENT_TOKENS: usize = 200_000;
+    /// Longest string literal kept in a token.
+    const MAX_STRING_KEPT: usize = 256;
+
+    #[derive(Clone, PartialEq)]
+    enum State {
+        Normal,
+        /// After one `-`: a second makes a line comment.
+        Dash,
+        /// After one `/`: a `*` opens a block comment.
+        Slash,
+        LineComment,
+        BlockComment,
+        /// A string (`'`) or quoted identifier (`"`, `` ` ``). `escaped` is
+        /// set after a backslash; `closing` after a quote that ends the
+        /// literal unless another quote follows (a doubled quote).
+        Quote {
+            quote: char,
+            backslash: bool,
+            escaped: bool,
+            closing: bool,
+        },
+        /// After a `$`: reading a possible dollar-quote tag.
+        MaybeDollar(String),
+        /// Inside `$tag$ ... $tag$` (the closing tag).
+        Dollar(String),
+        /// Raw rows after `COPY ... FROM stdin;`, up to a line `\.`.
+        CopyData,
+    }
+
+    struct Scanner {
+        state: State,
+        word: String,
+        tokens: Vec<Tok>,
+        /// The text of the literal being read.
+        text: String,
+        /// Whether this statement's tokens are kept (it starts with a DDL
+        /// or `SET` keyword) or only scanned for its end.
+        keep: Option<bool>,
+        overflow: bool,
+        /// Whether a backslash escapes in a `'...'` string: true until a
+        /// script says `standard_conforming_strings = on` (PostgreSQL).
+        backslash_strings: bool,
+        copy_line: String,
+        block_prev: char,
+        tables: Vec<Table>,
+    }
+
+    impl Scanner {
+        fn new() -> Self {
+            Scanner {
+                state: State::Normal,
+                word: String::new(),
+                tokens: Vec::new(),
+                text: String::new(),
+                keep: None,
+                overflow: false,
+                backslash_strings: true,
+                copy_line: String::new(),
+                block_prev: ' ',
+                tables: Vec::new(),
+            }
+        }
+
+        fn push_token(&mut self, tok: Tok) {
+            if self.keep.is_none() {
+                self.keep = Some(match &tok {
+                    Tok::Word(w) => matches!(
+                        w.to_ascii_lowercase().as_str(),
+                        "create" | "alter" | "set" | "copy"
+                    ),
+                    _ => false,
+                });
+            }
+            if self.keep == Some(true) {
+                if self.tokens.len() >= MAX_STATEMENT_TOKENS {
+                    self.overflow = true;
+                } else {
+                    self.tokens.push(tok);
+                }
+            }
+        }
+
+        fn flush_word(&mut self) {
+            if !self.word.is_empty() {
+                let w = std::mem::take(&mut self.word);
+                self.push_token(Tok::Word(w));
+            }
+        }
+
+        fn end_statement(&mut self) {
+            self.flush_word();
+            let tokens = std::mem::take(&mut self.tokens);
+            let overflow = self.overflow;
+            self.keep = None;
+            self.overflow = false;
+            if tokens.is_empty() || overflow {
+                return;
+            }
+            let first = match &tokens[0] {
+                Tok::Word(w) => w.to_ascii_lowercase(),
+                _ => return,
+            };
+            match first.as_str() {
+                "create" => create_table(&tokens, &mut self.tables),
+                "alter" => alter_table(&tokens, &mut self.tables),
+                "set" => {
+                    // `SET standard_conforming_strings = on`
+                    let words: Vec<String> = tokens
+                        .iter()
+                        .filter_map(|t| match t {
+                            Tok::Word(w) | Tok::Str(w) => Some(w.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .collect();
+                    if words.len() >= 3
+                        && words[1] == "standard_conforming_strings"
+                        && words[2] == "on"
+                    {
+                        self.backslash_strings = false;
+                    }
+                }
+                "copy" => {
+                    let lower: Vec<String> = tokens
+                        .iter()
+                        .filter_map(|t| match t {
+                            Tok::Word(w) => Some(w.to_ascii_lowercase()),
+                            _ => None,
+                        })
+                        .collect();
+                    if lower.windows(2).any(|w| w[0] == "from" && w[1] == "stdin") {
+                        self.state = State::CopyData;
+                        self.copy_line.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn feed(&mut self, chunk: &str) {
+            for c in chunk.chars() {
+                let state = std::mem::replace(&mut self.state, State::Normal);
+                let next = match state {
+                    State::Normal => self.normal(c),
+                    State::Dash => {
+                        if c == '-' {
+                            State::LineComment
+                        } else {
+                            self.push_token(Tok::Sym('-'));
+                            self.normal(c)
+                        }
+                    }
+                    State::Slash => {
+                        if c == '*' {
+                            self.block_prev = ' ';
+                            State::BlockComment
+                        } else {
+                            self.push_token(Tok::Sym('/'));
+                            self.normal(c)
+                        }
+                    }
+                    State::LineComment => {
+                        if c == '\n' {
+                            State::Normal
+                        } else {
+                            State::LineComment
+                        }
+                    }
+                    State::BlockComment => {
+                        let done = self.block_prev == '*' && c == '/';
+                        self.block_prev = c;
+                        if done {
+                            State::Normal
+                        } else {
+                            State::BlockComment
+                        }
+                    }
+                    State::Quote {
+                        quote,
+                        backslash,
+                        escaped,
+                        closing,
+                    } => self.quoted(c, quote, backslash, escaped, closing),
+                    State::MaybeDollar(mut tag) => {
+                        if c == '$' {
+                            // `$$` or `$tag$`: a dollar-quoted string.
+                            self.text.clear();
+                            State::Dollar(format!("${tag}$"))
+                        } else if c.is_alphanumeric() || c == '_' {
+                            tag.push(c);
+                            State::MaybeDollar(tag)
+                        } else {
+                            // Not a quote: a `$1` parameter or the like.
+                            self.word.push('$');
+                            self.word.push_str(&tag);
+                            self.normal(c)
+                        }
+                    }
+                    State::Dollar(close) => {
+                        self.text.push(c);
+                        if self.text.ends_with(&close) {
+                            self.push_token(Tok::Str(String::new()));
+                            State::Normal
+                        } else {
+                            // Only the tail can complete the closing tag.
+                            if self.text.len() > close.len() * 8 {
+                                let mut cut = self.text.len() - close.len();
+                                while !self.text.is_char_boundary(cut) {
+                                    cut += 1;
+                                }
+                                self.text.drain(..cut);
+                            }
+                            State::Dollar(close)
+                        }
+                    }
+                    State::CopyData => {
+                        if c == '\n' {
+                            let done = self.copy_line.trim_end_matches('\r') == "\\.";
+                            self.copy_line.clear();
+                            if done { State::Normal } else { State::CopyData }
+                        } else {
+                            if self.copy_line.len() < 8 {
+                                self.copy_line.push(c);
+                            }
+                            State::CopyData
+                        }
+                    }
+                };
+                self.state = next;
+            }
+        }
+
+        fn quoted(
+            &mut self,
+            c: char,
+            quote: char,
+            backslash: bool,
+            escaped: bool,
+            closing: bool,
+        ) -> State {
+            let same = |escaped, closing| State::Quote {
+                quote,
+                backslash,
+                escaped,
+                closing,
+            };
+            if escaped {
+                self.keep_text(c);
+                return same(false, false);
+            }
+            if closing {
+                if c == quote {
+                    // A doubled quote is one quote of the literal.
+                    self.keep_text(c);
+                    return same(false, false);
+                }
+                self.finish_quoted(quote);
+                return self.normal(c);
+            }
+            if backslash && c == '\\' {
+                return same(true, false);
+            }
+            if c == quote {
+                return same(false, true);
+            }
+            self.keep_text(c);
+            same(false, false)
+        }
+
+        fn keep_text(&mut self, c: char) {
+            if self.text.len() < MAX_STRING_KEPT * 4 {
+                self.text.push(c);
+            }
+        }
+
+        fn finish_quoted(&mut self, quote: char) {
+            let text = std::mem::take(&mut self.text);
+            if quote == '\'' {
+                self.push_token(Tok::Str(text.chars().take(MAX_STRING_KEPT).collect()));
+            } else {
+                self.push_token(Tok::Quoted(text));
+            }
+        }
+
+        fn normal(&mut self, c: char) -> State {
+            if c.is_alphanumeric() || c == '_' || c == '@' {
+                self.word.push(c);
+                return State::Normal;
+            }
+            match c {
+                '$' => {
+                    if self.word.is_empty() {
+                        return State::MaybeDollar(String::new());
+                    }
+                    self.word.push('$');
+                    State::Normal
+                }
+                '\'' | '"' | '`' => {
+                    // A quote right after `E` opens an escape string.
+                    let escape_string = c == '\'' && matches!(self.word.as_str(), "E" | "e");
+                    if escape_string {
+                        self.word.clear();
+                    }
+                    self.flush_word();
+                    self.text.clear();
+                    State::Quote {
+                        quote: c,
+                        backslash: c == '\'' && (self.backslash_strings || escape_string),
+                        escaped: false,
+                        closing: false,
+                    }
+                }
+                '-' => {
+                    self.flush_word();
+                    State::Dash
+                }
+                '/' => {
+                    self.flush_word();
+                    State::Slash
+                }
+                '#' if self.word.is_empty() => State::LineComment,
+                // A psql meta-command (`\restrict key`, `\connect db`) is a
+                // line of its own, never part of a statement.
+                '\\' if self.word.is_empty() && self.tokens.is_empty() && self.keep.is_none() => {
+                    State::LineComment
+                }
+                ';' => {
+                    // `COPY ... FROM stdin;` moves to its data block.
+                    self.state = State::Normal;
+                    self.end_statement();
+                    std::mem::replace(&mut self.state, State::Normal)
+                }
+                c if c.is_whitespace() => {
+                    self.flush_word();
+                    State::Normal
+                }
+                c => {
+                    self.flush_word();
+                    self.push_token(Tok::Sym(c));
+                    State::Normal
+                }
+            }
+        }
+
+        fn finish(mut self) -> Vec<Table> {
+            match std::mem::replace(&mut self.state, State::Normal) {
+                // A literal closed by the last character of the file.
+                State::Quote {
+                    quote,
+                    closing: true,
+                    ..
+                } => self.finish_quoted(quote),
+                State::Dash => self.push_token(Tok::Sym('-')),
+                State::Slash => self.push_token(Tok::Sym('/')),
+                _ => {}
+            }
+            self.end_statement();
+            self.tables
+        }
+    }
+
+    /// The tables a SQL script declares. A script that is not UTF-8 reads
+    /// as no tables.
+    pub(crate) fn parse_file(path: &Path) -> Result<Vec<Table>> {
+        let mut scanner = Scanner::new();
+        stream_utf8_chunks(path, |chunk| {
+            scanner.feed(chunk);
+            Ok(true)
+        })?;
+        Ok(scanner.finish())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parse_str(text: &str) -> Vec<Table> {
+        let mut scanner = Scanner::new();
+        scanner.feed(text);
+        scanner.finish()
+    }
+
+    fn is_kw(tok: Option<&Tok>, word: &str) -> bool {
+        matches!(tok, Some(Tok::Word(w)) if w.eq_ignore_ascii_case(word))
+    }
+
+    fn ident(tok: Option<&Tok>) -> Option<String> {
+        match tok {
+            Some(Tok::Word(w)) | Some(Tok::Quoted(w)) => Some(w.clone()),
+            _ => None,
+        }
+    }
+
+    /// `a.b.c` -> `c`, with the index after it.
+    fn qualified_name(tokens: &[Tok], mut i: usize) -> Option<(String, usize)> {
+        let mut name = ident(tokens.get(i))?;
+        i += 1;
+        while matches!(tokens.get(i), Some(Tok::Sym('.'))) {
+            name = ident(tokens.get(i + 1))?;
+            i += 2;
+        }
+        Some((name, i))
+    }
+
+    /// The index of the `)` matching the `(` at `open`.
+    fn matching_paren(tokens: &[Tok], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (k, t) in tokens.iter().enumerate().skip(open) {
+            match t {
+                Tok::Sym('(') => depth += 1,
+                Tok::Sym(')') => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(k);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `tokens` split at commas outside parentheses.
+    fn split_commas(tokens: &[Tok]) -> Vec<&[Tok]> {
+        let mut out = Vec::new();
+        let (mut depth, mut start) = (0usize, 0usize);
+        for (k, t) in tokens.iter().enumerate() {
+            match t {
+                Tok::Sym('(') => depth += 1,
+                Tok::Sym(')') => depth = depth.saturating_sub(1),
+                Tok::Sym(',') if depth == 0 => {
+                    out.push(&tokens[start..k]);
+                    start = k + 1;
+                }
+                _ => {}
+            }
+        }
+        if start < tokens.len() {
+            out.push(&tokens[start..]);
+        }
+        out
+    }
+
+    /// `(a, b DESC, c(10))` -> `[a, b, c]` and the index after the `)`.
+    fn ident_list(tokens: &[Tok], open: usize) -> Option<(Vec<String>, usize)> {
+        if !matches!(tokens.get(open), Some(Tok::Sym('('))) {
+            return None;
+        }
+        let close = matching_paren(tokens, open)?;
+        let names = split_commas(&tokens[open + 1..close])
+            .into_iter()
+            .filter_map(|item| ident(item.first()))
+            .collect();
+        Some((names, close + 1))
+    }
+
+    fn create_table(tokens: &[Tok], tables: &mut Vec<Table>) {
+        let mut i = 1;
+        while let Some(Tok::Word(w)) = tokens.get(i) {
+            if matches!(
+                w.to_ascii_lowercase().as_str(),
+                "or" | "replace"
+                    | "global"
+                    | "local"
+                    | "temp"
+                    | "temporary"
+                    | "unlogged"
+                    | "transient"
+                    | "volatile"
+            ) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !is_kw(tokens.get(i), "table") {
+            return;
+        }
+        i += 1;
+        if is_kw(tokens.get(i), "if")
+            && is_kw(tokens.get(i + 1), "not")
+            && is_kw(tokens.get(i + 2), "exists")
+        {
+            i += 3;
+        }
+        let Some((name, next)) = qualified_name(tokens, i) else {
+            return;
+        };
+        if !matches!(tokens.get(next), Some(Tok::Sym('('))) {
+            return;
+        }
+        let Some(close) = matching_paren(tokens, next) else {
+            return;
+        };
+        if tables.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+            return;
+        }
+        let mut table = Table {
+            name,
+            ..Table::default()
+        };
+        for item in split_commas(&tokens[next + 1..close]) {
+            table_item(item, &mut table);
+        }
+        tables.push(table);
+    }
+
+    /// One entry of a table body or `ALTER TABLE ... ADD`: a constraint, or
+    /// a column.
+    fn table_item(item: &[Tok], table: &mut Table) {
+        let Some(Tok::Word(first)) = item.first() else {
+            if let Some(column) = column_def(item, table) {
+                table.columns.push(column);
+            }
+            return;
+        };
+        let first = first.to_ascii_lowercase();
+        let constraint = match first.as_str() {
+            "constraint" | "primary" | "foreign" | "unique" | "check" | "fulltext" | "spatial"
+            | "exclude" | "like" | "period" => true,
+            // `KEY name (cols)` and `INDEX (cols)` are indexes, but `key text`
+            // and `index int` are columns.
+            "key" | "index" => {
+                matches!(item.get(1), Some(Tok::Sym('(')))
+                    || (ident(item.get(1)).is_some()
+                        && matches!(item.get(2), Some(Tok::Sym('(')))
+                        && !matches!(item.get(3), Some(Tok::Word(w)) if w.chars().all(|c| c.is_ascii_digit())))
+            }
+            _ => false,
+        };
+        if constraint {
+            table_constraint(item, table);
+        } else if let Some(column) = column_def(item, table) {
+            table.columns.push(column);
+        }
+    }
+
+    fn table_constraint(item: &[Tok], table: &mut Table) {
+        let mut i = 0;
+        if is_kw(item.get(i), "constraint") {
+            i += 1;
+            if !matches!(item.get(i), Some(Tok::Word(w)) if matches!(w.to_ascii_lowercase().as_str(), "primary" | "foreign" | "unique" | "check"))
+            {
+                i += 1;
+            }
+        }
+        if is_kw(item.get(i), "primary") && is_kw(item.get(i + 1), "key") {
+            if let Some(open) = item[i..].iter().position(|t| *t == Tok::Sym('('))
+                && let Some((cols, _)) = ident_list(item, i + open)
+            {
+                table.primary_key = cols;
+            }
+        } else if is_kw(item.get(i), "foreign") && is_kw(item.get(i + 1), "key") {
+            let Some(open) = item[i..].iter().position(|t| *t == Tok::Sym('(')) else {
+                return;
+            };
+            let Some((columns, after)) = ident_list(item, i + open) else {
+                return;
+            };
+            if let Some(fk) = references(item, after, columns) {
+                table.foreign_keys.push(fk);
+            }
+        }
+    }
+
+    /// `REFERENCES t [(c, ...)]` found at or after `from`.
+    fn references(tokens: &[Tok], from: usize, columns: Vec<String>) -> Option<ForeignKey> {
+        let at = tokens[from..]
+            .iter()
+            .position(|t| matches!(t, Tok::Word(w) if w.eq_ignore_ascii_case("references")))?;
+        let (table, next) = qualified_name(tokens, from + at + 1)?;
+        let target = ident_list(tokens, next).map(|(c, _)| c).unwrap_or_default();
+        Some(ForeignKey {
+            columns,
+            table,
+            target,
+        })
+    }
+
+    fn column_def(item: &[Tok], table: &mut Table) -> Option<Column> {
+        let name = ident(item.first())?;
+        // The type: everything up to a constraint keyword outside parens.
+        let mut j = 1;
+        let mut depth = 0usize;
+        while let Some(t) = item.get(j) {
+            match t {
+                Tok::Sym('(') => depth += 1,
+                Tok::Sym(')') => depth = depth.saturating_sub(1),
+                Tok::Word(w) if depth == 0 => {
+                    let w = w.to_ascii_lowercase();
+                    let stop = matches!(
+                        w.as_str(),
+                        "not"
+                            | "null"
+                            | "default"
+                            | "primary"
+                            | "references"
+                            | "unique"
+                            | "check"
+                            | "collate"
+                            | "generated"
+                            | "constraint"
+                            | "auto_increment"
+                            | "autoincrement"
+                            | "identity"
+                            | "comment"
+                            | "on"
+                            | "charset"
+                            | "as"
+                            | "encode"
+                            | "key"
+                    ) || (w == "character" && is_kw(item.get(j + 1), "set"));
+                    if stop {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        let mut ty = String::new();
+        let mut previous_word = false;
+        for t in &item[1..j.min(item.len())] {
+            match t {
+                Tok::Word(w) | Tok::Quoted(w) => {
+                    if previous_word {
+                        ty.push(' ');
+                    }
+                    ty.push_str(w);
+                    previous_word = true;
+                }
+                Tok::Str(s) => {
+                    ty.push_str(&format!("'{s}'"));
+                    previous_word = false;
+                }
+                Tok::Sym(',') => {
+                    ty.push_str(", ");
+                    previous_word = false;
+                }
+                Tok::Sym(c) => {
+                    ty.push(*c);
+                    previous_word = false;
+                }
+            }
+        }
+        let mut not_null = false;
+        let mut k = j;
+        while k < item.len() {
+            if is_kw(item.get(k), "not") && is_kw(item.get(k + 1), "null") {
+                not_null = true;
+                k += 2;
+            } else if is_kw(item.get(k), "primary") && is_kw(item.get(k + 1), "key") {
+                not_null = true;
+                table.primary_key.push(name.clone());
+                k += 2;
+            } else if is_kw(item.get(k), "references") {
+                if let Some((target, next)) = qualified_name(item, k + 1) {
+                    let cols = ident_list(item, next).map(|(c, _)| c).unwrap_or_default();
+                    table.foreign_keys.push(ForeignKey {
+                        columns: vec![name.clone()],
+                        table: target,
+                        target: cols,
+                    });
+                    k = next;
+                } else {
+                    k += 1;
+                }
+            } else {
+                k += 1;
+            }
+        }
+        Some(Column { name, ty, not_null })
+    }
+
+    fn alter_table(tokens: &[Tok], tables: &mut [Table]) {
+        if !is_kw(tokens.get(1), "table") {
+            return;
+        }
+        let mut i = 2;
+        if is_kw(tokens.get(i), "only") {
+            i += 1;
+        }
+        if is_kw(tokens.get(i), "if") && is_kw(tokens.get(i + 1), "exists") {
+            i += 2;
+        }
+        let Some((name, next)) = qualified_name(tokens, i) else {
+            return;
+        };
+        let Some(table) = tables
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(&name))
+        else {
+            return;
+        };
+        for action in split_commas(&tokens[next..]) {
+            if !is_kw(action.first(), "add") {
+                continue;
+            }
+            let mut rest = &action[1..];
+            if is_kw(rest.first(), "column") {
+                rest = &rest[1..];
+            }
+            if is_kw(rest.first(), "if")
+                && is_kw(rest.get(1), "not")
+                && is_kw(rest.get(2), "exists")
+            {
+                rest = &rest[3..];
+            }
+            if !rest.is_empty() {
+                table_item(rest, table);
+            }
+        }
+    }
+
+    /// The ideal type a declared SQL type most nearly names.
+    fn ideal_of(ty: &str) -> &'static str {
+        let lower = ty.to_ascii_lowercase();
+        let base: String = lower
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ' ')
+            .collect();
+        let first = base.split_whitespace().next().unwrap_or("");
+        match first {
+            "int" | "integer" | "bigint" | "smallint" | "tinyint" | "mediumint" | "int2"
+            | "int4" | "int8" | "serial" | "bigserial" | "smallserial" | "serial4" | "serial8" => {
+                "i64"
+            }
+            "float" | "double" | "real" | "numeric" | "decimal" | "dec" | "money" | "float4"
+            | "float8" | "number" | "smallmoney" => "f64",
+            "bool" | "boolean" | "bit" => "bool",
+            "date" => "NaiveDate / DateTime",
+            "timestamp" | "timestamptz" | "datetime" | "datetime2" | "smalldatetime" => {
+                "NaiveDate / DateTime"
+            }
+            "time" | "timetz" => "NaiveTime",
+            "uuid" | "uniqueidentifier" => "UUID",
+            _ => "String",
+        }
+    }
+
+    /// The tables as profiles: names, declared types, and each foreign key
+    /// that resolves to a table and column of the same script (as a
+    /// SQLite database's declared keys do).
+    pub(crate) fn to_profiles(tables: &[Table]) -> Vec<(String, Vec<ColumnProfile>)> {
+        let find = |name: &str| tables.iter().find(|t| t.name.eq_ignore_ascii_case(name));
+        tables
+            .iter()
+            .map(|table| {
+                let mut profiles: Vec<ColumnProfile> = table
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let pk = table
+                            .primary_key
+                            .iter()
+                            .any(|p| p.eq_ignore_ascii_case(&c.name));
+                        let mut notes = String::from("declared in a SQL script");
+                        if pk {
+                            notes.push_str("; primary key");
+                        } else if c.not_null {
+                            notes.push_str("; NOT NULL");
+                        }
+                        ColumnProfile {
+                            name: c.name.clone(),
+                            current_type: if c.ty.is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                c.ty.clone()
+                            },
+                            ideal_type: ideal_of(&c.ty).to_string(),
+                            description: String::new(),
+                            missing_pct: 0.0,
+                            sample_values: Vec::new(),
+                            notes,
+                            row_count: 0,
+                            numeric_stats: None,
+                            content: None,
+                            references: Vec::new(),
+                            value_sketch: None,
+                            temporal_format: None,
+                        }
+                    })
+                    .collect();
+                for fk in &table.foreign_keys {
+                    let Some(target) = find(&fk.table) else {
+                        continue;
+                    };
+                    // (local column, referenced column) per pair.
+                    let pairs: Vec<(String, String)> = fk
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, local)| {
+                            let local = table
+                                .columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(local))?;
+                            let wanted = fk.target.get(k).or_else(|| target.primary_key.get(k))?;
+                            let remote = target
+                                .columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(wanted))?;
+                            Some((local.name.clone(), remote.name.clone()))
+                        })
+                        .collect();
+                    for (local, remote) in &pairs {
+                        if let Some(profile) = profiles.iter_mut().find(|p| &p.name == local) {
+                            profile.references.push(ColumnRef {
+                                table: target.name.clone(),
+                                column: remote.clone(),
+                                composite: if pairs.len() > 1 {
+                                    pairs.clone()
+                                } else {
+                                    Vec::new()
+                                },
+                            });
+                        }
+                    }
+                }
+                (table.name.clone(), profiles)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod sql_ddl_tests {
+    use super::json_support::{self, Value};
+    use super::sql_ddl::{Table, parse_str};
+
+    fn strings(v: Option<&Value>) -> Vec<String> {
+        v.and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Each foreign key as `cols -> table(target)`, a missing target column
+    /// list filled in from the referenced table's primary key.
+    fn resolved(tables: &[Table], table: &Table) -> Vec<String> {
+        let mut out: Vec<String> = table
+            .foreign_keys
+            .iter()
+            .map(|fk| {
+                let target = if fk.target.is_empty() {
+                    tables
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(&fk.table))
+                        .map(|t| t.primary_key.clone())
+                        .unwrap_or_default()
+                } else {
+                    fk.target.clone()
+                };
+                format!(
+                    "{} -> {}({})",
+                    fk.columns.join(","),
+                    fk.table,
+                    target.join(",")
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// One server-written dump against the server's own catalog.
+    fn check_vector(v: &Value) -> Result<(), String> {
+        let sql = v.get("sql").and_then(|x| x.as_str()).ok_or("no sql")?;
+        let got = parse_str(sql);
+        let want = v
+            .get("tables")
+            .and_then(|x| x.as_array())
+            .ok_or("no tables")?;
+        let mut want_names: Vec<String> = want
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .collect();
+        let mut got_names: Vec<String> = got.iter().map(|t| t.name.clone()).collect();
+        want_names.sort();
+        got_names.sort();
+        if want_names != got_names {
+            return Err(format!("tables: want {want_names:?}, got {got_names:?}"));
+        }
+        for w in want {
+            let name = w.get("name").and_then(|n| n.as_str()).unwrap();
+            let t = got.iter().find(|t| t.name == name).unwrap();
+            let cols: Vec<String> = t.columns.iter().map(|c| c.name.clone()).collect();
+            if cols != strings(w.get("columns")) {
+                return Err(format!(
+                    "{name} columns: want {:?}, got {cols:?}",
+                    strings(w.get("columns"))
+                ));
+            }
+            if t.primary_key != strings(w.get("pk")) {
+                return Err(format!(
+                    "{name} pk: want {:?}, got {:?}",
+                    strings(w.get("pk")),
+                    t.primary_key
+                ));
+            }
+            let mut want_fks: Vec<String> = w
+                .get("fks")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .map(|fk| {
+                            format!(
+                                "{} -> {}({})",
+                                strings(fk.get("cols")).join(","),
+                                fk.get("table").and_then(|x| x.as_str()).unwrap_or(""),
+                                strings(fk.get("target")).join(",")
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            want_fks.sort();
+            let got_fks = resolved(&got, t);
+            if want_fks != got_fks {
+                return Err(format!(
+                    "{name} foreign keys: want {want_fks:?}, got {got_fks:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn run(path: &str, limit: usize) -> (usize, Vec<String>) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let (mut checked, mut bad) = (0, Vec::new());
+        for (n, line) in text.lines().enumerate() {
+            let v = json_support::from_str(line).unwrap();
+            checked += 1;
+            if let Err(e) = check_vector(&v)
+                && bad.len() < limit
+            {
+                let dialect = v.get("dialect").and_then(|x| x.as_str()).unwrap_or("?");
+                bad.push(format!("vector {n} ({dialect}): {e}"));
+            }
+        }
+        (checked, bad)
+    }
+
+    fn names(sql: &str) -> Vec<String> {
+        parse_str(sql).into_iter().map(|t| t.name).collect()
+    }
+
+    #[test]
+    fn comments_and_strings_hide_statements() {
+        let sql = "CREATE TABLE a (x int); -- CREATE TABLE b (y int);\n\
+                   /* CREATE TABLE c (z int); */ # CREATE TABLE e (q int);\n\
+                   INSERT INTO a VALUES ('CREATE TABLE d (w int);');\n\
+                   /*!40101 SET @x = 1 */;";
+        assert_eq!(names(sql), ["a"]);
+    }
+
+    #[test]
+    fn a_backslash_escapes_unless_strings_are_standard() {
+        // MySQL: the backslash keeps the quote inside the string.
+        assert_eq!(
+            names(
+                "INSERT INTO t VALUES ('it\\'s; CREATE TABLE no (id int);'); CREATE TABLE yes (id int);"
+            ),
+            ["yes"]
+        );
+        // PostgreSQL with standard strings: a backslash is just a character.
+        assert_eq!(
+            names(
+                "SET standard_conforming_strings = on;\n\
+                 INSERT INTO t VALUES ('C:\\'); CREATE TABLE after (id int);"
+            ),
+            ["after"]
+        );
+        // ...except in an E'' string.
+        assert_eq!(
+            names(
+                "SET standard_conforming_strings = on;\n\
+                 SELECT E'a\\'b; CREATE TABLE no (id int);'; CREATE TABLE yes (id int);"
+            ),
+            ["yes"]
+        );
+    }
+
+    #[test]
+    fn dollar_quoted_bodies_and_copy_blocks_are_skipped() {
+        let sql = "CREATE FUNCTION f() RETURNS void AS $a$ BEGIN CREATE TABLE no1 (i int); \
+                   SELECT $$ x; $$; END $a$;\n\
+                   COPY public.t (a, b) FROM stdin;\n1\tCREATE TABLE no2 (i int);\n\
+                   2\t\\N\n\\.\n\
+                   CREATE TABLE public.t (a int, b text);";
+        assert_eq!(names(sql), ["t"]);
+    }
+
+    #[test]
+    fn keys_indexes_and_columns_with_those_names() {
+        let t = &parse_str(
+            "CREATE TABLE t (key text, index int, `id` int NOT NULL, KEY k1 (id), \
+             INDEX (id), UNIQUE KEY u (id), PRIMARY KEY (id), v varchar(20) DEFAULT 'x,y');",
+        )[0];
+        let cols: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cols, ["key", "index", "id", "v"]);
+        assert_eq!(t.primary_key, ["id"]);
+        assert_eq!(t.columns[3].ty, "varchar(20)");
+        assert!(t.columns[2].not_null);
+    }
+
+    #[test]
+    fn alter_table_adds_columns_and_keys() {
+        let tables = parse_str(
+            "CREATE TABLE a (id int); CREATE TABLE b (id int, a_id int);\n\
+             ALTER TABLE ONLY public.b ADD COLUMN extra text, \
+               ADD CONSTRAINT fk FOREIGN KEY (a_id) REFERENCES public.a (id) ON DELETE CASCADE;\n\
+             ALTER TABLE a ADD PRIMARY KEY (id);\n\
+             ALTER TABLE nothere ADD CONSTRAINT x FOREIGN KEY (q) REFERENCES a (id);",
+        );
+        let b = &tables[1];
+        assert_eq!(b.columns.len(), 3);
+        assert_eq!(b.foreign_keys.len(), 1);
+        assert_eq!(b.foreign_keys[0].table, "a");
+        assert_eq!(tables[0].primary_key, ["id"]);
+    }
+
+    #[test]
+    fn broken_scripts_do_not_panic() {
+        for sql in [
+            "CREATE TABLE t (a int, b",
+            "CREATE TABLE t ((((",
+            "CREATE TABLE 'x' (a int)",
+            "SELECT 'unterminated",
+            "CREATE TABLE t (a int) /* open",
+            "COPY t FROM stdin;\nrow",
+            "CREATE TABLE t (a int REFERENCES",
+            "ALTER TABLE",
+            "$a$ never closed",
+            "--",
+            "-",
+        ] {
+            let _ = parse_str(sql);
+        }
+    }
+
+    /// pg_dump and mysqldump output for random schemas, against the
+    /// servers' catalogs (tools/gen_ddl_vectors.py).
+    #[test]
+    fn dumps_match_the_servers_catalogs() {
+        let (checked, bad) = run(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/ddl_vectors.jsonl"
+            ),
+            10,
+        );
+        assert!(checked >= 40, "only {checked} vectors");
+        assert!(
+            bad.is_empty(),
+            "{} of {checked} differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The same, on a file named by `SNIFF_DDL_VECTORS` (a larger run).
+    #[test]
+    #[ignore]
+    fn dumps_match_the_servers_catalogs_on_a_corpus() {
+        let path = std::env::var("SNIFF_DDL_VECTORS").expect("set SNIFF_DDL_VECTORS");
+        let (checked, bad) = run(&path, 20);
+        assert!(
+            bad.is_empty(),
+            "{} of {checked} differ:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+}
+
 // --- Content scanning (knowledge-graph input) ---
 //
 // The table-join graph above (`detect_relationships` and the `explain`/
@@ -119034,6 +120155,15 @@ mod knowledge_graph {
             file.kind = FileKind::Text;
             file.text = Some(content);
             file.truncated_scan = truncated;
+        }
+        // A SQL script that declares tables is a schema as well as code.
+        if ext == "sql"
+            && file.kind == FileKind::Text
+            && let Ok(declared) = sql_ddl::parse_file(&read_path)
+            && !declared.is_empty()
+        {
+            file.tables = sql_ddl::to_profiles(&declared);
+            file.kind = FileKind::Data;
         }
         file
     }
