@@ -7,6 +7,20 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph` reads more: `.eml` and Outlook `.msg` messages (as
+  one-message mailboxes, with `--people` too), the tables and declared keys
+  of a `.sql` script (`CREATE TABLE`, `pg_dump`'s `ALTER TABLE ... ADD
+  CONSTRAINT`; data is skipped and a dump of any size reads in constant
+  memory), the text of RTF, OpenDocument and EPUB documents (with their
+  authors), and the sheets of an `.xlsx` workbook that read each other
+  (`references` between sheets, and into other workbooks).
+- `sniff-rs graph --git` (implies `--people`): each file's git authors as
+  people ("author of N commits") and a `changes_with` link between files that
+  change in the same commits. `--db <target>` reads the tables, columns and
+  keys of a running PostgreSQL or MySQL database (catalog only) as a file of
+  tables. Checked against `pg_dump`/`mysqldump` and the servers' catalogs,
+  LibreOffice, openpyxl, `extract_msg` and scripted repositories.
+- The mailbox reader takes back mboxrd quoting (`>From ` in a body).
 - `sniff-rs graph --people` (or `people = true` in the config file): a
   `person` node for each address that two or more files name, or that a
   contact card holds, with `involves` (a mailbox, address book or calendar

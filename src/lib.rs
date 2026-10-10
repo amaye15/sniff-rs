@@ -96762,7 +96762,7 @@ mod xlsx_support {
                 let Ok(bytes) = cfb.read_entry(*id) else {
                     continue;
                 };
-                for rec in bytes.get(header..).unwrap_or(&[]).chunks_exact(16) {
+                for rec in bytes.get(header..).unwrap_or(&[]).as_chunks::<16>().0 {
                     let tag = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]);
                     let (prop, ty) = ((tag >> 16) as u16, (tag & 0xFFFF) as u16);
                     match ty {
@@ -96807,8 +96807,10 @@ mod xlsx_support {
             };
             let text = if ty == 0x001F {
                 let units: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes(*b))
                     .collect();
                 String::from_utf16_lossy(&units)
             } else {
@@ -115515,7 +115517,7 @@ mod people_facts {
         }
     }
 
-    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    #[cfg(feature = "icalendar")]
     /// The value of parameter `name` in a content line's parameter list
     /// (`ATTENDEE;CN="Smith, Jane";ROLE=REQ:mailto:...`).
     pub(crate) fn property_param(line: &str, name: &str) -> Option<String> {
@@ -115554,7 +115556,7 @@ mod people_facts {
         None
     }
 
-    #[cfg(any(feature = "mbox", feature = "vcard", feature = "icalendar"))]
+    #[cfg(feature = "vcard")]
     /// `N` property value `family;given;additional;prefix;suffix` as
     /// "Given Additional Family".
     pub(crate) fn name_from_n(n: &str) -> Option<String> {
@@ -121254,6 +121256,7 @@ mod knowledge_graph {
             })
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// An attribute's value in the text of one tag.
         fn attr(tag: &str, name: &str) -> Option<String> {
             let mut from = 0;
@@ -121272,6 +121275,7 @@ mod knowledge_graph {
             None
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         pub(crate) fn odf_paragraphs(xml: &str) -> Vec<String> {
             let mut out = Vec::new();
             let mut links = Vec::new();
@@ -121457,13 +121461,14 @@ mod knowledge_graph {
             Some(DocText { lines, meta })
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         fn percent_decode(s: &str) -> String {
             let b = s.as_bytes();
             let mut out = Vec::with_capacity(b.len());
             let mut i = 0;
             while i < b.len() {
                 if b[i] == b'%'
-                    && i + 2 < b.len() + 0
+                    && i + 2 < b.len()
                     && let (Some(h), Some(l)) = (
                         (b[i + 1] as char).to_digit(16),
                         (b[i + 2] as char).to_digit(16),
@@ -121479,6 +121484,7 @@ mod knowledge_graph {
             String::from_utf8_lossy(&out).into_owned()
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// The text of an (X)HTML document: block elements end a line, scripts
         /// and styles are dropped, and `href` targets that leave the document
         /// become lines of their own.
@@ -121564,8 +121570,10 @@ mod knowledge_graph {
 
         // ----------------------------------------------- Excel formulas
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// How many formulas one sheet may contribute.
         const MAX_FORMULAS_PER_SHEET: usize = 5_000_000;
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// Longest formula text read.
         const MAX_FORMULA_CHARS: usize = 16 * 1024;
 
@@ -121584,6 +121592,7 @@ mod knowledge_graph {
             pub count: u32,
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// What a workbook's formulas and links say about other sheets and
         /// files.
         #[derive(Default, Debug, PartialEq)]
@@ -121593,6 +121602,7 @@ mod knowledge_graph {
             pub refs: Vec<SheetRef>,
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// A reference to a sheet, found in a formula: `[n]` is the
         /// external workbook's number.
         #[derive(Debug, PartialEq)]
@@ -121601,6 +121611,7 @@ mod knowledge_graph {
             pub sheet: String,
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// The sheets a formula's references name: `Data!A1`,
         /// `'My Sheet'!A1:B2`, `[1]Other!A1`, `'Jan:Mar'!A1` (both ends).
         /// Text in `"..."` is not a reference; `#REF!` is not a sheet.
@@ -121704,6 +121715,7 @@ mod knowledge_graph {
             out
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// `[3]Sheet` -> (Some(3), "Sheet"); a name with no bracket prefix
         /// is local. A path form (`C:\dir\[book.xlsx]Sheet`) names no
         /// numbered link, so it counts as external with number 0.
@@ -121722,6 +121734,7 @@ mod knowledge_graph {
             (None, text.to_string())
         }
 
+        #[cfg(any(feature = "xlsx", feature = "npy"))]
         /// The formulas in a worksheet's XML, as they are read from `r`.
         fn each_formula(mut r: impl std::io::Read, mut on_formula: impl FnMut(&str)) {
             let mut buf = String::new();
@@ -121859,15 +121872,12 @@ mod knowledge_graph {
                 each_formula(std::io::BufReader::new(file), |formula| {
                     let mut seen: Vec<(Option<String>, String)> = Vec::new();
                     for r in formula_sheets(formula) {
-                        let ext = match r.external {
-                            None => None,
-                            Some(n) => Some(
-                                n.checked_sub(1)
-                                    .and_then(|k| external.get(k))
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            ),
-                        };
+                        let ext = r.external.map(|n| {
+                            n.checked_sub(1)
+                                .and_then(|k| external.get(k))
+                                .cloned()
+                                .unwrap_or_default()
+                        });
                         if ext.is_none() && &r.sheet == name {
                             continue;
                         }
@@ -121891,6 +121901,17 @@ mod knowledge_graph {
                 }
             }
             Some(facts)
+        }
+
+        /// Author and organization of a document whose properties are not in
+        /// a zip package: RTF's `\info` group and an EPUB's package file.
+        pub(crate) fn properties(path: &Path, ext: &str) -> Vec<(String, String)> {
+            match ext {
+                "rtf" => rtf(path).map(|d| d.meta).unwrap_or_default(),
+                #[cfg(any(feature = "xlsx", feature = "npy"))]
+                "epub" => epub(path).map(|d| d.meta).unwrap_or_default(),
+                _ => Vec::new(),
+            }
         }
 
         #[cfg(test)]
@@ -121956,6 +121977,7 @@ mod knowledge_graph {
                 }
             }
 
+            #[cfg(any(feature = "xlsx", feature = "npy"))]
             #[test]
             fn formulas_name_the_sheets_they_read() {
                 let sheets = |f: &str| -> Vec<(Option<usize>, String)> {
@@ -121989,6 +122011,7 @@ mod knowledge_graph {
                 assert!(sheets("'unterminated!A1").is_empty());
             }
 
+            #[cfg(any(feature = "xlsx", feature = "npy"))]
             #[test]
             fn odf_paragraphs_in_order_with_spaces_tabs_and_links() {
                 let xml = "<office:text><text:p>a<text:s text:c=\"2\"/>b<text:tab/>c</text:p>\
@@ -122001,6 +122024,7 @@ mod knowledge_graph {
                 );
             }
 
+            #[cfg(any(feature = "xlsx", feature = "npy"))]
             #[test]
             fn html_lines_drop_scripts_and_keep_block_breaks() {
                 let html = "<html><head><title>no</title></head><body><h1>Title</h1><script>var a = '<p>x</p>';</script>\
@@ -122038,17 +122062,6 @@ mod knowledge_graph {
                     .map(|(_, v)| v.as_str())
                     .collect();
                 assert_eq!(authors, ["Jane Smith", "Tom Brown"]);
-            }
-        }
-
-        /// Author and organization of a document whose properties are not in
-        /// a zip package: RTF's `\info` group and an EPUB's package file.
-        pub(crate) fn properties(path: &Path, ext: &str) -> Vec<(String, String)> {
-            match ext {
-                "rtf" => rtf(path).map(|d| d.meta).unwrap_or_default(),
-                #[cfg(any(feature = "xlsx", feature = "npy"))]
-                "epub" => epub(path).map(|d| d.meta).unwrap_or_default(),
-                _ => Vec::new(),
             }
         }
     }
@@ -132064,7 +132077,8 @@ USAGE:
 
       joins        tables whose columns line up by name and/or by values
                    (EXTRACTED when the value sets measurably overlap), and
-                   foreign keys a database declares (SQLite)
+                   foreign keys a database declares (a SQLite file, a SQL
+                   dump's CREATE/ALTER TABLE, a running database via --db)
       shares_key   two tables that both point at one owner through the
                    same key (orders.customer_id and invoices.customer_id
                    into customers) - kept, weighted low, so a star schema
@@ -132079,7 +132093,9 @@ USAGE:
                    reference numbers - linked when two or more files share
                    one
       references   a file naming another file (a notebook's
-                   read_csv("sales.csv"), a page's <img src="plot.png">)
+                   read_csv("sales.csv"), a page's <img src="plot.png">,
+                   a workbook's external links), and a workbook sheet
+                   to the sheets its formulas read
       imports      a source file to the file it imports (Python, JS/TS,
                    Rust, Java, R source(); notebooks' code cells too);
                    directed

@@ -20332,3 +20332,298 @@ fn graph_people_links_mail_contacts_calendars_and_authors() {
     let again = graph_doc(&["graph", &input, "-", "--no-cache", "--people"]);
     assert_eq!(doc, again, "the same input gives the same graph");
 }
+
+fn sources_fixture() -> String {
+    format!(
+        "{}/tests/fixtures/edge_graph_sources",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn link_of<'a>(
+    doc: &'a serde_json::Value,
+    relation: &str,
+    from: &str,
+    to: &str,
+) -> Option<&'a serde_json::Value> {
+    doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["relation"] == relation && l["source"] == from && l["target"] == to)
+}
+
+#[test]
+fn graph_reads_the_schema_of_a_sql_dump_and_links_queries_to_it() {
+    let doc = graph_doc(&["graph", &sources_fixture(), "-", "--no-cache"]);
+    let table = |t: &str| format!("shop_dump.sql#{t}");
+    for t in [
+        "customers",
+        "orders",
+        "order_lines",
+        "products",
+        "shipments",
+    ] {
+        assert!(
+            link_of(&doc, "contains", "shop_dump.sql", &table(t)).is_some(),
+            "table {t}"
+        );
+    }
+    // Declared keys, from pg_dump's ALTER TABLE ... ADD CONSTRAINT too.
+    for (from, to) in [
+        ("orders", "customers"),
+        ("order_lines", "orders"),
+        ("order_lines", "products"),
+        ("shipments", "order_lines"),
+    ] {
+        let l = link_of(&doc, "joins", &table(from), &table(to))
+            .unwrap_or_else(|| panic!("{from} -> {to}"));
+        assert_eq!(l["confidence"], "EXTRACTED");
+        assert!(
+            l["evidence"][0]
+                .as_str()
+                .unwrap()
+                .contains("declared foreign key")
+        );
+    }
+    assert!(
+        link_of(&doc, "joins", &table("shipments"), &table("order_lines")).unwrap()["evidence"][0]
+            .as_str()
+            .unwrap()
+            .contains("composite key"),
+        "a composite key stays one key"
+    );
+    // A query reads the tables of the dump; the dump does not "write" its own.
+    for t in ["orders", "customers", "order_lines", "products"] {
+        assert!(
+            link_of(&doc, "reads", "report.sql", &table(t)).is_some(),
+            "reads {t}"
+        );
+    }
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "writes" && l["source"] == "shop_dump.sql")
+    );
+    // The data in the dump (COPY rows) is not mistaken for statements.
+    let nodes = doc["nodes"].as_array().unwrap();
+    assert!(
+        !nodes
+            .iter()
+            .any(|n| n["id"].as_str().unwrap().contains("trap"))
+    );
+}
+
+#[cfg(any(feature = "xlsx", feature = "npy"))]
+#[test]
+fn graph_reads_rtf_opendocument_and_epub_text_and_authors() {
+    let doc = graph_doc(&["graph", &sources_fixture(), "-", "--no-cache", "--people"]);
+    // The same report in four formats names the same things.
+    for file in ["report.rtf", "report.odt", "report.epub", "report.docx"] {
+        for entity in [
+            "email:jane.smith@acme-corp.com",
+            "doi:10.1000/xyz123",
+            "id:INV-2024-00123",
+            "url:acme-corp.com/results/q3",
+        ] {
+            assert!(
+                link_of(&doc, "mentions", file, entity).is_some(),
+                "{file} mentions {entity}"
+            );
+        }
+        assert!(
+            link_of(&doc, "authored_by", file, "person:jane.smith@acme-corp.com").is_some(),
+            "{file} author"
+        );
+    }
+    // The footnote's address is read (in every format that has footnotes).
+    for file in ["report.rtf", "report.odt", "report.docx", "report.epub"] {
+        assert!(
+            link_of(&doc, "mentions", file, "email:accounts@acme-corp.com").is_some(),
+            "{file} footnote"
+        );
+    }
+    // An RTF file is a document, not JSON.
+    let rtf = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "report.rtf")
+        .unwrap();
+    assert_eq!(rtf["file_type"], "rtf");
+    assert_eq!(rtf["kind"], "text");
+}
+
+#[cfg(feature = "xlsx")]
+#[test]
+fn graph_links_workbook_sheets_that_read_each_other_and_other_workbooks() {
+    let doc = graph_doc(&["graph", &sources_fixture(), "-", "--no-cache"]);
+    let sheet = |s: &str| format!("budget_book.xlsx#{s}");
+    // `=SUM(Data!B2:B6)`, and two formulas each reading Data and Summary Sheet.
+    let l = link_of(&doc, "references", &sheet("Summary Sheet"), &sheet("Data")).expect("summary");
+    assert_eq!(l["directed"], true);
+    assert!(
+        l["evidence"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("1 formula cell ")
+    );
+    assert!(
+        link_of(&doc, "references", &sheet("It's here"), &sheet("Data")).unwrap()["evidence"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("2 formula cells ")
+    );
+    assert!(
+        link_of(
+            &doc,
+            "references",
+            &sheet("It's here"),
+            &sheet("Summary Sheet")
+        )
+        .is_some()
+    );
+    assert!(
+        link_of(&doc, "references", &sheet("Data"), &sheet("Summary Sheet")).is_none(),
+        "a sheet whose formulas read nothing else links to nothing"
+    );
+    // A text in quotes that looks like a reference is not one.
+    // A 3-D reference reaches both ends, and `[1]Rates!B2` reaches into
+    // another workbook that is among the inputs.
+    assert!(link_of(&doc, "references", "rollup.xlsx#Total", "rollup.xlsx#Jan").is_some());
+    assert!(link_of(&doc, "references", "rollup.xlsx#Total", "rollup.xlsx#Mar").is_some());
+    assert!(link_of(&doc, "references", "rollup.xlsx#Total", "other.xlsx").is_some());
+    assert!(link_of(&doc, "references", "rollup.xlsx", "other.xlsx").is_some());
+}
+
+#[cfg(all(feature = "mbox", feature = "xlsx"))]
+#[test]
+fn graph_reads_eml_and_msg_messages_as_mail() {
+    let doc = graph_doc(&["graph", &sources_fixture(), "-", "--no-cache", "--people"]);
+    let types: Vec<(&str, &str)> = doc["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["type"] == "file")
+        .map(|n| (n["id"].as_str().unwrap(), n["file_type"].as_str().unwrap()))
+        .collect();
+    assert!(types.contains(&("edge_eml_multipart_crlf.eml", "eml")));
+    assert!(types.contains(&("edge_msg_basic.msg", "msg")));
+    // Jane sent both, and Tom received both.
+    for file in ["edge_eml_multipart_crlf.eml", "edge_msg_basic.msg"] {
+        let l = link_of(&doc, "involves", file, "person:jane.smith@acme-corp.com")
+            .unwrap_or_else(|| panic!("{file} sender"));
+        assert_eq!(l["evidence"][0], "sender of 1 message");
+        assert!(link_of(&doc, "involves", file, "person:tom@acme-corp.com").is_some());
+    }
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+fn git_in(dir: &std::path::Path, who: (&str, &str), args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", &format!("user.name={}", who.0)])
+        .args(["-c", &format!("user.email={}", who.1)])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn graph_git_links_authors_and_files_that_change_together() {
+    if !git_available() {
+        return;
+    }
+    let tmp = TempDir::new();
+    let repo = tmp.path().join("repo");
+    let proj = repo.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    git_in(
+        &repo,
+        ("Ann Ng", "ann@example.org"),
+        &["init", "-q", "-b", "main"],
+    );
+    let ann = ("Ann Ng", "ann@example.org");
+    let bo = ("Bo Li", "bo@example.org");
+    for n in 0..4 {
+        // a and b always change together; c changes alone, by Bo.
+        for f in ["a.txt", "b.txt"] {
+            std::fs::write(proj.join(f), format!("{f} {n}\n")).unwrap();
+        }
+        git_in(&repo, ann, &["add", "-A"]);
+        git_in(&repo, ann, &["commit", "-q", "-m", &format!("ab {n}")]);
+        std::fs::write(proj.join("c.txt"), format!("c {n}\n")).unwrap();
+        git_in(&repo, bo, &["add", "-A"]);
+        git_in(&repo, bo, &["commit", "-q", "-m", &format!("c {n}")]);
+    }
+    // Bo touches a too, once.
+    std::fs::write(proj.join("a.txt"), "again\n").unwrap();
+    git_in(&repo, bo, &["add", "-A"]);
+    git_in(&repo, bo, &["commit", "-q", "-m", "a"]);
+    let input = proj.to_str().unwrap();
+    // Not asked for: nothing from the history.
+    let plain = graph_doc(&["graph", input, "-", "--no-cache"]);
+    assert!(!plain["links"].to_string().contains("changes_with"));
+    let doc = graph_doc(&["graph", input, "-", "--no-cache", "--git"]);
+    let l = link_of(&doc, "changes_with", "a.txt", "b.txt").expect("a and b");
+    assert_eq!(l["confidence"], "INFERRED");
+    assert_eq!(
+        l["evidence"][0],
+        "changed together in 4 commits (5 and 4 commits each)"
+    );
+    assert!(link_of(&doc, "changes_with", "a.txt", "c.txt").is_none());
+    // The authors are people: Ann wrote a and b, Bo wrote c and a.
+    let ev = |file: &str, who: &str| {
+        link_of(&doc, "involves", file, &format!("person:{who}@example.org"))
+            .map(|l| l["evidence"][0].as_str().unwrap().to_string())
+    };
+    assert_eq!(ev("a.txt", "ann").as_deref(), Some("author of 4 commits"));
+    assert_eq!(ev("a.txt", "bo").as_deref(), Some("author of 1 commit"));
+    assert_eq!(ev("c.txt", "bo").as_deref(), Some("author of 4 commits"));
+    assert_eq!(ev("c.txt", "ann"), None);
+    // The config file can ask for it.
+    std::fs::write(proj.join(".sniff-rs.json"), r#"{"graph": {"git": true}}"#).unwrap();
+    let via_config = graph_doc(&["graph", input, "-", "--no-cache"]);
+    assert!(link_of(&via_config, "changes_with", "a.txt", "b.txt").is_some());
+}
+
+#[test]
+fn graph_git_outside_a_repository_is_an_error_and_so_is_a_bad_database() {
+    let tmp = TempDir::new();
+    std::fs::write(tmp.path().join("x.csv"), "a,b\n1,2\n").unwrap();
+    let dir = tmp.path().to_str().unwrap();
+    if git_available() {
+        let run = run_graph(&["graph", dir, "-", "--no-cache", "--git"]);
+        assert!(!run.status.success());
+        assert!(String::from_utf8_lossy(&run.stderr).contains("git repository"));
+    }
+    // A file database is read as a file; an unknown engine is named.
+    for (spec, want) in [
+        ("sqlite:/tmp/x.db", "graphed as a file"),
+        ("oracle://x/y", "unrecognized engine"),
+    ] {
+        let run = run_graph(&["graph", dir, "-", "--no-cache", "--db", spec]);
+        assert!(!run.status.success(), "{spec}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains(want),
+            "{spec}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

@@ -111,7 +111,7 @@ full, honest numbers.
 | GeoJSON | `.geojson` | `--features geojson` | plain JSON with a fixed top-level shape (RFC 7946); a `FeatureCollection`'s `features` array is the natural records array, one `Feature` or a bare `Geometry` profiles as a single record; each feature's own geometry renders as WKT text, which this tool's own coordinate/WKT heuristics then recognize automatically |
 | vCard | `.vcf` | `--features vcard` | one record per `BEGIN:VCARD`/`END:VCARD` block (RFC 6350); a repeated property (multiple `EMAIL`/`TEL` lines) pools into an array column, the same convention this tool's INI reader already uses for a repeated key |
 | iCalendar | `.ics` | `--features icalendar` | one record per `VEVENT`/`VTODO` component (RFC 5545); every other component type (`VALARM`, `VTIMEZONE`, ...) is structurally recognized but not itself surfaced, so its own properties never leak into an enclosing event/todo's record |
-| MBOX | `.mbox` | `--features mbox` | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
+| MBOX | `.mbox`, `.eml`, `.msg` | `--features mbox` (`.msg` also `xlsx`, for the OLE2 reader) | one record per message (RFC 4155); a message boundary is a `From ` envelope line at the very start of the file or immediately after a blank line - never merely because some line happens to start with those five characters; RFC 822 headers become columns, a repeated header (multiple `Received:` lines) pools into an array |
 | Jupyter notebooks (.ipynb) | `.ipynb` | `--features ipynb` | standard JSON with a fixed top-level shape (nbformat v4); the top-level `cells` array is the natural records array, one record per object in it; a cell's own `source` line-list pools into a `Vec<String>` column by the existing array convention |
 | PDF page text | `.pdf` | `--features pdf` | one record per page (`page_number`, `text`); resolves the trailer/xref (table or stream, `/Prev` chains, bare-trailer files via index rebuild) and decodes each page's content streams through its `/Tf`-selected font (WinAnsi/MacRoman/Differences/ToUnicode), breaking words and lines where the glyphs are drawn and letting marked-content `/ActualText` stand in for the glyphs it covers; comment/note annotation text lands in an `annotations` column, and a filled-in AcroForm becomes a second `<file>_form` table (one record, one column per field) - see the Dependency footprint section |
 | Delta Lake | *(directory)* | `--features delta` | the one format detected from directory *structure* (a `_delta_log/` subdirectory with real commit files), not an extension or `--format` at all; resolves the transaction log's own JSON commits to the table's live schema and file set, then profiles every live Parquet data file as one merged table - see "Lakehouse table formats" below |
@@ -18756,6 +18756,121 @@ decoded for mbox only. The role-mailbox list is a heuristic list of local
 parts. A document author is matched by name only, so two people with one
 name give AMBIGUOUS links, not a guess. A card with no address and a
 common name can join a stranger's `same_person` group; it stays AMBIGUOUS.
+
+### Phase 5: new sources (mail, SQL schemas, documents, workbooks, git, live databases)
+
+Six things the graph could not see, each on its own oracle. The first four
+are read by default; `--git` and `--db` are opt-in because they run another
+program.
+
+- **`.eml` and Outlook `.msg` are one-message mailboxes.** `.eml` is wrapped
+  as an mbox of one (`convert_message_to_mbox`: an envelope line, every line
+  that is `From ` after any number of `>` quoted with one more `>` (mboxrd), a
+  trailing blank line like any mailbox). The mailbox reader now takes one `>`
+  back from a `>From ` body line. A `.msg` is an OLE2 file: `msg_to_rfc822`
+  reads `__properties_version1.0` and the `__substg1.0_<id><type>` streams of
+  the message and of each `__recip_version1.0_#N` storage (the CFB reader
+  gained `children_of`, `entry_info` and `read_entry`, since recipient
+  storages repeat stream names), and writes an RFC 5322 message: `From`, `To`,
+  `Cc`, `Bcc` (by recipient type), `Subject`, `Date` (from the FILETIME),
+  `Message-ID`, `In-Reply-To`, and the text body (the HTML body, marked so,
+  when that is all there is). Columns, `--people` and `--sql-mode inline`
+  then work as for any mailbox; the graph node's type is `eml` or `msg`.
+  Not read: attachments of a `.msg` (an `.eml`'s attachment names are), the
+  compressed-RTF body, an Exchange DN with no SMTP address (the recipient's
+  name is kept, no person is made from it).
+- **A `.sql` script that declares tables is a schema.** `sql_ddl` scans a
+  script of any size in constant memory (statement splitting that knows
+  quotes, `''`/backslash rules per dialect, `E''`, comments, `$tag$` quotes,
+  `COPY ... FROM stdin` data blocks, psql `\` meta-lines, MySQL conditional
+  comments) and keeps only `CREATE TABLE` and `ALTER TABLE ... ADD`. Table
+  bodies are read for columns and declared types, `NOT NULL`, inline and
+  table-level `PRIMARY KEY`, inline and table-level `FOREIGN KEY ...
+  REFERENCES` (composite keys stay whole), and `ADD CONSTRAINT` / `ADD COLUMN`
+  from `pg_dump`. The tables become table nodes of the script, declared keys
+  become `joins`, and queries that read those tables link to them. The
+  existing `reads`/`writes` of code are unchanged. Data is not read: the
+  columns carry no values, row counts or sketches.
+- **RTF, OpenDocument and EPUB text.** `doc_text::rtf` reads groups,
+  destinations to skip (fonts, styles, pictures, `\*` ones, `\listtext`),
+  code pages (`\ansicpg`, `\'hh`), `\uN` with the `\ucN` fallback skipped
+  and surrogate pairs joined, `\bin`, hyperlink fields (`\fldinst`, the URL
+  becomes a line) and the `\info` author/operator/company. `odf` reads
+  `content.xml`'s paragraphs, headings, tabs, spaces and links (a footnote's
+  number is not text); `epub` follows `container.xml` and the OPF spine,
+  strips XHTML (`html_lines`) and reads `dc:creator`/`dc:publisher`. They feed
+  the same identifier, link, wording and author machinery as Word and
+  PowerPoint. A `{\rtf` file is no longer sniffed as JSON.
+- **Workbook formulas and links.** An `.xlsx` family workbook's formulas are
+  scanned for the sheets they read (`formula_sheets`: quoted and unquoted
+  names, ranges, 3-D `Jan:Mar!A1` (both ends), `[1]Book!A1` and `'[1]Sheet'!A1`
+  external references, string literals skipped, `#REF!` skipped). Each pair of
+  sheets that are tables gets a directed `references` link ("N formula cells in
+  sheet X read sheet Y"); an external reference links to that workbook's sheet
+  (or the workbook) when its file name is among the inputs, and the external
+  link targets are scanned as text like a Word document's. A shared formula
+  counts once. Cached with the file (`CACHE_FORMAT` 5).
+- **`--git`** (or `git = true` in the config file; implies `--people`) runs
+  `git log --no-merges --relative --name-only` over the graphed folder (the
+  newest 20,000 commits; `%aN`/`%aE`, so `.mailmap` applies). Each file's
+  authors become people with role `git-author` ("author of N commits"), and
+  files that change in the same commits get an undirected, INFERRED
+  `changes_with` link: at least 3 commits together and at least half of the
+  less-changed file's commits, commits touching more than 60 files left out,
+  at most 8 partners per file (a pair is kept while either file has room).
+  The history is not cached per file (it belongs to the repository). A folder
+  that is not inside a repository, or no `git` program, is an error.
+- **`--db <target>`** (repeatable; flag only, because a config file inside the
+  graphed folder is a bad place for a password) runs `psql` or `mysql` through
+  the same `LoadTarget` as `--load-into` (so `postgresql://`, `mysql://`,
+  `postgres:name`, `-w`, `MYSQL_PWD`) and reads only the catalog: tables,
+  columns with types, primary keys, foreign keys. The database is a file of
+  tables (named `postgres-<db>` / `mysql-<db>`, never a host or password)
+  that goes through the same code as a dump. A PostgreSQL table outside
+  `public` is `schema.table`. SQLite and DuckDB files are graphed as files
+  already, so `--db sqlite:...` is an error saying so.
+
+**Verified** with independent oracles for each (tools in `tools/`):
+`check_eml.py` writes 200 random messages with Python's `email` package (plain,
+multipart, RFC 2047, QP/base64/8-bit, CRLF/LF, body lines that read as
+envelopes) both as `.eml` and through `mailbox.mbox`, and the columns must
+agree; `check_msg.py` compares `.msg` files with `extract_msg` (5 real files
+from its test set, fetched transiently, and 3 written by `make_msg.py`, a
+small OLE2 writer whose output olefile and extract_msg read); `gen_ddl_vectors.py` loads random
+schemas into real PostgreSQL 17 and MySQL 8 servers, takes `pg_dump` /
+`mysqldump` output (with data, functions, triggers, `COPY` blocks and
+fake-statement traps) and the servers' own catalogs, and the Rust test
+(`dumps_match_the_servers_catalogs`, 40 committed; 400 in the ignored run
+with `SNIFF_DDL_VECTORS`) requires the same tables, columns in order, primary
+keys and foreign keys; `check_doc_text.py` converts 150 random flat-ODF
+documents with LibreOffice to ODT, RTF, DOCX and EPUB and requires each
+artifact's words to equal LibreOffice's own text export of the original (the
+random text has accents, CJK, Hebrew, emoji, tabs, runs of spaces, lists,
+tables and links); `check_formula_refs.py` writes 120 workbooks with openpyxl
+(2,321 sheet references) and compares the links with openpyxl's formula
+tokenizer; `check_git.py` builds 40 scripted repositories and compares the
+authors and 165 co-change pairs with the script; `check_live_db.py` creates 40
+random live databases and compares `--db` with the catalogs. Each checker was
+shown to fail when its expectation is broken. Bugs the oracles found: a
+`COPY ... FROM stdin;` state that the main loop overwrote (so the data block
+was read as statements); a closing-tag name parsed as empty (a footnote
+number leaked into the text); a creator tag with no attributes skipped; the
+`>From ` quoting that an `.eml` needs to round-trip; and `{\rtf1` sniffed as
+JSON.
+
+**Disclosed.** Attachments of `.msg`/`.eml`; compressed-RTF bodies; RTF
+`\fcharset` per-font code pages and double-byte code pages (a `\'hh` pair in
+Shift-JIS reads as two Latin-1 characters); EPUB 3 navigation documents are
+read as text like any spine item; ODF flat XML (`.fodt`) is plain XML and not
+read as a document; formulas of `.xls`, `.xlsb` and `.ods` workbooks and
+defined names; SQL: only `CREATE TABLE` and `ALTER TABLE ... ADD`
+(no views, `CREATE INDEX`, MSSQL bracket identifiers, Oracle syntax), partitions
+and inheritance, and a script that is not UTF-8; git: renames are not followed,
+only the newest 20,000 commits are read, and a bot with an address is a
+person; `--db`: PostgreSQL and MySQL only, tables only (not views), row counts
+are not read, and a MySQL target has to name a database. Not covered by an
+automated test: the live servers (as for `--load-into`; `check_live_db.py`
+needs them running).
 
 ## Known limitations / roadmap
 
