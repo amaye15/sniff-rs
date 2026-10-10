@@ -7,6 +7,17 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph --geo` and `--timeline` (off by default; also `geo`, `geo_cell`
+  and `timeline` in the config file): files about the same coarse place or the
+  same day are linked through a `place:` or `day:` node (`near`). A position is
+  kept only as the centre of a grid cell (`--geo-cell`, default 0.1 degree, about
+  11 km) and a time only as a day, so no exact place or moment is ever in the
+  graph or its cache. Places come from the GPS in photos (EXIF and XMP), the
+  points of GPX, TCX, KML and GeoJSON files, latitude and longitude columns that
+  stay within a degree, and `lat,lon` columns; days from when a photo was taken,
+  the `Date` of mail, calendar events, and when a PDF or an office document
+  was created. Checked against Pillow, `mailbox`/`email`, pikepdf, openpyxl and
+  the XML and JSON parsers, with exact decimal arithmetic.
 - `sniff-rs graph` reads more of what files are: `looks_like` links two
   PNG or JPEG pictures that are the same picture resized, recompressed or saved
   again (a 64-bit perceptual hash; a PNG is decoded in full in any colour type

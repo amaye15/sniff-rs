@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<gpx version="1.1" creator="fixture" xmlns="http://www.topografix.com/GPX/1/1"><trk><name>walk</name><trkseg>
+<trkpt lat="48.860600" lon="2.337600"><ele>35</ele></trkpt>
+<trkpt lat="48.861000" lon="2.337100"><ele>35</ele></trkpt>
+<trkpt lat="48.861400" lon="2.336600"><ele>35</ele></trkpt>
+<trkpt lat="48.861800" lon="2.336100"><ele>35</ele></trkpt>
+<trkpt lat="48.862200" lon="2.335600"><ele>35</ele></trkpt>
+<trkpt lat="48.862600" lon="2.335100"><ele>35</ele></trkpt>
+<trkpt lat="48.863000" lon="2.334600"><ele>35</ele></trkpt>
+<trkpt lat="48.863400" lon="2.334100"><ele>35</ele></trkpt>
+<trkpt lat="48.863800" lon="2.333600"><ele>35</ele></trkpt>
+<trkpt lat="48.864200" lon="2.333100"><ele>35</ele></trkpt>
+<trkpt lat="48.864600" lon="2.332600"><ele>35</ele></trkpt>
+<trkpt lat="48.865000" lon="2.332100"><ele>35</ele></trkpt>
+</trkseg></trk></gpx>

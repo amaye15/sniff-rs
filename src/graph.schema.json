@@ -65,7 +65,7 @@
               "similar_to", "same_name", "shares_key", "duplicate_of", "metadata", "in_folder",
               "related_to", "has_column", "same_column", "type_drift", "uses_column", "involves",
               "authored_by", "same_person", "member_of", "changes_with",
-              "version_of", "derived_from", "exported_from", "looks_like"
+              "version_of", "derived_from", "exported_from", "looks_like", "near"
             ]
           },
           "confidence": { "enum": ["EXTRACTED", "INFERRED", "AMBIGUOUS"] },

@@ -68739,7 +68739,14 @@ mod pdf_support {
                 return Vec::new();
             };
             let mut out = Vec::new();
-            for key in ["Author", "Title", "Subject", "Creator", "Producer"] {
+            for key in [
+                "Author",
+                "Title",
+                "Subject",
+                "Creator",
+                "Producer",
+                "CreationDate",
+            ] {
                 if let Some(PdfObj::Str(c)) = d.get(key.as_bytes()) {
                     let text = decode_text_string(c);
                     let text = text.trim();
@@ -115801,6 +115808,18 @@ pub fn graph_image_hash(
     knowledge_graph::image_probe(path, plane)
 }
 
+/// The coarse places and days `--geo` / `--timeline` would give one file:
+/// grid-cell centres and `YYYY-MM-DD`. Used by `examples/place_time.rs` and
+/// `tools/check_geotime.py`; not a supported interface.
+#[doc(hidden)]
+pub fn graph_places_and_days(
+    path: &Path,
+    cell: Option<f64>,
+    timeline: bool,
+) -> (Vec<String>, Vec<String>) {
+    knowledge_graph::probe_places_and_days(path, cell, timeline)
+}
+
 /// The (kind, value) facts the graph reads from a file's own properties:
 /// author, camera, artist, album, ... Used by `examples/file_meta.rs` and
 /// `tools/check_audio.py`; not a supported interface.
@@ -119239,6 +119258,10 @@ mod knowledge_graph {
         /// A perceptual hash of a PNG or JPEG (`image_hash`): pictures that
         /// differ in a few bits are the same picture, resized or saved again.
         pub(crate) image_hash: Option<u64>,
+        /// Coarse places the file is about (grid-cell centres, only with
+        /// `--geo`) and the days it is dated (only with `--timeline`).
+        pub(crate) places: Vec<String>,
+        pub(crate) days: Vec<String>,
     }
 
     pub(crate) struct CollectOptions {
@@ -119263,6 +119286,11 @@ mod knowledge_graph {
         pub(crate) git: bool,
         /// Running databases to read the schema of (`--db`).
         pub(crate) databases: Vec<String>,
+        /// Read where files are about, as grid cells of this many degrees
+        /// (`--geo`); `None` reads no places.
+        pub(crate) geo_cell: Option<f64>,
+        /// Read when files are dated, as days (`--timeline`).
+        pub(crate) timeline: bool,
     }
 
     /// Formats whose columns are fixed by the format itself rather than
@@ -119350,6 +119378,8 @@ mod knowledge_graph {
         let names = {
             let mut h = fnv64_extend(FNV_OFFSET, &opts.patterns_fingerprint.to_le_bytes());
             h = fnv64_extend(h, &[u8::from(opts.people)]);
+            h = fnv64_extend(h, &opts.geo_cell.map_or(0, f64::to_bits).to_le_bytes());
+            h = fnv64_extend(h, &[u8::from(opts.timeline)]);
             for p in &paths {
                 if let Some(n) = p.file_name().and_then(|n| n.to_str()) {
                     h = fnv64_extend(h, n.as_bytes());
@@ -119433,6 +119463,8 @@ mod knowledge_graph {
             changes_with: Vec::new(),
             mtime: 0,
             image_hash: None,
+            places: Vec::new(),
+            days: Vec::new(),
         }
     }
 
@@ -120034,6 +120066,18 @@ mod knowledge_graph {
         if f.mtime != 0 {
             o.insert("mtime".to_string(), JsonValue::from(f.mtime));
         }
+        if !f.places.is_empty() {
+            o.insert(
+                "places".to_string(),
+                JsonValue::Array(f.places.iter().cloned().map(JsonValue::from).collect()),
+            );
+        }
+        if !f.days.is_empty() {
+            o.insert(
+                "days".to_string(),
+                JsonValue::Array(f.days.iter().cloned().map(JsonValue::from).collect()),
+            );
+        }
         if let Some(h) = f.image_hash {
             o.insert(
                 "image_hash".to_string(),
@@ -120288,6 +120332,8 @@ mod knowledge_graph {
             },
             changes_with: Vec::new(),
             mtime: v.get("mtime").and_then(|m| m.as_u64()).unwrap_or(0),
+            places: strings_of(v.get("places")),
+            days: strings_of(v.get("days")),
             image_hash: v
                 .get("image_hash")
                 .and_then(|h| h.as_str())
@@ -120353,7 +120399,92 @@ mod knowledge_graph {
         if image_hash::is_hashable_extension(&ext) && file.size <= 256 * 1024 * 1024 {
             file.image_hash = image_hash::hash(path);
         }
+        if file.kind != FileKind::Failed {
+            read_places_and_days(&mut file, path, &ext, opts);
+        }
         file
+    }
+
+    /// Where and when the file is about, if `--geo` / `--timeline` ask.
+    fn read_places_and_days(file: &mut KgFile, path: &Path, ext: &str, opts: &CollectOptions) {
+        if opts.geo_cell.is_none() && !opts.timeline {
+            return;
+        }
+        let (mut places, mut days) = (Vec::new(), Vec::new());
+        let size = opts.geo_cell.unwrap_or(0.1);
+        if image_meta::is_image_extension(ext) {
+            let (geo, taken) = image_meta::facts(path);
+            if opts.geo_cell.is_some()
+                && let Some((lat, lon)) = geo
+                && let Some(c) = place_time::cell(lat, lon, size)
+            {
+                places.push(c);
+            }
+            if opts.timeline {
+                days.extend(taken);
+            }
+        }
+        if opts.geo_cell.is_some() {
+            if place_time::is_track_extension(ext) {
+                places.extend(place_time::track_cells(path, ext, size));
+            }
+            places.extend(place_time::table_cells(&file.tables, size));
+        }
+        if opts.timeline {
+            if ext == "ics" || file.file_type == "icalendar" {
+                days.extend(place_time::ics_days(path));
+            } else if file.file_type == "mbox" || file.file_type == "eml" {
+                days.extend(place_time::mail_days(path));
+            } else if ext == "pdf" {
+                days.extend(
+                    pdf_document_info(path)
+                        .into_iter()
+                        .find(|(k, _)| k == "creationdate")
+                        .and_then(|(_, v)| place_time::created_day(&v)),
+                );
+            } else {
+                days.extend(office_created(path, ext).and_then(|v| place_time::created_day(&v)));
+            }
+        }
+        places.sort();
+        places.dedup();
+        places.truncate(16);
+        days.sort();
+        days.dedup();
+        days.truncate(40);
+        file.places = places;
+        file.days = days;
+    }
+
+    /// When an office document says it was created (`dcterms:created` of an
+    /// OOXML package, `meta:creation-date` of an ODF one).
+    #[cfg(any(feature = "xlsx", feature = "npy"))]
+    fn office_created(path: &Path, ext: &str) -> Option<String> {
+        let ooxml = matches!(
+            ext,
+            "docx" | "docm" | "pptx" | "pptm" | "xlsx" | "xlsm" | "dotx" | "potx" | "xltx"
+        );
+        let odf = matches!(ext, "odt" | "ods" | "odp");
+        if !ooxml && !odf {
+            return None;
+        }
+        let mut zip = zip_support::ZipArchive::open(path).ok()?;
+        let (part, open) = if ooxml {
+            ("docProps/core.xml", "<dcterms:created")
+        } else {
+            ("meta.xml", "<meta:creation-date")
+        };
+        let xml = String::from_utf8_lossy(&zip.read(part).ok()?).into_owned();
+        let at = xml.find(open)?;
+        let rest = &xml[at..];
+        let start = rest.find('>')? + 1;
+        let end = rest[start..].find('<')?;
+        Some(rest[start..start + end].trim().to_string())
+    }
+
+    #[cfg(not(any(feature = "xlsx", feature = "npy")))]
+    fn office_created(_path: &Path, _ext: &str) -> Option<String> {
+        None
     }
 
     /// What a source file, a SQL script or a notebook's code cells say
@@ -121044,6 +121175,402 @@ mod knowledge_graph {
                 }
                 at = end;
             }
+        }
+    }
+
+    /// Where and when a file is about, in coarse units. A position is kept
+    /// only as the centre of a grid cell (0.1 degrees, about 11 km, by
+    /// default) and a time only as a day, so the graph never holds an exact
+    /// place or moment - and both are read only when `--geo` or
+    /// `--timeline` asks for them, since even a cell is something a person
+    /// may not want to share.
+    ///
+    /// Places: EXIF and XMP GPS in pictures; the points of GPX, TCX, KML
+    /// and GeoJSON files; a table's latitude and longitude columns when
+    /// together they span at most a degree; a column of `lat,lon` values.
+    /// Days: when a picture was taken; the `Date` of each mail message; the
+    /// start of each calendar event; when a PDF or an office document was
+    /// created.
+    mod place_time {
+        use super::*;
+        use std::io::{BufRead, BufReader};
+
+        /// Most cells or days kept for one file.
+        const MAX_PER_FILE: usize = 16;
+        const MAX_DAYS_PER_FILE: usize = 40;
+        /// Largest geo file read (bytes).
+        const MAX_GEO_FILE: u64 = 32 * 1024 * 1024;
+
+        /// The id of the grid cell holding a position: its centre.
+        pub(super) fn cell(lat: f64, lon: f64, size: f64) -> Option<String> {
+            if !(lat.is_finite() && lon.is_finite())
+                || lat.abs() > 90.0
+                || lon.abs() > 180.0
+                || (lat == 0.0 && lon == 0.0)
+                || !(size.is_finite() && size > 0.0 && size <= 10.0)
+            {
+                return None;
+            }
+            let decimals = (-size.log10()).ceil().max(0.0) as usize + 1;
+            let centre = |v: f64| ((v / size + 1e-9).floor() + 0.5) * size;
+            let clat = centre(lat).clamp(-90.0, 90.0);
+            let clon = centre(lon).clamp(-180.0, 180.0);
+            Some(format!("{clat:.decimals$},{clon:.decimals$}"))
+        }
+
+        fn top_by_count(counts: HashMap<String, u32>, cap: usize) -> Vec<String> {
+            let mut v: Vec<(String, u32)> = counts.into_iter().collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            v.truncate(cap);
+            let mut ids: Vec<String> = v.into_iter().map(|(id, _)| id).collect();
+            ids.sort();
+            ids
+        }
+
+        // ---- places ----
+
+        pub(super) fn is_track_extension(ext: &str) -> bool {
+            matches!(ext, "gpx" | "tcx" | "kml" | "geojson")
+        }
+
+        /// Cells of the points in a GPX, TCX, KML or GeoJSON file.
+        pub(super) fn track_cells(path: &Path, ext: &str, size: f64) -> Vec<String> {
+            let Ok(meta) = fs::metadata(path) else {
+                return Vec::new();
+            };
+            if meta.len() > MAX_GEO_FILE {
+                return Vec::new();
+            }
+            let Ok(bytes) = fs::read(path) else {
+                return Vec::new();
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            match ext {
+                "gpx" => attribute_points(&text, &mut points),
+                "tcx" => tcx_points(&text, &mut points),
+                "kml" => kml_points(&text, &mut points),
+                _ => geojson_points(&text, &mut points),
+            }
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            for (lat, lon) in points {
+                if let Some(c) = cell(lat, lon, size) {
+                    *counts.entry(c).or_insert(0) += 1;
+                }
+            }
+            top_by_count(counts, MAX_PER_FILE)
+        }
+
+        fn number_after(text: &str, key: &str) -> Option<f64> {
+            let at = text.find(key)? + key.len();
+            let tail = &text[at..];
+            let end = tail.find('"')?;
+            tail[..end].trim().parse().ok()
+        }
+
+        /// GPX points: any tag carrying `lat="..."` and `lon="..."`.
+        fn attribute_points(text: &str, out: &mut Vec<(f64, f64)>) {
+            for tag in text.split('<').skip(1) {
+                let tag = &tag[..tag.find('>').unwrap_or(tag.len()).min(300)];
+                if let (Some(la), Some(lo)) =
+                    (number_after(tag, " lat=\""), number_after(tag, " lon=\""))
+                {
+                    out.push((la, lo));
+                }
+            }
+        }
+
+        fn tcx_points(text: &str, out: &mut Vec<(f64, f64)>) {
+            let mut rest = text;
+            while let Some(a) = rest.find("<LatitudeDegrees>") {
+                let after = &rest[a + 17..];
+                let Some(end) = after.find('<') else {
+                    break;
+                };
+                let lat: Option<f64> = after[..end].trim().parse().ok();
+                let Some(b) = after.find("<LongitudeDegrees>") else {
+                    break;
+                };
+                let tail = &after[b + 18..];
+                let lon: Option<f64> = tail.find('<').and_then(|e| tail[..e].trim().parse().ok());
+                if let (Some(la), Some(lo)) = (lat, lon) {
+                    out.push((la, lo));
+                }
+                rest = tail;
+            }
+        }
+
+        /// KML `<coordinates>` hold `lon,lat[,alt]` separated by whitespace.
+        fn kml_points(text: &str, out: &mut Vec<(f64, f64)>) {
+            let mut rest = text;
+            while let Some(a) = rest.find("<coordinates>") {
+                let after = &rest[a + 13..];
+                let Some(end) = after.find("</coordinates>") else {
+                    break;
+                };
+                for tuple in after[..end].split_whitespace() {
+                    let mut it = tuple.split(',');
+                    let lon: Option<f64> = it.next().and_then(|v| v.parse().ok());
+                    let lat: Option<f64> = it.next().and_then(|v| v.parse().ok());
+                    if let (Some(lo), Some(la)) = (lon, lat) {
+                        out.push((la, lo));
+                    }
+                }
+                rest = &after[end..];
+            }
+        }
+
+        /// GeoJSON positions: innermost arrays of two or three numbers after
+        /// the first `"coordinates"`, as `[lon, lat(, altitude)]`.
+        fn geojson_points(text: &str, out: &mut Vec<(f64, f64)>) {
+            let Some(start) = text.find("\"coordinates\"") else {
+                return;
+            };
+            let b = text.as_bytes();
+            let mut i = start;
+            while i < b.len() && out.len() < 2_000_000 {
+                if b[i] == b'[' {
+                    // Try to read `[ number , number ( , number )? ]`.
+                    let mut j = i + 1;
+                    let mut nums: Vec<f64> = Vec::new();
+                    loop {
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let s = j;
+                        while j < b.len()
+                            && (b[j].is_ascii_digit()
+                                || matches!(b[j], b'-' | b'+' | b'.' | b'e' | b'E'))
+                        {
+                            j += 1;
+                        }
+                        let Some(n) = text[s..j].parse::<f64>().ok().filter(|_| j > s) else {
+                            break;
+                        };
+                        nums.push(n);
+                        while j < b.len() && b[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        if j < b.len() && b[j] == b',' && nums.len() < 3 {
+                            j += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if (2..=3).contains(&nums.len()) && j < b.len() && b[j] == b']' {
+                        out.push((nums[1], nums[0]));
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+
+        fn canon(name: &str) -> String {
+            canon_name(name)
+        }
+
+        /// Cells from the latitude and longitude columns of a table (when
+        /// their values lie within a degree of each other) and from a column
+        /// of `lat,lon` values.
+        pub(super) fn table_cells(
+            tables: &[(String, Vec<ColumnProfile>)],
+            size: f64,
+        ) -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            let mut add = |c: Option<String>| {
+                if let Some(c) = c
+                    && !out.contains(&c)
+                    && out.len() < MAX_PER_FILE
+                {
+                    out.push(c);
+                }
+            };
+            for (_, cols) in tables {
+                let find = |names: &[&str]| {
+                    cols.iter().find(|c| {
+                        matches!(c.ideal_type.as_str(), "f64" | "i64")
+                            && names.contains(&canon(&c.name).as_str())
+                    })
+                };
+                let lat = find(&[
+                    "lat",
+                    "latitude",
+                    "lat_deg",
+                    "latitude_deg",
+                    "gps_lat",
+                    "gps_latitude",
+                ]);
+                let lon = find(&[
+                    "lon",
+                    "lng",
+                    "long",
+                    "longitude",
+                    "lon_deg",
+                    "longitude_deg",
+                    "gps_lon",
+                    "gps_longitude",
+                ]);
+                if let (Some(la), Some(lo)) = (lat, lon)
+                    && let (Some(ls), Some(os)) = (&la.numeric_stats, &lo.numeric_stats)
+                    && ls.max - ls.min <= 1.0
+                    && os.max - os.min <= 1.0
+                    && ls.min.abs() <= 90.0
+                    && ls.max.abs() <= 90.0
+                    && os.min.abs() <= 180.0
+                    && os.max.abs() <= 180.0
+                {
+                    add(cell(ls.median, os.median, size));
+                }
+                for c in cols {
+                    if c.ideal_type == "Geographic Coordinates" {
+                        for v in &c.sample_values {
+                            if let Some((a, b)) = v.split_once(',')
+                                && let (Ok(la), Ok(lo)) =
+                                    (a.trim().parse::<f64>(), b.trim().parse::<f64>())
+                            {
+                                add(cell(la, lo, size));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        // ---- days ----
+
+        fn valid_day(y: u32, m: u32, d: u32) -> Option<String> {
+            ((1900..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d))
+                .then(|| format!("{y:04}-{m:02}-{d:02}"))
+        }
+
+        /// The calendar day of an RFC 5322 `Date:` value as written
+        /// (`Mon, 15 Jan 2024 10:00:00 +0000`, the weekday and seconds optional).
+        pub(super) fn mail_day(value: &str) -> Option<String> {
+            const MONTHS: [&str; 12] = [
+                "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+            ];
+            let cleaned: String = value.split('(').next().unwrap_or("").replace(',', " ");
+            let toks: Vec<&str> = cleaned.split_whitespace().collect();
+            for w in toks.windows(3) {
+                let Ok(d) = w[0].parse::<u32>() else {
+                    continue;
+                };
+                let month = w[1].to_ascii_lowercase();
+                let Some(m) = MONTHS.iter().position(|x| month.starts_with(x)) else {
+                    continue;
+                };
+                // Two-digit years follow RFC 5322's obsolete rule.
+                let y = match w[2].len() {
+                    4 => w[2].parse::<u32>().ok(),
+                    2 => w[2]
+                        .parse::<u32>()
+                        .ok()
+                        .map(|y| if y < 50 { 2000 + y } else { 1900 + y }),
+                    _ => None,
+                };
+                if let Some(y) = y {
+                    return valid_day(y, m as u32 + 1, d);
+                }
+            }
+            None
+        }
+
+        /// The days of the `Date:` headers of a mailbox or a message.
+        pub(super) fn mail_days(path: &Path) -> Vec<String> {
+            let Ok(f) = fs::File::open(path) else {
+                return Vec::new();
+            };
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            let mut in_headers = true;
+            let mut previous_blank = true;
+            let mut seen = 0usize;
+            let mut lines = BufReader::new(f).split(b'\n');
+            while let Some(Ok(raw)) = lines.next() {
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim_end_matches('\r');
+                if line.is_empty() {
+                    in_headers = false;
+                    previous_blank = true;
+                    continue;
+                }
+                if previous_blank && line.starts_with("From ") {
+                    in_headers = true;
+                    previous_blank = false;
+                    continue;
+                }
+                previous_blank = false;
+                if in_headers
+                    && line.len() > 5
+                    && line.as_bytes()[..5].eq_ignore_ascii_case(b"date:")
+                {
+                    seen += 1;
+                    if let Some(day) = mail_day(&line[5..]) {
+                        *counts.entry(day).or_insert(0) += 1;
+                    }
+                    in_headers = false;
+                    if seen > 200_000 {
+                        break;
+                    }
+                }
+            }
+            top_by_count(counts, MAX_DAYS_PER_FILE)
+        }
+
+        /// The days of the `DTSTART` of each event in an iCalendar file.
+        pub(super) fn ics_days(path: &Path) -> Vec<String> {
+            let Ok(f) = fs::File::open(path) else {
+                return Vec::new();
+            };
+            let mut counts: HashMap<String, u32> = HashMap::new();
+            for raw in BufReader::new(f).split(b'\n').map_while(|r| r.ok()) {
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim_end_matches('\r');
+                let upper = line.get(..7).map(str::to_ascii_uppercase);
+                if upper.as_deref() != Some("DTSTART") {
+                    continue;
+                }
+                let Some((_, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let digits: String = value.chars().take(8).collect();
+                if digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_digit()) {
+                    let (y, m, d) = (
+                        digits[..4].parse().unwrap_or(0),
+                        digits[4..6].parse().unwrap_or(0),
+                        digits[6..8].parse().unwrap_or(0),
+                    );
+                    if let Some(day) = valid_day(y, m, d) {
+                        *counts.entry(day).or_insert(0) += 1;
+                    }
+                }
+            }
+            top_by_count(counts, MAX_DAYS_PER_FILE)
+        }
+
+        /// A PDF `D:20240309142211+01'00'`, or an ISO timestamp, as a day.
+        pub(super) fn created_day(value: &str) -> Option<String> {
+            let v = value.trim();
+            let v = v.strip_prefix("D:").unwrap_or(v);
+            let digits: String = v.chars().take_while(char::is_ascii_digit).collect();
+            if digits.len() >= 8 {
+                return valid_day(
+                    digits[..4].parse().ok()?,
+                    digits[4..6].parse().ok()?,
+                    digits[6..8].parse().ok()?,
+                );
+            }
+            let b = v.as_bytes();
+            if b.len() >= 10 && b[4] == b'-' && b[7] == b'-' {
+                return valid_day(
+                    v[..4].parse().ok()?,
+                    v[5..7].parse().ok()?,
+                    v[8..10].parse().ok()?,
+                );
+            }
+            None
         }
     }
 
@@ -122084,6 +122611,10 @@ mod knowledge_graph {
             authors: Vec<String>,
             make: Option<String>,
             model: Option<String>,
+            /// Where the picture was taken (EXIF GPS or XMP), in degrees.
+            geo: Option<(f64, f64)>,
+            /// The day it was taken, `YYYY-MM-DD`.
+            taken: Option<String>,
         }
 
         impl Found {
@@ -122443,6 +122974,146 @@ mod knowledge_graph {
                 }
             }
             found.camera(make, model);
+            sub_directories(src, &entries, big, found);
+        }
+
+        fn type_size(kind: u16) -> u64 {
+            match kind {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                _ => 0,
+            }
+        }
+
+        fn rd16(b: &[u8], big: bool) -> u16 {
+            let a = [b[0], b[1]];
+            if big {
+                u16::from_be_bytes(a)
+            } else {
+                u16::from_le_bytes(a)
+            }
+        }
+
+        fn rd32(b: &[u8], big: bool) -> u32 {
+            let a = [b[0], b[1], b[2], b[3]];
+            if big {
+                u32::from_be_bytes(a)
+            } else {
+                u32::from_le_bytes(a)
+            }
+        }
+
+        /// The 12-byte entries of the directory at `at`.
+        fn directory<R: Read + Seek>(src: &mut R, at: u64, big: bool) -> Option<Vec<u8>> {
+            src.seek(SeekFrom::Start(at)).ok()?;
+            let n = take(src, 2)?;
+            let n = u64::from(rd16(&n, big)).min(1024);
+            take(src, n * 12)
+        }
+
+        /// The value bytes of one directory entry (inline or at its offset).
+        fn entry_value<R: Read + Seek>(src: &mut R, e: &[u8], big: bool) -> Option<Vec<u8>> {
+            let size = type_size(rd16(&e[2..4], big));
+            let total = size.checked_mul(u64::from(rd32(&e[4..8], big)))?;
+            if size == 0 || total == 0 || total > 4096 {
+                return None;
+            }
+            if total <= 4 {
+                return Some(e[8..8 + total as usize].to_vec());
+            }
+            src.seek(SeekFrom::Start(u64::from(rd32(&e[8..12], big))))
+                .ok()?;
+            take(src, total)
+        }
+
+        /// `YYYY:MM:DD HH:MM:SS` (or with dashes) as `YYYY-MM-DD`; zero and
+        /// out-of-range dates, which cameras without a clock write, are not dates.
+        fn exif_day(text: &[u8]) -> Option<String> {
+            let t = std::str::from_utf8(text.get(..10)?).ok()?;
+            let sep = |c: char| c == ':' || c == '-';
+            let b: Vec<char> = t.chars().collect();
+            if !sep(b[4]) || !sep(b[7]) {
+                return None;
+            }
+            let num = |r: std::ops::Range<usize>| -> Option<u32> {
+                b[r].iter().collect::<String>().parse().ok()
+            };
+            let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+            ((1900..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d))
+                .then(|| format!("{y:04}-{m:02}-{d:02}"))
+        }
+
+        /// Degrees from up to three rationals (degrees, minutes, seconds).
+        fn degrees(v: &[u8], big: bool) -> Option<f64> {
+            let n = (v.len() / 8).min(3);
+            if n == 0 {
+                return None;
+            }
+            let mut total = 0.0;
+            let mut scale = 1.0;
+            for i in 0..n {
+                let num = f64::from(rd32(&v[i * 8..i * 8 + 4], big));
+                let den = f64::from(rd32(&v[i * 8 + 4..i * 8 + 8], big));
+                if den == 0.0 {
+                    return None;
+                }
+                total += num / den / scale;
+                scale *= 60.0;
+            }
+            Some(total)
+        }
+
+        /// The Exif directory (`DateTimeOriginal`) and the GPS directory
+        /// (latitude and longitude) that IFD0 points at, and IFD0's own
+        /// `DateTime` when nothing better is there.
+        fn sub_directories<R: Read + Seek>(src: &mut R, ifd0: &[u8], big: bool, found: &mut Found) {
+            let (mut exif_at, mut gps_at, mut modified) = (None, None, None);
+            for e in ifd0.as_chunks::<12>().0 {
+                match rd16(&e[0..2], big) {
+                    0x8769 => exif_at = Some(u64::from(rd32(&e[8..12], big))),
+                    0x8825 => gps_at = Some(u64::from(rd32(&e[8..12], big))),
+                    0x0132 => modified = entry_value(src, e, big).and_then(|v| exif_day(&v)),
+                    _ => {}
+                }
+            }
+            if let Some(at) = exif_at
+                && let Some(dir) = directory(src, at, big)
+            {
+                let mut original = None;
+                let mut digitized = None;
+                for e in dir.as_chunks::<12>().0 {
+                    match rd16(&e[0..2], big) {
+                        0x9003 => original = entry_value(src, e, big).and_then(|v| exif_day(&v)),
+                        0x9004 => digitized = entry_value(src, e, big).and_then(|v| exif_day(&v)),
+                        _ => {}
+                    }
+                }
+                found.taken = original.or(digitized);
+            }
+            if found.taken.is_none() {
+                found.taken = modified;
+            }
+            if let Some(at) = gps_at
+                && let Some(dir) = directory(src, at, big)
+            {
+                let (mut lat_ref, mut lat, mut lon_ref, mut lon) = (None, None, None, None);
+                for e in dir.as_chunks::<12>().0 {
+                    match rd16(&e[0..2], big) {
+                        1 => lat_ref = entry_value(src, e, big).and_then(|v| v.first().copied()),
+                        2 => lat = entry_value(src, e, big).and_then(|v| degrees(&v, big)),
+                        3 => lon_ref = entry_value(src, e, big).and_then(|v| v.first().copied()),
+                        4 => lon = entry_value(src, e, big).and_then(|v| degrees(&v, big)),
+                        _ => {}
+                    }
+                }
+                if let (Some(la), Some(lo)) = (lat, lon) {
+                    let la = if lat_ref == Some(b'S') { -la } else { la };
+                    let lo = if lon_ref == Some(b'W') { -lo } else { lo };
+                    found.geo = Some((la, lo));
+                }
+            }
         }
 
         /// `dc:creator` (a list of names) and the TIFF make and model, from
@@ -122480,6 +123151,47 @@ mod knowledge_graph {
                 Some(xml_unescape_text(&tail[..end]).trim().to_string())
             };
             found.camera(value("tiff:Make"), value("tiff:Model"));
+            if found.geo.is_none()
+                && let (Some(la), Some(lo)) =
+                    (value("exif:GPSLatitude"), value("exif:GPSLongitude"))
+                && let (Some(la), Some(lo)) = (xmp_degrees(&la), xmp_degrees(&lo))
+            {
+                found.geo = Some((la, lo));
+            }
+            if found.taken.is_none() {
+                found.taken = value("exif:DateTimeOriginal")
+                    .or_else(|| value("photoshop:DateCreated"))
+                    .and_then(|v| exif_day(v.as_bytes()));
+            }
+        }
+
+        /// XMP writes a coordinate as `DDD,MM.mmk` or `DDD,MM,SSk`, `k` being
+        /// N, S, E or W.
+        fn xmp_degrees(text: &str) -> Option<f64> {
+            let text = text.trim();
+            let last = text.chars().last()?;
+            let (body, sign) = match last {
+                'N' | 'E' => (&text[..text.len() - 1], 1.0),
+                'S' | 'W' => (&text[..text.len() - 1], -1.0),
+                _ => return None,
+            };
+            let mut total = 0.0;
+            let mut scale = 1.0;
+            for part in body.split(',').take(3) {
+                total += part.trim().parse::<f64>().ok()? / scale;
+                scale *= 60.0;
+            }
+            Some(sign * total)
+        }
+
+        /// Where and when a picture was taken, if it says.
+        #[allow(clippy::type_complexity)]
+        pub(super) fn facts(path: &Path) -> (Option<(f64, f64)>, Option<String>) {
+            let Ok(mut file) = fs::File::open(path) else {
+                return (None, None);
+            };
+            let found = scan(&mut file);
+            (found.geo, found.taken)
         }
     }
 
@@ -122521,6 +123233,8 @@ mod knowledge_graph {
             changes_with: Vec::new(),
             mtime: 0,
             image_hash: None,
+            places: Vec::new(),
+            days: Vec::new(),
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -123914,6 +124628,32 @@ mod knowledge_graph {
         (image_hash::hash(path), p)
     }
 
+    /// Places and days of one file, as a graph run would read them.
+    pub(crate) fn probe_places_and_days(
+        path: &Path,
+        cell: Option<f64>,
+        timeline: bool,
+    ) -> (Vec<String>, Vec<String>) {
+        let opts = CollectOptions {
+            samples: 3,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            progress: false,
+            jobs: Some(1),
+            cache_dir: None,
+            patterns: Vec::new(),
+            patterns_fingerprint: 0,
+            people: false,
+            git: false,
+            databases: Vec::new(),
+            geo_cell: cell,
+            timeline,
+        };
+        let known = Arc::new(KnownFiles::new(std::iter::empty::<&str>()));
+        let file = read_one(Path::new(""), path, &opts, &known);
+        (file.places, file.days)
+    }
+
     /// A file's own-property facts, by its extension.
     pub(crate) fn file_facts(path: &Path) -> Vec<(String, String)> {
         let name = path
@@ -124274,10 +125014,13 @@ mod knowledge_graph {
         /// Two pictures that look alike: the same picture resized or saved
         /// again.
         LooksLike,
+        /// A file and a coarse place (a grid cell) or a day it is about
+        /// (`--geo`, `--timeline`).
+        Near,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 29] = [
+        pub(crate) const ALL: [Relation; 30] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -124307,6 +125050,7 @@ mod knowledge_graph {
             Relation::DerivedFrom,
             Relation::ExportedFrom,
             Relation::LooksLike,
+            Relation::Near,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -124340,6 +125084,7 @@ mod knowledge_graph {
                 Relation::DerivedFrom => "derived_from",
                 Relation::ExportedFrom => "exported_from",
                 Relation::LooksLike => "looks_like",
+                Relation::Near => "near",
             }
         }
 
@@ -124828,6 +125573,7 @@ mod knowledge_graph {
         link_versions(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_looks_like(&mut b, &files, &file_node);
+        link_near(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
         if opts.folders {
             link_folders(&mut b, &files, &file_node);
@@ -127384,6 +128130,60 @@ mod knowledge_graph {
                     conf,
                     evidence,
                 );
+            }
+        }
+    }
+
+    /// `near`: files about the same coarse place (a grid cell) or the same
+    /// day, through a `place:` or `day:` node that two or more files name
+    /// (and at most a quarter of them - a cell or day nearly everything is
+    /// in says nothing). Only files read with `--geo` / `--timeline` have
+    /// any.
+    fn link_near(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let cap = (files.len() / 4).max(200);
+        for (kind, prefix, label_prefix) in [("place", "place", "near "), ("day", "day", "")] {
+            let mut by: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (fi, f) in files.iter().enumerate() {
+                let facts = if kind == "place" { &f.places } else { &f.days };
+                for id in facts {
+                    let slot = by.entry(id.as_str()).or_default();
+                    if !slot.contains(&fi) {
+                        slot.push(fi);
+                    }
+                }
+            }
+            for (id, members) in by {
+                if members.len() < 2 || members.len() > cap {
+                    continue;
+                }
+                let mut attrs = json_support::Map::new();
+                attrs.insert("entity_kind".to_string(), JsonValue::from(kind));
+                attrs.insert("files".to_string(), JsonValue::from(members.len()));
+                let node = b.add_node(
+                    format!("{prefix}:{id}"),
+                    format!("{label_prefix}{id}"),
+                    NodeType::Entity,
+                    kind.to_string(),
+                    None,
+                    attrs,
+                );
+                let weight = 1.5 / (1.0 + (members.len() as f64).ln());
+                let why = if kind == "place" {
+                    format!("located in the same grid cell, centred on {id}")
+                } else {
+                    format!("dated {id}")
+                };
+                for fi in members {
+                    b.add_edge(
+                        file_node[fi],
+                        node,
+                        Relation::Near,
+                        Conf::Inferred,
+                        0.4,
+                        weight,
+                        vec![why.clone()],
+                    );
+                }
             }
         }
     }
@@ -130267,6 +131067,9 @@ mod knowledge_graph {
             pub(crate) columns: Option<bool>,
             pub(crate) people: Option<bool>,
             pub(crate) git: Option<bool>,
+            pub(crate) geo: Option<bool>,
+            pub(crate) timeline: Option<bool>,
+            pub(crate) geo_cell: Option<f64>,
             pub(crate) resolution: Option<f64>,
             pub(crate) samples: Option<usize>,
             pub(crate) jobs: Option<usize>,
@@ -130400,6 +131203,9 @@ mod knowledge_graph {
                         "columns",
                         "people",
                         "git",
+                        "geo",
+                        "timeline",
+                        "geo_cell",
                         "resolution",
                         "samples",
                         "jobs",
@@ -130423,6 +131229,28 @@ mod knowledge_graph {
                     cfg.people = Some(c.as_bool().ok_or_else(|| {
                         anyhow!("{origin}: [graph] people must be true or false")
                     })?);
+                }
+                if let Some(c) = g.get("geo") {
+                    cfg.geo =
+                        Some(c.as_bool().ok_or_else(|| {
+                            anyhow!("{origin}: [graph] geo must be true or false")
+                        })?);
+                }
+                if let Some(c) = g.get("timeline") {
+                    cfg.timeline = Some(c.as_bool().ok_or_else(|| {
+                        anyhow!("{origin}: [graph] timeline must be true or false")
+                    })?);
+                }
+                if let Some(c) = g.get("geo_cell") {
+                    cfg.geo_cell = Some(
+                        c.as_f64()
+                            .filter(|x| x.is_finite() && *x >= 0.001 && *x <= 10.0)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "{origin}: [graph] geo_cell must be a number of degrees from 0.001 to 10"
+                                )
+                            })?,
+                    );
                 }
                 if let Some(c) = g.get("git") {
                     cfg.git =
@@ -133174,6 +134002,8 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 changes_with: Vec::new(),
                 mtime: 0,
                 image_hash: None,
+                places: Vec::new(),
+                days: Vec::new(),
             }
         }
 
@@ -134430,6 +135260,97 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     }
 
     #[cfg(test)]
+    mod place_time_tests {
+        use super::place_time::*;
+
+        #[test]
+        fn a_cell_is_the_centre_of_its_square() {
+            assert_eq!(cell(48.8566, 2.3522, 0.1).as_deref(), Some("48.85,2.35"));
+            assert_eq!(
+                cell(-33.8688, 151.2093, 0.1).as_deref(),
+                Some("-33.85,151.25")
+            );
+            assert_eq!(cell(48.8566, 2.3522, 1.0).as_deref(), Some("48.5,2.5"));
+            // 0.3 / 0.1 is 2.9999999999999996 in doubles; a position on a
+            // cell's edge belongs to the cell above it.
+            assert_eq!(cell(0.3, 0.3, 0.1).as_deref(), Some("0.35,0.35"));
+            assert_eq!(cell(10.0, 20.0, 0.1), cell(10.0001, 20.0001, 0.1));
+            // The poles and the date line stay on the globe.
+            assert_eq!(cell(90.0, 180.0, 0.1).as_deref(), Some("90.00,180.00"));
+        }
+
+        #[test]
+        fn impossible_and_empty_positions_are_no_place() {
+            assert_eq!(cell(0.0, 0.0, 0.1), None);
+            assert_eq!(cell(91.0, 0.0, 0.1), None);
+            assert_eq!(cell(0.0, 181.0, 0.1), None);
+            assert_eq!(cell(f64::NAN, 1.0, 0.1), None);
+            assert_eq!(cell(1.0, f64::INFINITY, 0.1), None);
+            assert_eq!(cell(1.0, 1.0, 0.0), None);
+        }
+
+        #[test]
+        fn mail_dates_are_read_as_written() {
+            for (text, day) in [
+                (" Mon, 15 Jan 2024 10:00:00 +0000", Some("2024-01-15")),
+                ("15 Jan 2024 10:00 -0800", Some("2024-01-15")),
+                (" Tue, 5 Mar 24 08:00 -0500 (EST)", Some("2024-03-05")),
+                (" Sat, 1 Jun 1999 23:59:59 GMT", Some("1999-06-01")),
+                (" Thu, 32 Jan 2024 10:00:00 +0000", None),
+                (" soon", None),
+                ("", None),
+            ] {
+                assert_eq!(mail_day(text).as_deref(), day, "{text:?}");
+            }
+        }
+
+        /// A picture's GPS and date are read from its own bytes; cut or damaged
+        /// ones give less, never a panic.
+        #[test]
+        fn a_damaged_photo_gives_fewer_facts_and_never_a_panic() {
+            use super::image_meta::facts;
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/edge_graph_geotime");
+            let good = std::fs::read(dir.join("eiffel_1.jpg")).unwrap();
+            let tmp = std::env::temp_dir().join(format!("sniff-rs-pt-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let probe = tmp.join("probe.jpg");
+            std::fs::write(&probe, &good).unwrap();
+            let (geo, day) = facts(&probe);
+            let (lat, lon) = geo.expect("the fixture has GPS");
+            assert!((lat - 48.8584).abs() < 1e-4 && (lon - 2.2945).abs() < 1e-4);
+            assert_eq!(day.as_deref(), Some("2024-06-01"));
+            for cut in 0..good.len() {
+                std::fs::write(&probe, &good[..cut]).unwrap();
+                let _ = facts(&probe);
+            }
+            for at in 0..good.len() {
+                let mut bad = good.clone();
+                bad[at] = !bad[at];
+                std::fs::write(&probe, &bad).unwrap();
+                let _ = facts(&probe);
+            }
+            std::fs::remove_dir_all(&tmp).unwrap();
+        }
+
+        #[test]
+        fn creation_dates_in_pdf_and_iso_forms() {
+            assert_eq!(
+                created_day("D:20240309142211+01'00'").as_deref(),
+                Some("2024-03-09")
+            );
+            assert_eq!(created_day("D:20240309").as_deref(), Some("2024-03-09"));
+            assert_eq!(
+                created_day("2024-03-09T14:22:11Z").as_deref(),
+                Some("2024-03-09")
+            );
+            assert_eq!(created_day("D:2024"), None);
+            assert_eq!(created_day("D:20241399"), None);
+            assert_eq!(created_day("yesterday"), None);
+        }
+    }
+
+    #[cfg(test)]
     mod version_tests {
         use super::*;
 
@@ -134967,6 +135888,8 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 changes_with: Vec::new(),
                 mtime: 0,
                 image_hash: None,
+                places: Vec::new(),
+                days: Vec::new(),
             }
         }
 
@@ -135121,6 +136044,9 @@ USAGE:
                    reads (per statement for SQL, per script otherwise; a
                    dbt model to the models and sources it names);
                    directed, INFERRED
+      near         with --geo or --timeline: a file and the grid cell
+                   (place:) or day (day:) it is about, shared by two
+                   or more files
       looks_like   two pictures (PNG or JPEG) that look alike - the same
                    picture resized, recompressed or saved again; found by
                    a perceptual hash, never for byte-identical copies
@@ -135222,6 +136148,16 @@ OPTIONS:
                                 or mysql://... (or postgres:name,
                                 mysql:name); runs psql or mysql, reads
                                 the catalog only, never the data
+        --geo                   Read where files are about and link files
+                                in the same grid cell (near): GPS in photos,
+                                GPX/TCX/KML/GeoJSON points, latitude and
+                                longitude columns. Only the cell's centre is
+                                kept, never an exact position. Off by default
+        --geo-cell <DEGREES>    Size of the cells (default 0.1, about 11 km)
+        --timeline              Read when files are dated and link files of
+                                the same day (near): when a photo was taken,
+                                the Date of mail, calendar events, when a PDF
+                                or office document was created. Off by default
         --unlinked-report       Also write unlinked.json: each file that
                                 shares nothing with any other, why, the
                                 words, identifiers and columns in it,
@@ -135329,6 +136265,9 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut people: Option<bool> = None;
     let mut git: Option<bool> = None;
     let mut unlinked_report = false;
+    let mut geo: Option<bool> = None;
+    let mut timeline: Option<bool> = None;
+    let mut geo_cell: Option<f64> = None;
     let mut databases: Vec<String> = Vec::new();
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
@@ -135408,6 +136347,31 @@ fn run_graph(raw: &[String]) -> Result<()> {
                         bail!("--git takes no value");
                     }
                     git = Some(true);
+                }
+                "geo" => {
+                    if inline_value.is_some() {
+                        bail!(
+                            "--geo takes no value (use --geo-cell <DEGREES> to set the cell size)"
+                        );
+                    }
+                    geo = Some(true);
+                }
+                "timeline" => {
+                    if inline_value.is_some() {
+                        bail!("--timeline takes no value");
+                    }
+                    timeline = Some(true);
+                }
+                "geo-cell" => {
+                    let v = value(&mut i)?;
+                    geo_cell = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|x: &f64| x.is_finite() && *x >= 0.001 && *x <= 10.0)
+                            .ok_or_else(|| {
+                                anyhow!("--geo-cell must be a number of degrees from 0.001 to 10, got {v:?}")
+                            })?,
+                    );
                 }
                 "unlinked-report" => {
                     if inline_value.is_some() {
@@ -135547,6 +136511,14 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let folders = folders.or(cfg.folders).unwrap_or(false);
     let columns = columns.or(cfg.columns).unwrap_or(false);
     let git = git.or(cfg.git).unwrap_or(false);
+    // A cell size alone does not turn places on: that takes --geo.
+    let geo_on = geo.or(cfg.geo).unwrap_or(false);
+    let geo_cell_size = geo_cell.or(cfg.geo_cell).unwrap_or(0.1);
+    if geo_cell.is_some() && !geo_on {
+        bail!("--geo-cell sets the size of the cells --geo reads; add --geo");
+    }
+    let geo_cell = geo_on.then_some(geo_cell_size);
+    let timeline = timeline.or(cfg.timeline).unwrap_or(false);
     // The authors in the history are people, so `--git` reads people too.
     let people = people.or(cfg.people).unwrap_or(false) || git;
     let resolution = resolution.or(cfg.resolution).unwrap_or(1.0);
@@ -135568,6 +136540,8 @@ fn run_graph(raw: &[String]) -> Result<()> {
             people,
             git,
             databases,
+            geo_cell,
+            timeline,
         },
     )?;
     if files.is_empty() {
@@ -135837,6 +136811,11 @@ fn load_knowledge_graph_input(
                 people: cfg.people.unwrap_or(false) || cfg.git.unwrap_or(false),
                 git: cfg.git.unwrap_or(false),
                 databases: Vec::new(),
+                geo_cell: cfg
+                    .geo
+                    .unwrap_or(false)
+                    .then_some(cfg.geo_cell.unwrap_or(0.1)),
+                timeline: cfg.timeline.unwrap_or(false),
             },
         )?;
         if files.is_empty() {

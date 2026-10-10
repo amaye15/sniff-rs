@@ -20887,3 +20887,161 @@ fn graph_links_pictures_that_look_alike_but_not_identical_copies() {
     }));
     assert!(!linked("scene.png", "scene_copy.png"));
 }
+
+fn geotime_fixture() -> String {
+    format!(
+        "{}/tests/fixtures/edge_graph_geotime",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn near_groups(doc: &serde_json::Value) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for l in doc["links"].as_array().unwrap() {
+        if l["relation"] == "near" {
+            out.entry(l["target"].as_str().unwrap().to_string())
+                .or_default()
+                .push(l["source"].as_str().unwrap().to_string());
+        }
+    }
+    for v in out.values_mut() {
+        v.sort();
+    }
+    out
+}
+
+#[cfg(all(feature = "mbox", feature = "icalendar", feature = "pdf"))]
+#[test]
+fn graph_reads_places_and_days_only_when_asked() {
+    // Off by default: no place or day anywhere.
+    let plain = graph_doc(&["graph", &geotime_fixture(), "-", "--no-cache"]);
+    assert!(near_groups(&plain).is_empty());
+    assert!(
+        !plain["nodes"].as_array().unwrap().iter().any(|n| n["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("place:")
+            || n["id"].as_str().unwrap().starts_with("day:"))
+    );
+    // With both flags, files about one cell or day share a node.
+    let run = run_graph(&[
+        "graph",
+        &geotime_fixture(),
+        "-",
+        "--no-cache",
+        "--geo",
+        "--timeline",
+    ]);
+    assert!(run.status.success());
+    let text = String::from_utf8(run.stdout).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let groups = near_groups(&doc);
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        groups["place:48.85,2.35"],
+        names(&["fixes.csv", "route.geojson", "route.gpx", "route.kml"])
+    );
+    assert_eq!(
+        groups["place:48.85,2.25"],
+        names(&["eiffel_1.jpg", "eiffel_2.jpg"])
+    );
+    assert_eq!(
+        groups["day:2024-06-01"],
+        names(&[
+            "eiffel_1.jpg",
+            "eiffel_2.jpg",
+            "inbox.mbox",
+            "rome.jpg",
+            "trip.ics"
+        ])
+    );
+    assert_eq!(
+        groups["day:2024-06-02"],
+        names(&["inbox.mbox", "itinerary.pdf"])
+    );
+    // Rome is alone in its cell, so it has no node; nothing is about "lonely.txt".
+    assert_eq!(groups.len(), 4, "{groups:?}");
+    assert!(!text.contains("lonely.txt\", \"target\": \"place"));
+    // No exact position is in the graph: only cell centres.
+    for exact in [
+        "48.8606", "2.3376", "48.8584", "2.2945", "41.9028", "12.4964",
+    ] {
+        assert!(!text.contains(exact), "{exact} is in the output");
+    }
+}
+
+#[cfg(all(feature = "mbox", feature = "icalendar", feature = "pdf"))]
+#[test]
+fn graph_geo_cell_sets_the_cell_size_and_needs_geo() {
+    let bad = run_graph(&["graph", &geotime_fixture(), "-", "--geo-cell", "1"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("add --geo"));
+    let doc = graph_doc(&[
+        "graph",
+        &geotime_fixture(),
+        "-",
+        "--no-cache",
+        "--geo",
+        "--geo-cell",
+        "1",
+    ]);
+    let groups = near_groups(&doc);
+    // At one degree the route, the fixes and the two Paris photos are one cell.
+    assert_eq!(
+        groups["place:48.5,2.5"],
+        vec![
+            "eiffel_1.jpg",
+            "eiffel_2.jpg",
+            "fixes.csv",
+            "route.geojson",
+            "route.gpx",
+            "route.kml"
+        ]
+    );
+    for bad in ["0", "-1", "11", "wide"] {
+        let run = run_graph(&["graph", &geotime_fixture(), "-", "--geo", "--geo-cell", bad]);
+        assert!(!run.status.success(), "--geo-cell {bad}");
+    }
+}
+
+#[test]
+fn graph_geo_and_timeline_can_be_set_in_the_config_file() {
+    let dir = std::env::temp_dir().join(format!("sniff-rs-geocfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("cfg.json");
+    std::fs::write(
+        &cfg,
+        r#"{"graph": {"geo": true, "timeline": true, "geo_cell": 0.5}}"#,
+    )
+    .unwrap();
+    let doc = graph_doc(&[
+        "graph",
+        &geotime_fixture(),
+        "-",
+        "--no-cache",
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
+    let groups = near_groups(&doc);
+    assert!(groups.contains_key("day:2024-06-01"));
+    assert!(
+        groups.keys().any(|k| k.starts_with("place:48.75,2.25")),
+        "{groups:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+    // A bad value is refused, naming the key.
+    let dir = std::env::temp_dir().join(format!("sniff-rs-geocfg2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("cfg.json");
+    std::fs::write(&cfg, r#"{"graph": {"geo_cell": 100}}"#).unwrap();
+    let run = run_graph(&[
+        "graph",
+        &geotime_fixture(),
+        "-",
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("geo_cell"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

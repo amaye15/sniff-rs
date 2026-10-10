@@ -19003,6 +19003,66 @@ lyrics frames are not read; track, year and genre are left out on purpose.
 Pictures: see above. `--unlinked-report` is a flag only (not in the config
 file).
 
+### Phase 8: where and when (`--geo`, `--timeline`)
+
+Opt-in, because even a coarse place or a day can be something a person does
+not want in a file they share. With neither flag nothing is read and the graph
+is byte-identical to before (checked on every fixture tree and the 1,340-file
+corpus).
+
+- **What is kept.** A position becomes the centre of its grid cell (`place:48.85,2.35`;
+  `--geo-cell <DEGREES>` from 0.001 to 10, default 0.1, about 11 km), a time
+  becomes a day (`day:2024-06-01`). The exact values never leave the reader:
+  the per-file cache holds cells and days only, and its key includes the cell
+  size and the flags, so a run without them never sees a stale place. A
+  cell edge is a cell edge (`cell` adds 1e-9 before flooring so 0.3 is in the
+  cell above 0.2, not the one below by rounding); two points a metre apart on
+  either side are two cells.
+- **Places.** EXIF GPS (latitude and longitude as degrees, minutes, seconds
+  rationals, N/S/E/W), also XMP `exif:GPSLatitude`; the points of GPX
+  (`lat=`/`lon=` attributes, either order), TCX, KML (`lon,lat[,alt]`) and
+  GeoJSON (the first `coordinates` onward, arrays of two or three numbers);
+  a table's latitude and longitude columns (`lat`, `latitude`, `lng`, `lon`,
+  `long`, `longitude` and a few more) when both stay within one degree, as the
+  cell of their medians (a wider table spans too much to be one place); a
+  column of `lat,lon` values (from its samples). 16 cells at most per file,
+  the most-visited first; (0, 0), NaN and out-of-range values are no place.
+- **Days.** `DateTimeOriginal` (else `DateTimeDigitized`, else `DateTime`) of a
+  photo; the `Date:` header of each message of an mbox or `.eml` (as written,
+  in the message's own time zone; headers only, never a `Date:` line in a
+  body); each `DTSTART` of an iCalendar file (date, date-time, UTC and
+  `TZID` forms); the PDF `CreationDate`; `dcterms:created` of an OOXML
+  package and `meta:creation-date` of an ODF one. 40 days at most per file.
+  A file's modified time is not used: copying resets it.
+- **Linking.** A `place:` or `day:` node exists when two or more files name it
+  and at most a quarter of all files (and at least 200) do; each file links to
+  it with `near` (INFERRED). Louvain weight falls with the node's size, so one
+  busy day does not pull its files into one community.
+
+**Verified** by `tools/check_geotime.py` (148 files: JPEGs written by Pillow
+with GPS in all four hemispheres and capture dates, tracks in four formats
+parsed back with the standard XML and JSON parsers, tables, mailboxes written by
+`mailbox` and messages by `email` with dates in six time zones, calendars in
+every `DTSTART` form, PDFs by pikepdf, workbooks by openpyxl; expected cells
+by exact decimal arithmetic; every place and day equal, nothing read without
+the flags, and the graph links exactly the files that share one). A sign bug
+planted in the southern hemisphere made it fail 16 files. Unit tests cover the
+cell edge cases, mail date forms, creation dates; integration tests cover the
+fixture folder `tests/fixtures/edge_graph_geotime` (made by
+`tools/make_geotime_fixtures.py`: a route as GPX, KML and GeoJSON, a table of
+fixes, three photos, a mailbox, a calendar, a PDF), that no exact position is in
+the output, `--geo-cell` needing `--geo`, and the config keys.
+
+**Disclosed.** A cell is not a distance: points near an edge fall in different
+cells, and a person who wants "within 5 km" should use a larger cell and
+accept the blur. Only the first EXIF directory and the Exif and GPS directories
+it points at are read (no maker notes, no HEIC). KMZ, FIT, Google Takeout JSON
+and positions written in prose are not read. A table's place needs both
+columns to be `f64`/`i64` with `numeric_stats` (a text column of numbers is
+not one). Mail dates are the days as written, so a message sent at 23:30 in
+one zone and read at 04:30 UTC is on the earlier day. Time zones are never
+converted.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
