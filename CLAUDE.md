@@ -19063,6 +19063,70 @@ not one). Mail dates are the days as written, so a message sent at 23:30 in
 one zone and read at 04:30 UTC is on the earlier day. Time zones are never
 converted.
 
+### Phase 9: more exports and four ways to ask the graph
+
+**Exports.** `--export` (and `--output-format` with output `-`) now also writes
+`graph.sqlite`, `graph.gexf`, `graph.jsonld` and `graph.mmd`.
+
+- **SQLite.** `mod sqlite_writer` writes a database file with no library: page
+  1 holds the header and `sqlite_master`, each table is a b-tree (leaf pages
+  0x0D, interior 0x05 with at most 200 children), a value too long for a page
+  goes to an overflow chain (local payload 4061 bytes at most, 489 at least),
+  integers use the smallest serial type, varints run to nine bytes. Tables:
+  `meta`, `nodes`, `links`, `evidence`, `communities`, and a view `link_names`
+  that joins the link ends back to node ids. To a terminal the binary is
+  refused (redirect it or give a path).
+- **GEXF 1.2draft** (networkx reads only 1.1draft and 1.2draft, and rejects a
+  graph that mixes directed and undirected links, so the file is directed only
+  when every link is). **JSON-LD** with `urn:sniff-rs:` IRIs; a node and a link
+  are both resources. **Mermaid** draws the 120 most connected nodes and 400
+  links; text is escaped with `#NNN;` entities.
+
+**Queries**, each reading a directory or a `graph.json` and each honouring
+`--relation`, `--confidence` and `--min-score`:
+
+- `search <INPUT> <QUERY>`: BM25 exactly as SQLite FTS5 computes it
+  (`k1 = 1.2`, `b = 0.75`, idf `ln((N - n + 0.5) / (n + 0.5))` floored at 1e-6,
+  the frequency of a word the sum of its counts times the weight of its field,
+  length all words of the node). Fields: label 4, id 3, top words and column
+  names 2, kind 1, community label 0.5. A word ending in `*` is a prefix; words
+  are runs of letters and digits in lower case (`order_id` is two words); text
+  in a script written without spaces is cut into pairs of characters, as
+  `similar_to` does. `--type` limits to one node type, `--top` caps (20).
+- `neighbors <INPUT> <NODE>`: every node within `--depth` links (1 to 6),
+  nearest first, with the neighbor each was reached from and the links between
+  them (relation, direction, confidence, score).
+- `subgraph <INPUT>`: the nodes within `--depth` of `--node` and `--community`
+  seeds (both repeatable) and every link between two kept nodes, as a graph of
+  its own: `graph.json` by default (valid against the schema, communities
+  renumbered from 0, degrees recounted), `md`, or any export format.
+- `communities <INPUT>`: per community the size, composition, three best
+  connected nodes, top words, internal and boundary links, cohesion (internal
+  share of its links) and the communities it is linked to most; and the
+  modularity of the whole split (parallel links add up, self links ignored).
+  `--top N` limits, `--members` lists the nodes.
+
+**Verified** by `tools/check_export_formats.py` (SQLite `PRAGMA integrity_check` and read-back
+of a 30-database fuzz with up to 100 KB values, 9-byte varints and 60,000-row
+trees; networkx reads the GEXF; rdflib parses the JSON-LD; the Mermaid parser
+of the `mermaid` package accepts every diagram) and `tools/check_queries.py`
+(on every graph fixture: search against FTS5's own `bm25()` over a table of the
+same five fields, 400 random queries, every score equal to 1e-9; neighbors and
+subgraph against networkx shortest-path lengths and induced multigraphs, the
+subgraph also against `src/graph.schema.json`; communities against networkx
+`modularity` and counts from the link list). A mutation in each (BM25 `b`, a
+field weight, the neighbor depth, the subgraph depth, the modularity weights)
+made the checker fail. Unit tests cover tokens (case, punctuation, prefix,
+character pairs), subgraph re-indexing, hand-computed modularity and search
+ranking; integration tests cover the four exports and the four commands.
+
+**Disclosed.** Search is over the node's own text (label, id, top words, column
+names, kind, community label), not the files' contents. FTS5 oracle covers
+ASCII and Latin text; script-without-spaces tokens are checked by unit test
+only, since FTS5 keeps such a run as one word. Duplicate words in a query count
+once (FTS5 would count them twice). Modularity uses the link weights the
+communities were found with. A `subgraph` drops the `unlinked` report.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

@@ -7,6 +7,21 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs search`, `neighbors`, `subgraph` and `communities` query a
+  knowledge graph (a directory or a `graph.json`). `search` ranks nodes by
+  words with BM25 as SQLite FTS5 computes it (weighted fields, `word*`
+  prefixes, character pairs for Chinese, Japanese and other scripts written
+  without spaces); `neighbors` lists the nodes within 1 to 6 links with the
+  links that reach them; `subgraph` cuts the part around chosen nodes and
+  communities out as a graph of its own (`graph.json`, a report, or any
+  export); `communities` reports size, composition, hubs, words, cohesion,
+  linked communities and the modularity of the split. Checked against FTS5,
+  networkx and the graph JSON Schema.
+- `sniff-rs graph --export` also writes `graph.sqlite` (a database written
+  without a library: nodes, links, evidence, communities and a `link_names`
+  view), `graph.gexf` (Gephi), `graph.jsonld` (RDF) and `graph.mmd` (a Mermaid
+  diagram of the 120 most connected nodes). Checked by SQLite's own integrity
+  check, networkx, rdflib and the Mermaid parser.
 - `sniff-rs graph --geo` and `--timeline` (off by default; also `geo`, `geo_cell`
   and `timeline` in the config file): files about the same coarse place or the
   same day are linked through a `place:` or `day:` node (`near`). A position is

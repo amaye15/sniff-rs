@@ -21045,3 +21045,351 @@ fn graph_geo_and_timeline_can_be_set_in_the_config_file() {
     assert!(String::from_utf8_lossy(&run.stderr).contains("geo_cell"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn graph_exports_sqlite_gexf_jsonld_and_mermaid() {
+    let tmp = TempDir::new();
+    let out = tmp.path().join("out");
+    let run = run_graph(&[
+        "graph",
+        &lineage_fixture(),
+        out.to_str().unwrap(),
+        "--no-cache",
+        "--export",
+        "sqlite,gexf,jsonld,mermaid",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc = graph_json_of(&out);
+    let nodes = doc["nodes"].as_array().unwrap().len();
+    let links = doc["links"].as_array().unwrap().len();
+
+    // The database opens in a real SQLite, is intact, and has every node and link.
+    let db = rusqlite::Connection::open(out.join("graph.sqlite")).unwrap();
+    let check: String = db
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(check, "ok");
+    let count = |table: &str| -> usize {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap() as usize
+    };
+    assert_eq!(count("nodes"), nodes);
+    assert_eq!(count("links"), links);
+    assert_eq!(count("link_names"), links);
+
+    let gexf = std::fs::read_to_string(out.join("graph.gexf")).unwrap();
+    assert!(gexf.contains("<gexf") && gexf.contains("version=\"1.2\""));
+    let jsonld: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("graph.jsonld")).unwrap()).unwrap();
+    assert!(jsonld.get("@context").is_some());
+    let mermaid = std::fs::read_to_string(out.join("graph.mmd")).unwrap();
+    assert!(mermaid.contains("graph LR"));
+
+    // Text formats print to stdout; the database prints when stdout is a pipe.
+    for (format, start) in [
+        ("gexf", "<?xml"),
+        ("jsonld", "{"),
+        ("mermaid", "%% sniff-rs"),
+    ] {
+        let text = run_graph(&[
+            "graph",
+            &lineage_fixture(),
+            "-",
+            "--no-cache",
+            "--output-format",
+            format,
+        ]);
+        assert!(text.status.success(), "{format}");
+        assert!(
+            String::from_utf8_lossy(&text.stdout).starts_with(start),
+            "{format}"
+        );
+    }
+    let bin_out = run_graph(&[
+        "graph",
+        &lineage_fixture(),
+        "-",
+        "--no-cache",
+        "--output-format",
+        "sqlite",
+    ]);
+    assert!(bin_out.status.success());
+    assert!(bin_out.stdout.starts_with(b"SQLite format 3\0"));
+}
+
+fn query_graph_json(tmp: &std::path::Path) -> std::path::PathBuf {
+    let out = tmp.join("q");
+    let run = run_graph(&[
+        "graph",
+        &lineage_fixture(),
+        out.to_str().unwrap(),
+        "--no-cache",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    out.join("graph.json")
+}
+
+#[test]
+fn graph_search_ranks_nodes_and_honours_prefix_and_type() {
+    let tmp = TempDir::new();
+    let graph = query_graph_json(tmp.path());
+    let run = run_graph(&[
+        "search",
+        graph.to_str().unwrap(),
+        "audit",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    let hits = doc["results"].as_array().unwrap();
+    assert_eq!(hits[0]["id"], "audit_log.csv");
+    assert!(
+        hits.windows(2)
+            .all(|w| w[0]["score"].as_f64() >= w[1]["score"].as_f64())
+    );
+    // A prefix finds the same node, a type filter removes the others.
+    let prefix = run_graph(&[
+        "search",
+        graph.to_str().unwrap(),
+        "audi*",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&prefix.stdout).unwrap();
+    assert_eq!(doc["results"][0]["id"], "audit_log.csv");
+    let tables = run_graph(&[
+        "search",
+        graph.to_str().unwrap(),
+        "audit",
+        "--type",
+        "schema",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&tables.stdout).unwrap();
+    assert!(
+        doc["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["type"] == "schema")
+    );
+    // Nothing matches, a bad type, and a data file are all answered, not crashed.
+    let none = run_graph(&["search", graph.to_str().unwrap(), "zzzzqqq"]);
+    assert!(none.status.success());
+    assert!(String::from_utf8_lossy(&none.stdout).contains("Nothing matches"));
+    let bad = run_graph(&["search", graph.to_str().unwrap(), "audit", "--type", "nope"]);
+    assert!(!bad.status.success());
+    let csv = fixture("sample.csv");
+    let table = run_graph(&["search", csv.to_str().unwrap(), "audit"]);
+    assert!(!table.status.success());
+    assert!(String::from_utf8_lossy(&table.stderr).contains("knowledge graph"));
+}
+
+#[test]
+fn graph_neighbors_follow_links_by_distance() {
+    let tmp = TempDir::new();
+    let graph = query_graph_json(tmp.path());
+    let near = run_graph(&[
+        "neighbors",
+        graph.to_str().unwrap(),
+        "archive_schema.sql",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        near.status.success(),
+        "{}",
+        String::from_utf8_lossy(&near.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&near.stdout).unwrap();
+    let ids: Vec<&str> = doc["neighbors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"audit_log.csv"));
+    assert!(
+        doc["neighbors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["distance"] == 1)
+    );
+    let far = run_graph(&[
+        "neighbors",
+        graph.to_str().unwrap(),
+        "archive_schema.sql",
+        "--depth",
+        "2",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&far.stdout).unwrap();
+    let two = doc["neighbors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["distance"] == 2)
+        .expect("a node two links away");
+    assert!(two["via"].as_str().is_some());
+    // An unknown node is refused, and a relation filter narrows what is followed.
+    let bad = run_graph(&["neighbors", graph.to_str().unwrap(), "no-such-node"]);
+    assert!(!bad.status.success());
+    let none = run_graph(&[
+        "neighbors",
+        graph.to_str().unwrap(),
+        "archive_schema.sql",
+        "--relation",
+        "joins",
+        "--output-format",
+        "json",
+    ]);
+    let doc: serde_json::Value = serde_json::from_slice(&none.stdout).unwrap();
+    assert_eq!(doc["count"], 0);
+}
+
+#[test]
+fn graph_subgraph_is_a_valid_graph_of_its_own() {
+    let tmp = TempDir::new();
+    let graph = query_graph_json(tmp.path());
+    let run = run_graph(&[
+        "subgraph",
+        graph.to_str().unwrap(),
+        "--node",
+        "archive_schema.sql",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let sub: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    let ids: Vec<&str> = sub["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"archive_schema.sql") && ids.contains(&"audit_log.csv"));
+    // Every link joins two kept nodes, communities are numbered from 0 with no gap.
+    for l in sub["links"].as_array().unwrap() {
+        assert!(ids.contains(&l["source"].as_str().unwrap()));
+        assert!(ids.contains(&l["target"].as_str().unwrap()));
+    }
+    let used: std::collections::BTreeSet<u64> = sub["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["community"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        used.iter().copied().collect::<Vec<_>>(),
+        (0..used.len() as u64).collect::<Vec<_>>()
+    );
+    // The result is read by the other commands.
+    let file = tmp.path().join("sub.json");
+    std::fs::write(&file, &run.stdout).unwrap();
+    let rank = run_graph(&["rank", file.to_str().unwrap()]);
+    assert!(
+        rank.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rank.stderr)
+    );
+    // Other formats, community seeds, and the refusals.
+    let mmd = run_graph(&[
+        "subgraph",
+        graph.to_str().unwrap(),
+        "--community",
+        "0",
+        "--output-format",
+        "mermaid",
+    ]);
+    assert!(mmd.status.success());
+    assert!(String::from_utf8_lossy(&mmd.stdout).contains("graph LR"));
+    let db = tmp.path().join("sub.sqlite");
+    let sqlite = run_graph(&[
+        "subgraph",
+        graph.to_str().unwrap(),
+        db.to_str().unwrap(),
+        "--node",
+        "archive_schema.sql",
+        "--output-format",
+        "sqlite",
+    ]);
+    assert!(sqlite.status.success());
+    assert!(
+        std::fs::read(&db)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0")
+    );
+    assert!(
+        !run_graph(&["subgraph", graph.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        !run_graph(&["subgraph", graph.to_str().unwrap(), "--community", "999"])
+            .status
+            .success()
+    );
+    assert!(
+        !run_graph(&["search", graph.to_str().unwrap(), "x", "--node", "a"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn graph_communities_report_size_cohesion_and_modularity() {
+    let tmp = TempDir::new();
+    let graph = query_graph_json(tmp.path());
+    let run = run_graph(&[
+        "communities",
+        graph.to_str().unwrap(),
+        "--members",
+        "--output-format",
+        "json",
+    ]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    let list = doc["list"].as_array().unwrap();
+    assert_eq!(list.len() as u64, doc["communities"].as_u64().unwrap());
+    let sizes: Vec<u64> = list.iter().map(|c| c["size"].as_u64().unwrap()).collect();
+    assert!(sizes.windows(2).all(|w| w[0] >= w[1]));
+    let q = doc["modularity"].as_f64().unwrap();
+    assert!(q > 0.0 && q < 1.0, "{q}");
+    for c in list {
+        assert_eq!(
+            c["members"].as_array().unwrap().len() as u64,
+            c["size"].as_u64().unwrap()
+        );
+        let cohesion = c["cohesion"].as_f64().unwrap();
+        assert!((0.0..=1.0).contains(&cohesion));
+    }
+    let md = run_graph(&["communities", graph.to_str().unwrap(), "--top", "2"]);
+    assert!(md.status.success());
+    let text = String::from_utf8_lossy(&md.stdout);
+    assert!(text.contains("modularity") && text.contains("| ID |"));
+    assert_eq!(text.matches("\n| ").count(), 3, "{text}");
+}
