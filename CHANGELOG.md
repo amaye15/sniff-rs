@@ -4,7 +4,12 @@ All notable changes to sniff-rs are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versions follow
 [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.1.0] - 2026-10-11
+
+First release. The sections below are everything in it: CSV/TSV/JSON/JSONL
+plus 45+ optional formats, Markdown / rich JSON / JSON-Schema / SQL output,
+`diff`, directory batch mode, Delta Lake and Iceberg tables, and the
+knowledge graph with its query commands.
 
 ### Added
 - `sniff-rs completions <bash|zsh|fish|powershell>` prints a shell
@@ -467,8 +472,3 @@ All notable changes to sniff-rs are documented here. Format follows
 - Zero runtime dependencies: every format reader is hand-rolled pure
   `std`. Former third-party crates remain only as dev-only
   cross-verification oracles.
-
-## [0.1.0]
-- Initial release: CSV/TSV/JSON/JSONL plus 25+ optional formats, Markdown /
-  rich JSON / JSON-Schema / SQL output, `diff` subcommand, directory batch
-  mode, Delta Lake and Iceberg table support.
