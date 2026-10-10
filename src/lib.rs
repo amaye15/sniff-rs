@@ -115787,6 +115787,28 @@ pub fn graph_document_text(path: &Path) -> Option<Vec<String>> {
     knowledge_graph::document_text(path)
 }
 
+/// The perceptual hash the graph gives a PNG or JPEG (64 bits), and, with
+/// `plane`, the brightness plane it was made from: `(width, height, bytes)`,
+/// pixels for a PNG and one value per 8x8 block for a JPEG. Used by
+/// `examples/image_hash.rs` and `tools/check_images.py`; not a supported
+/// interface.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn graph_image_hash(
+    path: &Path,
+    plane: bool,
+) -> (Option<u64>, Option<(usize, usize, Vec<u8>)>) {
+    knowledge_graph::image_probe(path, plane)
+}
+
+/// The (kind, value) facts the graph reads from a file's own properties:
+/// author, camera, artist, album, ... Used by `examples/file_meta.rs` and
+/// `tools/check_audio.py`; not a supported interface.
+#[doc(hidden)]
+pub fn graph_file_metadata(path: &Path) -> Vec<(String, String)> {
+    knowledge_graph::file_facts(path)
+}
+
 // --- SQL schema (DDL) reading, for the knowledge graph ---
 //
 // A SQL dump says what a database holds: its tables, their columns and
@@ -117875,7 +117897,13 @@ mod content_scan {
                 self.sketch_insert(value_hash(&sketch_key(v)));
                 self.sketch_values += 1;
             }
-            if v.len() >= BLOB_LEN && !v.contains(char::is_whitespace) && !v.starts_with("http") {
+            // A long run with no whitespace is a blob, unless it is text in a
+            // script written without spaces (a Chinese paragraph is one run).
+            if v.len() >= BLOB_LEN
+                && !v.contains(char::is_whitespace)
+                && !v.starts_with("http")
+                && !v.chars().any(|c| c.is_alphabetic() && spaceless_script(c))
+            {
                 return;
             }
             self.scan(v, v);
@@ -117959,11 +117987,35 @@ mod content_scan {
             let mut chars = 0usize;
             let mut vowel = false;
             let mut non_ascii = false;
+            // The previous character of a run in a script written without
+            // spaces (Chinese, Japanese, Thai ...): such a run has no words
+            // to split on, so its overlapping character pairs are the terms.
+            let mut run_prev: Option<char> = None;
             for c in text.chars() {
                 self.text_chars += 1;
                 if c == '\u{FFFD}' {
                     self.unmapped_chars += 1;
                 }
+                if c.is_alphabetic() && spaceless_script(c) {
+                    if chars > 0 {
+                        self.flush_word(&word, chars, vowel || non_ascii);
+                        word.clear();
+                        chars = 0;
+                        vowel = false;
+                        non_ascii = false;
+                    }
+                    if let Some(p) = run_prev {
+                        let mut pair = String::with_capacity(8);
+                        pair.push(p);
+                        pair.push(c);
+                        self.terms
+                            .get_or_insert_with(TermCounter::default)
+                            .add(&pair);
+                    }
+                    run_prev = Some(c);
+                    continue;
+                }
+                run_prev = None;
                 if c.is_alphabetic() {
                     if chars < MAX_TERM_CHARS {
                         for lc in c.to_lowercase() {
@@ -118465,6 +118517,30 @@ mod content_scan {
             || (b.iter().any(u8::is_ascii_digit) && b.iter().any(u8::is_ascii_alphabetic))
     }
 
+    /// Scripts whose words are not separated by spaces: Han, kana, Hangul,
+    /// Thai, Lao, Myanmar and Khmer. A run of these is cut into overlapping
+    /// character pairs instead of being one long "word".
+    pub(crate) fn spaceless_script(c: char) -> bool {
+        matches!(c as u32,
+            0x0E00..=0x0EFF      // Thai, Lao
+            | 0x1000..=0x109F    // Myanmar
+            | 0x1100..=0x11FF    // Hangul Jamo
+            | 0x1780..=0x17FF    // Khmer
+            | 0x2E80..=0x2FDF    // CJK radicals
+            | 0x3005..=0x3007 | 0x3021..=0x3029 | 0x3038..=0x303B
+            | 0x3040..=0x30FF    // Hiragana, Katakana
+            | 0x3130..=0x318F    // Hangul compatibility Jamo
+            | 0x31F0..=0x31FF    // Katakana extensions
+            | 0x3400..=0x4DBF    // CJK extension A
+            | 0x4E00..=0x9FFF    // CJK unified ideographs
+            | 0xA960..=0xA97F    // Hangul Jamo extended A
+            | 0xAC00..=0xD7FF    // Hangul syllables, Jamo extended B
+            | 0xF900..=0xFAFF    // CJK compatibility ideographs
+            | 0xFF66..=0xFF9F    // halfwidth Katakana
+            | 0x20000..=0x323AF  // CJK extensions B-H
+        )
+    }
+
     fn is_stopword(word: &str) -> bool {
         STOPWORDS.binary_search(&word).is_ok()
     }
@@ -118893,6 +118969,60 @@ mod content_scan {
             assert_eq!(content.terms[0].1, 2);
             let blob = "iVBORw0KGgoAAAANSUhEUgAA".repeat(20);
             assert!(scan(&blob).terms.is_empty());
+            // A long paragraph of Chinese has no spaces and is not a blob.
+            let long = "医院医生患者治疗药物手术护士诊断症状疫苗".repeat(10);
+            assert!(long.len() >= BLOB_LEN);
+            assert!(!scan(&long).terms.is_empty());
+        }
+
+        #[test]
+        fn spaceless_runs_are_read_as_overlapping_pairs() {
+            let content = scan("数据分析 数据库");
+            let got: Vec<(&str, u32)> = content
+                .terms
+                .iter()
+                .map(|(t, c)| (t.as_str(), *c))
+                .collect();
+            assert_eq!(
+                got,
+                vec![("数据", 2), ("分析", 1), ("据分", 1), ("据库", 1),]
+            );
+            // Punctuation, spaces and other scripts end a run; a lone character is no term.
+            let content = scan("数，据 a数 カ。");
+            assert!(content.terms.is_empty());
+            // Latin words next to them are still words.
+            let content = scan("neural网络network");
+            let terms: Vec<&str> = content.terms.iter().map(|(t, _)| t.as_str()).collect();
+            assert_eq!(terms, vec!["network", "neural", "网络"]);
+        }
+
+        /// 600 texts in ten scripts and what Python says their pairs are, with
+        /// each character's script taken from its Unicode name
+        /// (`tools/gen_cjk_vectors.py`).
+        #[test]
+        fn pairs_match_the_unicode_name_vectors() {
+            let text = include_str!("../tests/fixtures/cjk_bigram_vectors.jsonl");
+            let mut checked = 0;
+            for line in text.lines() {
+                let v = json_support::from_str(line).unwrap();
+                let input = v.get("text").and_then(|t| t.as_str()).unwrap();
+                let want = v.get("terms").and_then(|t| t.as_object()).unwrap();
+                let content = scan(input);
+                let mut got: Vec<(String, u64)> = content
+                    .terms
+                    .iter()
+                    .map(|(t, c)| (t.clone(), u64::from(*c)))
+                    .collect();
+                got.sort();
+                let mut expect: Vec<(String, u64)> = want
+                    .iter()
+                    .map(|(t, c)| (t.clone(), c.as_u64().unwrap()))
+                    .collect();
+                expect.sort();
+                assert_eq!(got, expect, "{input:?}");
+                checked += 1;
+            }
+            assert_eq!(checked, 600);
         }
 
         #[test]
@@ -119106,6 +119236,9 @@ mod knowledge_graph {
         /// When the file was last modified, in seconds since the epoch
         /// (0 when unknown): the last resort for ordering versions.
         pub(crate) mtime: u64,
+        /// A perceptual hash of a PNG or JPEG (`image_hash`): pictures that
+        /// differ in a few bits are the same picture, resized or saved again.
+        pub(crate) image_hash: Option<u64>,
     }
 
     pub(crate) struct CollectOptions {
@@ -119299,6 +119432,7 @@ mod knowledge_graph {
             sheet_refs: Vec::new(),
             changes_with: Vec::new(),
             mtime: 0,
+            image_hash: None,
         }
     }
 
@@ -119365,7 +119499,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 6;
+    const CACHE_FORMAT: u64 = 7;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -119900,6 +120034,12 @@ mod knowledge_graph {
         if f.mtime != 0 {
             o.insert("mtime".to_string(), JsonValue::from(f.mtime));
         }
+        if let Some(h) = f.image_hash {
+            o.insert(
+                "image_hash".to_string(),
+                JsonValue::from(format!("{h:016x}")),
+            );
+        }
         if !f.sheet_refs.is_empty() {
             o.insert(
                 "sheet_refs".to_string(),
@@ -120148,6 +120288,10 @@ mod knowledge_graph {
             },
             changes_with: Vec::new(),
             mtime: v.get("mtime").and_then(|m| m.as_u64()).unwrap_or(0),
+            image_hash: v
+                .get("image_hash")
+                .and_then(|h| h.as_str())
+                .and_then(|h| u64::from_str_radix(h, 16).ok()),
         })
     }
 
@@ -120206,6 +120350,9 @@ mod knowledge_graph {
             file.meta = file_metadata(path, &ext);
         }
         file.code = code_facts_of(path, &ext);
+        if image_hash::is_hashable_extension(&ext) && file.size <= 256 * 1024 * 1024 {
+            file.image_hash = image_hash::hash(path);
+        }
         file
     }
 
@@ -120273,6 +120420,8 @@ mod knowledge_graph {
             raw = pdf_document_info(path);
         } else if image_meta::is_image_extension(ext) {
             raw = image_meta::read(path);
+        } else if audio_meta::is_audio_extension(ext) {
+            raw = audio_meta::read(path);
         } else {
             raw.extend(package_metadata(path, ext));
             raw.extend(doc_text::properties(path, ext));
@@ -120283,6 +120432,7 @@ mod knowledge_graph {
                 "author" | "last_modified_by" | "creator" => "author",
                 "company" | "organization" => "organization",
                 "camera" => "camera",
+                "artist" | "composer" | "album" => k.as_str(),
                 _ => continue,
             };
             // A PDF's "creator" is the authoring program, not a person.
@@ -120359,6 +120509,1537 @@ mod knowledge_graph {
     #[cfg(not(any(feature = "xlsx", feature = "npy")))]
     fn package_metadata(_path: &Path, _ext: &str) -> Vec<(String, String)> {
         Vec::new()
+    }
+
+    /// Who made a piece of music, read from the tags inside the file: ID3
+    /// (v1, and v2.2, v2.3 and v2.4 at the start of an MP3 or a FLAC),
+    /// MP4 and M4A (`moov/udta/meta/ilst`) and Vorbis comments (FLAC, Ogg
+    /// Vorbis, Ogg Opus). What is read: the artist (and album artist), the
+    /// composer and the album; the title, year, genre and track number are
+    /// left alone because they name nothing that other files share. Every
+    /// length is checked against what is there and capped, and anything
+    /// unreadable is left out.
+    mod audio_meta {
+        use super::*;
+        use std::io::{Read, Seek, SeekFrom};
+
+        /// Most of a tag or a header packet that is read.
+        const MAX_TAG: usize = 4 << 20;
+
+        pub(super) fn is_audio_extension(ext: &str) -> bool {
+            matches!(
+                ext,
+                "mp3" | "mp2" | "m4a" | "m4b" | "m4p" | "mp4" | "flac" | "ogg" | "oga" | "opus"
+            )
+        }
+
+        #[derive(Default)]
+        pub(super) struct Tags {
+            artist: Vec<String>,
+            album_artist: Vec<String>,
+            composer: Vec<String>,
+            album: Vec<String>,
+        }
+
+        impl Tags {
+            fn put(list: &mut Vec<String>, v: &str) {
+                let v = v.trim().trim_matches('\0').trim();
+                if !v.is_empty() && !list.iter().any(|x| x == v) {
+                    list.push(v.to_string());
+                }
+            }
+
+            /// Artists (the album artist too) and composers as such; the album
+            /// as `Album - Artist`, so two records called "Greatest Hits" by
+            /// different acts are two albums.
+            pub(super) fn into_pairs(self) -> Vec<(String, String)> {
+                let mut out: Vec<(String, String)> = Vec::new();
+                let mut add = |kind: &str, v: String| {
+                    if !out.iter().any(|(k, x)| k == kind && x == &v) {
+                        out.push((kind.to_string(), v));
+                    }
+                };
+                let lead = self.album_artist.first().or(self.artist.first()).cloned();
+                for a in self.artist.iter().chain(&self.album_artist) {
+                    add("artist", a.clone());
+                }
+                for c in &self.composer {
+                    add("composer", c.clone());
+                }
+                for al in &self.album {
+                    add(
+                        "album",
+                        match &lead {
+                            Some(who) => format!("{al} - {who}"),
+                            None => al.clone(),
+                        },
+                    );
+                }
+                out
+            }
+        }
+
+        pub(super) fn read(path: &Path) -> Vec<(String, String)> {
+            let Ok(mut f) = fs::File::open(path) else {
+                return Vec::new();
+            };
+            let mut tags = Tags::default();
+            read_tags(&mut f, &mut tags);
+            tags.into_pairs()
+        }
+
+        fn read_tags(f: &mut fs::File, tags: &mut Tags) {
+            let mut head = [0u8; 12];
+            if f.read_exact(&mut head).is_err() {
+                return;
+            }
+            let mut start = 0u64;
+            if &head[..3] == b"ID3" {
+                let size = syncsafe(&head[6..10]) as u64;
+                if let Some(bytes) = read_at(f, 0, (10 + size).min(MAX_TAG as u64) as usize) {
+                    id3v2(&bytes, tags);
+                }
+                start = 10 + size;
+                if head[5] & 0x10 != 0 {
+                    start += 10; // footer
+                }
+                let mut magic = [0u8; 12];
+                if f.seek(SeekFrom::Start(start)).is_err() || f.read_exact(&mut magic).is_err() {
+                    id3v1(f, tags);
+                    return;
+                }
+                head = magic;
+            }
+            if &head[..4] == b"fLaC" {
+                flac(f, start, tags);
+            } else if &head[..4] == b"OggS" {
+                ogg(f, start, tags);
+            } else if &head[4..8] == b"ftyp" {
+                mp4(f, tags);
+            } else {
+                id3v1(f, tags);
+            }
+        }
+
+        fn read_at(f: &mut fs::File, at: u64, len: usize) -> Option<Vec<u8>> {
+            f.seek(SeekFrom::Start(at)).ok()?;
+            let mut buf = Vec::new();
+            f.take(len as u64).read_to_end(&mut buf).ok()?;
+            Some(buf)
+        }
+
+        fn syncsafe(b: &[u8]) -> u32 {
+            b.iter()
+                .take(4)
+                .fold(0u32, |a, x| (a << 7) | u32::from(x & 0x7F))
+        }
+
+        fn be32(b: &[u8]) -> u32 {
+            b.iter().take(4).fold(0u32, |a, x| (a << 8) | u32::from(*x))
+        }
+
+        // ---- ID3 ----
+
+        /// Latin-1 is the first 256 code points.
+        fn latin1(b: &[u8]) -> String {
+            b.iter().map(|&c| c as char).collect()
+        }
+
+        /// One text frame body: an encoding byte, then text, possibly several
+        /// values separated by NUL (ID3v2.4's way to list several artists).
+        fn id3_text(body: &[u8]) -> Vec<String> {
+            let Some((&enc, text)) = body.split_first() else {
+                return Vec::new();
+            };
+            let utf16 = |b: &[u8], mut big: bool| -> String {
+                let mut b = b;
+                if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+                    big = false;
+                    b = &b[2..];
+                } else if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+                    big = true;
+                    b = &b[2..];
+                }
+                let (pairs, _) = b.as_chunks::<2>();
+                let units: Vec<u16> = pairs
+                    .iter()
+                    .map(|p| {
+                        if big {
+                            u16::from_be_bytes(*p)
+                        } else {
+                            u16::from_le_bytes(*p)
+                        }
+                    })
+                    .collect();
+                char::decode_utf16(units)
+                    .map(|r| r.unwrap_or('\u{FFFD}'))
+                    .collect()
+            };
+            let values: Vec<String> = match enc {
+                0 => latin1(text).split('\0').map(str::to_string).collect(),
+                3 => String::from_utf8_lossy(text)
+                    .split('\0')
+                    .map(str::to_string)
+                    .collect(),
+                1 | 2 => {
+                    // Each value ends at a 16-bit NUL, and may start with its own
+                    // byte-order mark.
+                    let mut out = Vec::new();
+                    let mut start = 0;
+                    let mut i = 0;
+                    let mut big = enc == 2;
+                    // The byte-order mark of the first value decides for the rest.
+                    if text.len() >= 2 && text[..2] == [0xFE, 0xFF] {
+                        big = true;
+                    } else if text.len() >= 2 && text[..2] == [0xFF, 0xFE] {
+                        big = false;
+                    }
+                    while i + 1 < text.len() {
+                        if text[i] == 0 && text[i + 1] == 0 {
+                            out.push(utf16(&text[start..i], big));
+                            start = i + 2;
+                        }
+                        i += 2;
+                    }
+                    if start < text.len() {
+                        out.push(utf16(&text[start..], big));
+                    }
+                    out
+                }
+                _ => Vec::new(),
+            };
+            values
+                .into_iter()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect()
+        }
+
+        fn unsync(b: &[u8]) -> Vec<u8> {
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                out.push(b[i]);
+                if b[i] == 0xFF && b.get(i + 1) == Some(&0) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            out
+        }
+
+        fn id3v2(tag: &[u8], tags: &mut Tags) {
+            if tag.len() < 10 {
+                return;
+            }
+            let version = tag[3];
+            let flags = tag[5];
+            if !(2..=4).contains(&version) {
+                return;
+            }
+            let mut body: Vec<u8> = tag[10..].to_vec();
+            if flags & 0x80 != 0 && version < 4 {
+                body = unsync(&body);
+            }
+            let mut pos = 0usize;
+            if flags & 0x40 != 0 && version >= 3 && body.len() >= 4 {
+                // Extended header: v2.3 size excludes its own four bytes, v2.4 includes them.
+                let n = if version == 4 {
+                    syncsafe(&body[..4]) as usize
+                } else {
+                    be32(&body[..4]) as usize + 4
+                };
+                pos = n.min(body.len());
+            }
+            let header = if version == 2 { 6 } else { 10 };
+            while pos + header <= body.len() {
+                let id = &body[pos..pos + if version == 2 { 3 } else { 4 }];
+                if id[0] == 0 {
+                    break; // padding
+                }
+                let size = match version {
+                    2 => {
+                        (usize::from(body[pos + 3]) << 16)
+                            | (usize::from(body[pos + 4]) << 8)
+                            | usize::from(body[pos + 5])
+                    }
+                    3 => be32(&body[pos + 4..pos + 8]) as usize,
+                    _ => syncsafe(&body[pos + 4..pos + 8]) as usize,
+                };
+                let frame_flags = if version == 2 {
+                    [0, 0]
+                } else {
+                    [body[pos + 8], body[pos + 9]]
+                };
+                let start = pos + header;
+                let Some(end) = start.checked_add(size).filter(|&e| e <= body.len()) else {
+                    break;
+                };
+                pos = end;
+                let mut data: Vec<u8> = body[start..end].to_vec();
+                if version == 3 && frame_flags[1] & 0xC0 != 0 {
+                    continue; // compressed or encrypted
+                }
+                if version == 4 {
+                    if frame_flags[1] & 0x0C != 0 {
+                        continue; // compressed or encrypted
+                    }
+                    if frame_flags[1] & 0x01 != 0 && data.len() >= 4 {
+                        data.drain(..4); // data length indicator
+                    }
+                    if frame_flags[1] & 0x02 != 0 {
+                        data = unsync(&data);
+                    }
+                }
+                let id = String::from_utf8_lossy(id).into_owned();
+                let slot = match id.as_str() {
+                    "TPE1" | "TP1" => &mut tags.artist,
+                    "TPE2" | "TP2" => &mut tags.album_artist,
+                    "TCOM" | "TCM" => &mut tags.composer,
+                    "TALB" | "TAL" => &mut tags.album,
+                    _ => continue,
+                };
+                for v in id3_text(&data) {
+                    Tags::put(slot, &v);
+                }
+            }
+        }
+
+        fn id3v1(f: &mut fs::File, tags: &mut Tags) {
+            let Ok(len) = f.seek(SeekFrom::End(0)) else {
+                return;
+            };
+            if len < 128 {
+                return;
+            }
+            let Some(t) = read_at(f, len - 128, 128) else {
+                return;
+            };
+            if &t[..3] != b"TAG" {
+                return;
+            }
+            let field = |b: &[u8]| {
+                latin1(b)
+                    .split('\0')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            // ID3v2 comes first; a v1 field only fills one that v2 left empty.
+            if tags.artist.is_empty() {
+                Tags::put(&mut tags.artist, &field(&t[33..63]));
+            }
+            if tags.album.is_empty() {
+                Tags::put(&mut tags.album, &field(&t[63..93]));
+            }
+        }
+
+        // ---- Vorbis comments ----
+
+        fn vorbis_comments(b: &[u8], tags: &mut Tags) {
+            let le32 = |at: usize| -> Option<usize> {
+                let s = b.get(at..at + 4)?;
+                Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
+            };
+            let Some(vendor) = le32(0) else {
+                return;
+            };
+            let Some(mut pos) = 4usize.checked_add(vendor) else {
+                return;
+            };
+            let Some(count) = le32(pos) else {
+                return;
+            };
+            pos += 4;
+            for _ in 0..count.min(10_000) {
+                let Some(len) = le32(pos) else {
+                    return;
+                };
+                pos += 4;
+                let Some(end) = pos.checked_add(len).filter(|&e| e <= b.len()) else {
+                    return;
+                };
+                let entry = String::from_utf8_lossy(&b[pos..end]).into_owned();
+                pos = end;
+                let Some((key, value)) = entry.split_once('=') else {
+                    continue;
+                };
+                match key.to_ascii_uppercase().as_str() {
+                    "ARTIST" | "PERFORMER" => Tags::put(&mut tags.artist, value),
+                    "ALBUMARTIST" | "ALBUM ARTIST" => Tags::put(&mut tags.album_artist, value),
+                    "COMPOSER" => Tags::put(&mut tags.composer, value),
+                    "ALBUM" => Tags::put(&mut tags.album, value),
+                    _ => {}
+                }
+            }
+        }
+
+        fn flac(f: &mut fs::File, start: u64, tags: &mut Tags) {
+            let mut pos = start + 4;
+            for _ in 0..1024 {
+                let Some(h) = read_at(f, pos, 4) else {
+                    return;
+                };
+                if h.len() < 4 {
+                    return;
+                }
+                let last = h[0] & 0x80 != 0;
+                let kind = h[0] & 0x7F;
+                let len = (usize::from(h[1]) << 16) | (usize::from(h[2]) << 8) | usize::from(h[3]);
+                if kind == 4 && len <= MAX_TAG {
+                    if let Some(b) = read_at(f, pos + 4, len) {
+                        vorbis_comments(&b, tags);
+                    }
+                    return;
+                }
+                if last {
+                    return;
+                }
+                pos += 4 + len as u64;
+            }
+        }
+
+        /// The first few packets of an Ogg stream, from its pages.
+        fn ogg(f: &mut fs::File, start: u64, tags: &mut Tags) {
+            let Some(data) = read_at(f, start, MAX_TAG) else {
+                return;
+            };
+            let mut packets: Vec<Vec<u8>> = Vec::new();
+            let mut cur: Vec<u8> = Vec::new();
+            let mut pos = 0usize;
+            while packets.len() < 2 && pos + 27 <= data.len() && &data[pos..pos + 4] == b"OggS" {
+                let nseg = usize::from(data[pos + 26]);
+                let Some(table) = data.get(pos + 27..pos + 27 + nseg) else {
+                    return;
+                };
+                let mut at = pos + 27 + nseg;
+                for &lace in table {
+                    let Some(seg) = data.get(at..at + usize::from(lace)) else {
+                        return;
+                    };
+                    cur.extend_from_slice(seg);
+                    at += usize::from(lace);
+                    if lace < 255 {
+                        packets.push(std::mem::take(&mut cur));
+                    }
+                }
+                pos = at;
+            }
+            let Some(second) = packets.get(1) else {
+                return;
+            };
+            if second.starts_with(b"\x03vorbis") {
+                vorbis_comments(&second[7..], tags);
+            } else if packets.first().is_some_and(|p| p.starts_with(b"OpusHead"))
+                && second.starts_with(b"OpusTags")
+            {
+                vorbis_comments(&second[8..], tags);
+            }
+        }
+
+        // ---- MP4 ----
+
+        /// `(type, start of body, end of body)` of the atom at `at`.
+        fn atom(f: &mut fs::File, at: u64, limit: u64) -> Option<([u8; 4], u64, u64)> {
+            let h = read_at(f, at, 16)?;
+            if h.len() < 8 || at + 8 > limit {
+                return None;
+            }
+            let size = u64::from(be32(&h[..4]));
+            let kind = [h[4], h[5], h[6], h[7]];
+            let (body, end) = match size {
+                0 => (at + 8, limit),
+                1 => {
+                    if h.len() < 16 {
+                        return None;
+                    }
+                    let big =
+                        u64::from_be_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+                    (at + 16, at.checked_add(big)?)
+                }
+                n if n < 8 => return None,
+                n => (at + 8, at.checked_add(n)?),
+            };
+            (end <= limit && end >= body).then_some((kind, body, end))
+        }
+
+        fn mp4(f: &mut fs::File, tags: &mut Tags) {
+            let Ok(len) = f.seek(SeekFrom::End(0)) else {
+                return;
+            };
+            let mut at = 0u64;
+            for _ in 0..4096 {
+                let Some((kind, body, end)) = atom(f, at, len) else {
+                    return;
+                };
+                if &kind == b"moov" {
+                    if end - body <= MAX_TAG as u64 * 4 {
+                        mp4_container(f, body, end, 0, tags);
+                    }
+                    return;
+                }
+                if end <= at {
+                    return;
+                }
+                at = end;
+            }
+        }
+
+        fn mp4_container(f: &mut fs::File, from: u64, to: u64, depth: u32, tags: &mut Tags) {
+            if depth > 6 {
+                return;
+            }
+            let mut at = from;
+            for _ in 0..100_000 {
+                if at >= to {
+                    return;
+                }
+                let Some((kind, body, end)) = atom(f, at, to) else {
+                    return;
+                };
+                match &kind {
+                    b"udta" => mp4_container(f, body, end, depth + 1, tags),
+                    // `meta` is a full box: four bytes of version and flags first.
+                    b"meta" => mp4_container(f, body + 4, end, depth + 1, tags),
+                    b"ilst" => mp4_items(f, body, end, tags),
+                    _ => {}
+                }
+                if end <= at {
+                    return;
+                }
+                at = end;
+            }
+        }
+
+        fn mp4_items(f: &mut fs::File, from: u64, to: u64, tags: &mut Tags) {
+            let mut at = from;
+            for _ in 0..10_000 {
+                if at >= to {
+                    return;
+                }
+                let Some((kind, body, end)) = atom(f, at, to) else {
+                    return;
+                };
+                let slot = match &kind {
+                    [0xA9, b'A', b'R', b'T'] => Some(&mut tags.artist),
+                    b"aART" => Some(&mut tags.album_artist),
+                    [0xA9, b'w', b'r', b't'] => Some(&mut tags.composer),
+                    [0xA9, b'a', b'l', b'b'] => Some(&mut tags.album),
+                    _ => None,
+                };
+                if let Some(slot) = slot
+                    && let Some((k, dbody, dend)) = atom(f, body, end)
+                    && &k == b"data"
+                    && dend - dbody <= 64 * 1024
+                    && let Some(d) = read_at(f, dbody, (dend - dbody) as usize)
+                    && d.len() >= 8
+                    && d[3] == 1
+                {
+                    // Version and flags (type 1 is UTF-8), a locale, then the text.
+                    Tags::put(slot, &String::from_utf8_lossy(&d[8..]));
+                }
+                if end <= at {
+                    return;
+                }
+                at = end;
+            }
+        }
+    }
+
+    /// A perceptual hash of a picture, to find copies that are not
+    /// byte-identical: a resized, recompressed or re-saved image. The
+    /// picture is cut to nine by eight cells of average brightness and each
+    /// cell is compared with its right neighbour (a "difference hash", 64
+    /// bits). PNG is decoded in full, row by row, whatever the colour type,
+    /// bit depth or interlacing. JPEG is decoded only as far as the DC
+    /// coefficient of each luma block - an eighth-size picture - so the
+    /// AC coefficients are read to be skipped and never transformed. No
+    /// picture is held in memory beyond one row (PNG) or one DC value per
+    /// block (JPEG). A picture that is smaller than 32 pixels a side, flat,
+    /// too large (over 400 million pixels), or in a form not handled
+    /// (arithmetic-coded, 12-bit, lossless or CMYK/RGB JPEG; anything but
+    /// PNG and JPEG) has no hash.
+    mod image_hash {
+        use super::*;
+        use std::io::{BufReader, Read};
+
+        const COLS: usize = 9;
+        const ROWS: usize = 8;
+        const MIN_SIDE: usize = 32;
+        const MAX_PIXELS: u64 = 400_000_000;
+
+        pub(super) fn is_hashable_extension(ext: &str) -> bool {
+            matches!(ext, "png" | "jpg" | "jpeg" | "jpe" | "jfif")
+        }
+
+        /// Where a decoder puts the brightness it finds.
+        pub(super) trait Plane {
+            fn put(&mut self, x: usize, y: usize, luma: u8);
+        }
+
+        /// The nine-by-eight grid of average brightness.
+        pub(super) struct Grid {
+            w: usize,
+            h: usize,
+            xcell: Vec<u8>,
+            ycell: Vec<u8>,
+            sum: [u64; COLS * ROWS],
+            count: [u64; COLS * ROWS],
+        }
+
+        impl Grid {
+            fn new(w: usize, h: usize) -> Option<Grid> {
+                if w < COLS || h < ROWS {
+                    return None;
+                }
+                Some(Grid {
+                    w,
+                    h,
+                    xcell: (0..w).map(|x| (x * COLS / w) as u8).collect(),
+                    ycell: (0..h).map(|y| (y * ROWS / h) as u8).collect(),
+                    sum: [0; COLS * ROWS],
+                    count: [0; COLS * ROWS],
+                })
+            }
+
+            /// The 64-bit difference hash, or `None` for a flat picture.
+            fn hash(&self) -> Option<u64> {
+                let mut mean = [0f64; COLS * ROWS];
+                for (c, m) in mean.iter_mut().enumerate() {
+                    if self.count[c] == 0 {
+                        return None;
+                    }
+                    *m = self.sum[c] as f64 / self.count[c] as f64;
+                }
+                let lo = mean.iter().cloned().fold(f64::MAX, f64::min);
+                let hi = mean.iter().cloned().fold(f64::MIN, f64::max);
+                if hi - lo < 8.0 {
+                    return None;
+                }
+                let mut bits = 0u64;
+                for r in 0..ROWS {
+                    for c in 0..COLS - 1 {
+                        bits <<= 1;
+                        if mean[r * COLS + c] > mean[r * COLS + c + 1] {
+                            bits |= 1;
+                        }
+                    }
+                }
+                (8..=56).contains(&bits.count_ones()).then_some(bits)
+            }
+        }
+
+        impl Plane for Grid {
+            fn put(&mut self, x: usize, y: usize, luma: u8) {
+                if x < self.w && y < self.h {
+                    let c = usize::from(self.ycell[y]) * COLS + usize::from(self.xcell[x]);
+                    self.sum[c] += u64::from(luma);
+                    self.count[c] += 1;
+                }
+            }
+        }
+
+        /// The whole plane, for tests.
+        pub(super) struct Collect {
+            pub(super) w: usize,
+            pub(super) h: usize,
+            pub(super) data: Vec<u8>,
+        }
+
+        impl Plane for Collect {
+            fn put(&mut self, x: usize, y: usize, luma: u8) {
+                if x < self.w && y < self.h {
+                    self.data[y * self.w + x] = luma;
+                }
+            }
+        }
+
+        /// ITU-R 601 luma, as Pillow computes it.
+        fn luma(r: u8, g: u8, b: u8) -> u8 {
+            ((u32::from(r) * 19595 + u32::from(g) * 38470 + u32::from(b) * 7471 + 0x8000) >> 16)
+                as u8
+        }
+
+        pub(super) fn hash(path: &Path) -> Option<u64> {
+            decode_into(path, Grid::new)?.hash()
+        }
+
+        /// The luma plane as the hash sees it: pixels for a PNG, one value
+        /// per 8x8 block for a JPEG. For tests and `tools/check_images.py`.
+        pub(super) fn plane(path: &Path) -> Option<Collect> {
+            decode_into(path, |w, h| {
+                Some(Collect {
+                    w,
+                    h,
+                    data: vec![0; w * h],
+                })
+            })
+        }
+
+        /// Reads the picture at `path`, asks `begin(w, h)` for the plane to
+        /// fill (with its size), and fills it.
+        fn decode_into<P: Plane>(
+            path: &Path,
+            begin: impl FnOnce(usize, usize) -> Option<P>,
+        ) -> Option<P> {
+            let f = fs::File::open(path).ok()?;
+            let mut r = BufReader::with_capacity(64 * 1024, f);
+            let mut sig = [0u8; 8];
+            r.read_exact(&mut sig).ok()?;
+            if sig == *b"\x89PNG\r\n\x1a\n" {
+                png(&mut r, begin)
+            } else if sig[..3] == [0xFF, 0xD8, 0xFF] {
+                // Put back the bytes read past the start of the JPEG.
+                let rest = std::io::Cursor::new(sig[..].to_vec()).chain(r);
+                jpeg(rest, begin)
+            } else {
+                None
+            }
+        }
+
+        // ---- PNG ----
+
+        /// The data of consecutive IDAT chunks as one stream.
+        struct Idat<R: Read> {
+            r: R,
+            remaining: u32,
+            done: bool,
+        }
+
+        impl<R: Read> Read for Idat<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                while self.remaining == 0 {
+                    if self.done {
+                        return Ok(0);
+                    }
+                    // The chunk's CRC, then the next chunk's header.
+                    let mut head = [0u8; 12];
+                    self.r.read_exact(&mut head)?;
+                    let len = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+                    if &head[8..12] == b"IDAT" {
+                        self.remaining = len;
+                    } else {
+                        self.done = true;
+                    }
+                }
+                let n = buf.len().min(self.remaining as usize);
+                let got = self.r.read(&mut buf[..n])?;
+                self.remaining -= got as u32;
+                Ok(got)
+            }
+        }
+
+        struct Pass {
+            x0: usize,
+            y0: usize,
+            dx: usize,
+            dy: usize,
+            w: usize,
+            h: usize,
+        }
+
+        /// Defilters rows as they arrive and turns each into luma values.
+        struct Rows<'a, P: Plane> {
+            color: u8,
+            depth: usize,
+            palette: Vec<[u8; 3]>,
+            passes: Vec<Pass>,
+            pass: usize,
+            row_in_pass: usize,
+            prev: Vec<u8>,
+            buf: Vec<u8>,
+            bpp: usize,
+            plane: &'a mut P,
+        }
+
+        impl<P: Plane> Rows<'_, P> {
+            fn channels(color: u8) -> usize {
+                match color {
+                    0 | 3 => 1,
+                    4 => 2,
+                    2 => 3,
+                    _ => 4,
+                }
+            }
+
+            fn row_bytes(&self, width: usize) -> usize {
+                (width * Self::channels(self.color) * self.depth).div_ceil(8)
+            }
+
+            fn start_pass(&mut self) {
+                while self.pass < self.passes.len() {
+                    let p = &self.passes[self.pass];
+                    if p.w > 0 && p.h > 0 {
+                        let n = self.row_bytes(p.w);
+                        self.prev = vec![0; n];
+                        self.buf = Vec::with_capacity(n + 1);
+                        self.row_in_pass = 0;
+                        return;
+                    }
+                    self.pass += 1;
+                }
+            }
+
+            fn finished(&self) -> bool {
+                self.pass >= self.passes.len()
+            }
+
+            fn row_done(&mut self) {
+                let n = self.buf.len() - 1;
+                let filter = self.buf[0];
+                let bpp = self.bpp;
+                let mut row = self.buf.split_off(1);
+                self.buf.clear();
+                for i in 0..n {
+                    let a = if i >= bpp { i32::from(row[i - bpp]) } else { 0 };
+                    let b = i32::from(self.prev[i]);
+                    let c = if i >= bpp {
+                        i32::from(self.prev[i - bpp])
+                    } else {
+                        0
+                    };
+                    let add = match filter {
+                        0 => 0,
+                        1 => a,
+                        2 => b,
+                        3 => (a + b) / 2,
+                        4 => {
+                            let p = a + b - c;
+                            let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+                            if pa <= pb && pa <= pc {
+                                a
+                            } else if pb <= pc {
+                                b
+                            } else {
+                                c
+                            }
+                        }
+                        _ => 0,
+                    };
+                    row[i] = (i32::from(row[i]) + add) as u8;
+                }
+                let p = &self.passes[self.pass];
+                let (x0, y0, dx, dy, w) = (p.x0, p.y0, p.dx, p.dy, p.w);
+                let y = y0 + self.row_in_pass * dy;
+                for i in 0..w {
+                    let l = self.pixel(&row, i);
+                    self.plane.put(x0 + i * dx, y, l);
+                }
+                self.prev = row;
+                self.row_in_pass += 1;
+                if self.row_in_pass >= self.passes[self.pass].h {
+                    self.pass += 1;
+                    self.start_pass();
+                }
+            }
+
+            fn sample(&self, row: &[u8], index: usize) -> u32 {
+                match self.depth {
+                    16 => u32::from(row[index * 2]),
+                    8 => u32::from(row[index]),
+                    d => {
+                        let bit = index * d;
+                        let shift = 8 - d - (bit % 8);
+                        u32::from((row[bit / 8] >> shift) & ((1u8 << d) - 1))
+                    }
+                }
+            }
+
+            fn pixel(&self, row: &[u8], i: usize) -> u8 {
+                let ch = Self::channels(self.color);
+                match self.color {
+                    0 | 4 => {
+                        let v = self.sample(row, i * ch);
+                        if self.depth < 8 {
+                            (v * 255 / ((1 << self.depth) - 1)) as u8
+                        } else {
+                            v as u8
+                        }
+                    }
+                    3 => {
+                        let idx = self.sample(row, i) as usize;
+                        // A 16-bit sample has no palette, and a bad index is black.
+                        let [r, g, b] = self.palette.get(idx).copied().unwrap_or([0, 0, 0]);
+                        luma(r, g, b)
+                    }
+                    _ => {
+                        let r = self.sample(row, i * ch) as u8;
+                        let g = self.sample(row, i * ch + 1) as u8;
+                        let b = self.sample(row, i * ch + 2) as u8;
+                        luma(r, g, b)
+                    }
+                }
+            }
+        }
+
+        impl<P: Plane> std::io::Write for Rows<'_, P> {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let mut rest = data;
+                while !rest.is_empty() && !self.finished() {
+                    let want = self.row_bytes(self.passes[self.pass].w) + 1 - self.buf.len();
+                    let take = want.min(rest.len());
+                    self.buf.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    if self.buf.len() == self.row_bytes(self.passes[self.pass].w) + 1 {
+                        self.row_done();
+                    }
+                }
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn png<R: Read, P: Plane>(
+            r: &mut R,
+            begin: impl FnOnce(usize, usize) -> Option<P>,
+        ) -> Option<P> {
+            let mut palette: Vec<[u8; 3]> = Vec::new();
+            let mut header: Option<(usize, usize, u8, u8, bool)> = None;
+            let first_len = loop {
+                let mut head = [0u8; 8];
+                r.read_exact(&mut head).ok()?;
+                let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+                match &head[4..8] {
+                    b"IHDR" if len == 13 => {
+                        let mut h = [0u8; 13];
+                        r.read_exact(&mut h).ok()?;
+                        let w = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+                        let ht = u32::from_be_bytes([h[4], h[5], h[6], h[7]]) as usize;
+                        if h[10] != 0 || h[11] != 0 || h[12] > 1 || w == 0 || ht == 0 {
+                            return None;
+                        }
+                        let ok = match h[9] {
+                            0 => matches!(h[8], 1 | 2 | 4 | 8 | 16),
+                            3 => matches!(h[8], 1 | 2 | 4 | 8),
+                            2 | 4 | 6 => matches!(h[8], 8 | 16),
+                            _ => false,
+                        };
+                        if !ok || (w as u64) * (ht as u64) > MAX_PIXELS {
+                            return None;
+                        }
+                        header = Some((w, ht, h[8], h[9], h[12] == 1));
+                        let mut crc = [0u8; 4];
+                        r.read_exact(&mut crc).ok()?;
+                    }
+                    b"PLTE" if len % 3 == 0 && len <= 768 => {
+                        let mut p = vec![0u8; len as usize];
+                        r.read_exact(&mut p).ok()?;
+                        palette = p.as_chunks::<3>().0.to_vec();
+                        let mut crc = [0u8; 4];
+                        r.read_exact(&mut crc).ok()?;
+                    }
+                    b"IDAT" => break len,
+                    b"IEND" => return None,
+                    _ => {
+                        std::io::copy(&mut r.take(u64::from(len) + 4), &mut std::io::sink())
+                            .ok()?;
+                    }
+                }
+            };
+            let (w, h, depth, color, interlaced) = header?;
+            if w < MIN_SIDE || h < MIN_SIDE {
+                return None;
+            }
+            let mut plane = begin(w, h)?;
+            let passes: Vec<Pass> = if interlaced {
+                [
+                    (0, 0, 8, 8),
+                    (4, 0, 8, 8),
+                    (0, 4, 4, 8),
+                    (2, 0, 4, 4),
+                    (0, 2, 2, 4),
+                    (1, 0, 2, 2),
+                    (0, 1, 1, 2),
+                ]
+                .iter()
+                .map(|&(x0, y0, dx, dy)| Pass {
+                    x0,
+                    y0,
+                    dx,
+                    dy,
+                    w: if w > x0 { (w - x0).div_ceil(dx) } else { 0 },
+                    h: if h > y0 { (h - y0).div_ceil(dy) } else { 0 },
+                })
+                .collect()
+            } else {
+                vec![Pass {
+                    x0: 0,
+                    y0: 0,
+                    dx: 1,
+                    dy: 1,
+                    w,
+                    h,
+                }]
+            };
+            let depth = usize::from(depth);
+            let mut rows = Rows {
+                color,
+                depth,
+                palette,
+                passes,
+                pass: 0,
+                row_in_pass: 0,
+                prev: Vec::new(),
+                buf: Vec::new(),
+                bpp: (Rows::<P>::channels(color) * depth).div_ceil(8).max(1),
+                plane: &mut plane,
+            };
+            rows.start_pass();
+            let mut idat = Idat {
+                r,
+                remaining: first_len,
+                done: false,
+            };
+            // The zlib header: deflate, 32 KiB window, no preset dictionary.
+            let mut z = [0u8; 2];
+            idat.read_exact(&mut z).ok()?;
+            if z[0] & 0x0F != 8
+                || z[1] & 0x20 != 0
+                || (u32::from(z[0]) * 256 + u32::from(z[1])) % 31 != 0
+            {
+                return None;
+            }
+            {
+                let mut sink = GzipStreamSink::new(&mut rows);
+                inflate_to(&mut idat, &mut sink).ok()?;
+                sink.finish().ok()?;
+            }
+            let complete = rows.finished();
+            complete.then_some(plane)
+        }
+
+        // ---- JPEG ----
+
+        struct Huffman {
+            mincode: [i32; 17],
+            maxcode: [i32; 17],
+            valptr: [i32; 17],
+            vals: Vec<u8>,
+        }
+
+        impl Huffman {
+            fn new(counts: &[u8; 16], vals: Vec<u8>) -> Option<Huffman> {
+                let mut h = Huffman {
+                    mincode: [0; 17],
+                    maxcode: [-1; 17],
+                    valptr: [0; 17],
+                    vals,
+                };
+                let (mut code, mut k) = (0i32, 0i32);
+                for l in 1..=16usize {
+                    let n = i32::from(counts[l - 1]);
+                    h.valptr[l] = k;
+                    h.mincode[l] = code;
+                    code += n;
+                    k += n;
+                    if n > 0 {
+                        h.maxcode[l] = code - 1;
+                    }
+                    if code > (1 << l) {
+                        return None;
+                    }
+                    code <<= 1;
+                }
+                (k as usize <= h.vals.len()).then_some(h)
+            }
+        }
+
+        /// The entropy-coded bits of a scan: byte stuffing undone, and a
+        /// marker met on the way is held (zeros are read after it).
+        struct Bits<'a, R: Read> {
+            r: &'a mut R,
+            acc: u32,
+            n: u32,
+            marker: Option<u8>,
+        }
+
+        impl<R: Read> Bits<'_, R> {
+            fn byte(&mut self) -> Option<u8> {
+                let mut b = [0u8; 1];
+                self.r.read_exact(&mut b).ok()?;
+                Some(b[0])
+            }
+
+            fn fill(&mut self) {
+                while self.n <= 24 {
+                    let b = if self.marker.is_some() {
+                        0
+                    } else {
+                        match self.byte() {
+                            None => {
+                                self.marker = Some(0xD9);
+                                0
+                            }
+                            Some(0xFF) => {
+                                let mut next = self.byte();
+                                while next == Some(0xFF) {
+                                    next = self.byte();
+                                }
+                                match next {
+                                    Some(0) => 0xFF,
+                                    Some(m) => {
+                                        self.marker = Some(m);
+                                        0
+                                    }
+                                    None => {
+                                        self.marker = Some(0xD9);
+                                        0
+                                    }
+                                }
+                            }
+                            Some(b) => b,
+                        }
+                    };
+                    self.acc |= u32::from(b) << (24 - self.n);
+                    self.n += 8;
+                }
+            }
+
+            fn bits(&mut self, count: u32) -> u32 {
+                if count == 0 {
+                    return 0;
+                }
+                if self.n < count {
+                    self.fill();
+                }
+                let v = self.acc >> (32 - count);
+                self.acc <<= count;
+                self.n -= count;
+                v
+            }
+
+            fn symbol(&mut self, h: &Huffman) -> Option<u8> {
+                let mut code = 0i32;
+                for l in 1..=16usize {
+                    code = (code << 1) | self.bits(1) as i32;
+                    if h.maxcode[l] >= 0 && code <= h.maxcode[l] {
+                        let at = h.valptr[l] + code - h.mincode[l];
+                        return h.vals.get(usize::try_from(at).ok()?).copied();
+                    }
+                }
+                None
+            }
+
+            /// Reads `s` bits as a signed value (JPEG's "extend").
+            fn extend(&mut self, s: u32) -> i32 {
+                if s == 0 {
+                    return 0;
+                }
+                let v = self.bits(s) as i32;
+                if v < (1 << (s - 1)) {
+                    v - (1 << s) + 1
+                } else {
+                    v
+                }
+            }
+
+            /// After a restart interval: drop the partial byte, find the RSTn.
+            fn restart(&mut self) -> bool {
+                self.acc = 0;
+                self.n = 0;
+                while self.marker.is_none() {
+                    match self.byte() {
+                        None => return false,
+                        Some(0xFF) => {
+                            let mut next = self.byte();
+                            while next == Some(0xFF) {
+                                next = self.byte();
+                            }
+                            match next {
+                                Some(0) => {}
+                                Some(m) => self.marker = Some(m),
+                                None => return false,
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+                match self.marker {
+                    Some(m) if (0xD0..=0xD7).contains(&m) => {
+                        self.marker = None;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+
+            /// The marker that ends this scan.
+            fn finish(&mut self) -> Option<u8> {
+                self.acc = 0;
+                self.n = 0;
+                loop {
+                    if let Some(m) = self.marker.take() {
+                        // A restart marker inside a scan we are skipping.
+                        if (0xD0..=0xD7).contains(&m) {
+                            continue;
+                        }
+                        return Some(m);
+                    }
+                    if self.byte()? == 0xFF {
+                        let mut next = self.byte()?;
+                        while next == 0xFF {
+                            next = self.byte()?;
+                        }
+                        if next != 0 {
+                            self.marker = Some(next);
+                        }
+                    }
+                }
+            }
+        }
+
+        struct Frame {
+            width: usize,
+            height: usize,
+            progressive: bool,
+            /// id, horizontal and vertical sampling, quantization table.
+            comps: Vec<(u8, usize, usize, usize)>,
+        }
+
+        impl Frame {
+            fn hmax(&self) -> usize {
+                self.comps.iter().map(|c| c.1).max().unwrap_or(1)
+            }
+
+            fn vmax(&self) -> usize {
+                self.comps.iter().map(|c| c.2).max().unwrap_or(1)
+            }
+
+            /// Blocks across and down of component `i`.
+            fn blocks(&self, i: usize) -> (usize, usize) {
+                let (_, h, v, _) = self.comps[i];
+                let w = (self.width * h).div_ceil(self.hmax());
+                let ht = (self.height * v).div_ceil(self.vmax());
+                (w.div_ceil(8), ht.div_ceil(8))
+            }
+        }
+
+        fn segment<R: Read>(r: &mut R) -> Option<Vec<u8>> {
+            let mut len = [0u8; 2];
+            r.read_exact(&mut len).ok()?;
+            let n = usize::from(u16::from_be_bytes(len)).checked_sub(2)?;
+            let mut buf = vec![0u8; n];
+            r.read_exact(&mut buf).ok()?;
+            Some(buf)
+        }
+
+        fn jpeg<R: Read, P: Plane>(
+            input: R,
+            begin: impl FnOnce(usize, usize) -> Option<P>,
+        ) -> Option<P> {
+            let mut r = BufReader::with_capacity(64 * 1024, input);
+            let mut soi = [0u8; 2];
+            r.read_exact(&mut soi).ok()?;
+            if soi != [0xFF, 0xD8] {
+                return None;
+            }
+            let mut quant: [[u32; 64]; 4] = [[0; 64]; 4];
+            let mut dc: [Option<Huffman>; 4] = [None, None, None, None];
+            let mut ac: [Option<Huffman>; 4] = [None, None, None, None];
+            let mut restart = 0usize;
+            let mut frame: Option<Frame> = None;
+            let mut adobe_transform: Option<u8> = None;
+            // One DC value per block of the first component; `i32::MIN` is unread.
+            let mut luma_dc: Vec<i32> = Vec::new();
+            let mut pending: Option<u8> = None;
+            loop {
+                let m = match pending.take() {
+                    Some(m) => m,
+                    None => {
+                        let mut b = [0u8; 1];
+                        loop {
+                            r.read_exact(&mut b).ok()?;
+                            if b[0] == 0xFF {
+                                break;
+                            }
+                        }
+                        loop {
+                            r.read_exact(&mut b).ok()?;
+                            if b[0] != 0xFF {
+                                break;
+                            }
+                        }
+                        b[0]
+                    }
+                };
+                match m {
+                    0 | 1 | 0xD0..=0xD7 | 0xD8 => {}
+                    0xD9 => break,
+                    0xC0..=0xC2 => {
+                        let s = segment(&mut r)?;
+                        if s.len() < 6 || s[0] != 8 || frame.is_some() {
+                            return None;
+                        }
+                        let height = usize::from(u16::from_be_bytes([s[1], s[2]]));
+                        let width = usize::from(u16::from_be_bytes([s[3], s[4]]));
+                        let n = usize::from(s[5]);
+                        if height == 0
+                            || width == 0
+                            || !(n == 1 || n == 3)
+                            || s.len() < 6 + 3 * n
+                            || (width as u64) * (height as u64) > MAX_PIXELS
+                        {
+                            return None;
+                        }
+                        let mut comps = Vec::new();
+                        for i in 0..n {
+                            let c = &s[6 + 3 * i..9 + 3 * i];
+                            let (h, v, tq) = (
+                                usize::from(c[1] >> 4),
+                                usize::from(c[1] & 15),
+                                usize::from(c[2]),
+                            );
+                            if !(1..=4).contains(&h) || !(1..=4).contains(&v) || tq > 3 {
+                                return None;
+                            }
+                            comps.push((c[0], h, v, tq));
+                        }
+                        // RGB stored as is: the first component is not brightness.
+                        if n == 3
+                            && (adobe_transform == Some(0)
+                                || comps.iter().map(|c| c.0).collect::<Vec<_>>() == b"RGB")
+                        {
+                            return None;
+                        }
+                        let f = Frame {
+                            width,
+                            height,
+                            progressive: m == 0xC2,
+                            comps,
+                        };
+                        let (bw, bh) = f.blocks(0);
+                        luma_dc = vec![i32::MIN; bw * bh];
+                        frame = Some(f);
+                    }
+                    0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return None,
+                    0xC4 => {
+                        let s = segment(&mut r)?;
+                        let mut at = 0;
+                        while at + 17 <= s.len() {
+                            let class = s[at] >> 4;
+                            let id = usize::from(s[at] & 15);
+                            let mut counts = [0u8; 16];
+                            counts.copy_from_slice(&s[at + 1..at + 17]);
+                            let total: usize = counts.iter().map(|&c| usize::from(c)).sum();
+                            let vals = s.get(at + 17..at + 17 + total)?.to_vec();
+                            at += 17 + total;
+                            if id > 3 || class > 1 {
+                                return None;
+                            }
+                            let table = Huffman::new(&counts, vals)?;
+                            if class == 0 {
+                                dc[id] = Some(table);
+                            } else {
+                                ac[id] = Some(table);
+                            }
+                        }
+                    }
+                    0xDB => {
+                        let s = segment(&mut r)?;
+                        let mut at = 0;
+                        while at < s.len() {
+                            let wide = s[at] >> 4;
+                            let id = usize::from(s[at] & 15);
+                            at += 1;
+                            if id > 3 || wide > 1 {
+                                return None;
+                            }
+                            for slot in quant[id].iter_mut() {
+                                let v = if wide == 1 {
+                                    let b = s.get(at..at + 2)?;
+                                    at += 2;
+                                    u32::from(u16::from_be_bytes([b[0], b[1]]))
+                                } else {
+                                    let b = *s.get(at)?;
+                                    at += 1;
+                                    u32::from(b)
+                                };
+                                *slot = v;
+                            }
+                        }
+                    }
+                    0xDD => {
+                        let s = segment(&mut r)?;
+                        restart = usize::from(u16::from_be_bytes([*s.first()?, *s.get(1)?]));
+                    }
+                    0xEE => {
+                        let s = segment(&mut r)?;
+                        if s.len() >= 12 && &s[..5] == b"Adobe" {
+                            adobe_transform = Some(s[11]);
+                        }
+                    }
+                    0xDA => {
+                        let s = segment(&mut r)?;
+                        let f = frame.as_ref()?;
+                        let n = usize::from(*s.first()?);
+                        if n == 0 || n > 4 || s.len() < 1 + 2 * n + 3 {
+                            return None;
+                        }
+                        let mut scan: Vec<(usize, usize, usize)> = Vec::new(); // comp, dc, ac
+                        for i in 0..n {
+                            let id = s[1 + 2 * i];
+                            let tables = s[2 + 2 * i];
+                            let ci = f.comps.iter().position(|c| c.0 == id)?;
+                            scan.push((ci, usize::from(tables >> 4), usize::from(tables & 15)));
+                        }
+                        let (ss, se, a) = (s[1 + 2 * n], s[2 + 2 * n], s[3 + 2 * n]);
+                        let (ah, al) = (a >> 4, u32::from(a & 15));
+                        let mut bits = Bits {
+                            r: &mut r,
+                            acc: 0,
+                            n: 0,
+                            marker: None,
+                        };
+                        // A progressive file sends the DC values first (cut to fewer bits
+                        // when `al` is not 0) and the missing bits in later scans.
+                        let reads_dc = if f.progressive { ss == 0 } else { true };
+                        if reads_dc && scan.iter().any(|&(ci, _, _)| ci == 0) {
+                            if !f.progressive && se != 63 && ss != 0 {
+                                return None;
+                            }
+                            scan_dc(
+                                f,
+                                &scan,
+                                &dc,
+                                &ac,
+                                f.progressive,
+                                if f.progressive && ah > 0 {
+                                    Some(al)
+                                } else {
+                                    None
+                                },
+                                if f.progressive { al } else { 0 },
+                                restart,
+                                &quant,
+                                &mut bits,
+                                &mut luma_dc,
+                            )?;
+                        }
+                        pending = bits.finish();
+                        pending?;
+                    }
+                    0xE0..=0xED | 0xEF | 0xFE | 0xC8 | 0xCC | 0xDC..=0xDF | 0xF0..=0xFD => {
+                        segment(&mut r)?;
+                    }
+                    _ => return None,
+                }
+            }
+            let f = frame?;
+            let (bw, bh) = f.blocks(0);
+            if luma_dc.contains(&i32::MIN) {
+                return None;
+            }
+            let mut plane = begin(bw, bh)?;
+            let q0 = quant[f.comps[0].3][0] as i32;
+            for by in 0..bh {
+                for bx in 0..bw {
+                    let mean = ((luma_dc[by * bw + bx] * q0 + 4) >> 3) + 128;
+                    plane.put(bx, by, mean.clamp(0, 255) as u8);
+                }
+            }
+            Some(plane)
+        }
+
+        /// Decodes one scan, keeping the DC value of every luma block. In a
+        /// sequential scan the AC coefficients are read and thrown away; a
+        /// progressive DC scan has none.
+        #[allow(clippy::too_many_arguments)]
+        fn scan_dc<R: Read>(
+            f: &Frame,
+            scan: &[(usize, usize, usize)],
+            dc: &[Option<Huffman>; 4],
+            ac: &[Option<Huffman>; 4],
+            progressive: bool,
+            refine: Option<u32>,
+            al: u32,
+            restart: usize,
+            quant: &[[u32; 64]; 4],
+            bits: &mut Bits<'_, R>,
+            luma_dc: &mut [i32],
+        ) -> Option<()> {
+            let _ = quant;
+            let (bw0, bh0) = f.blocks(0);
+            let mut pred = vec![0i32; scan.len()];
+            // The units of the scan: (blocks per MCU for each component) x MCUs.
+            let (mcus_x, mcus_y) = if scan.len() == 1 {
+                f.blocks(scan[0].0)
+            } else {
+                (
+                    f.width.div_ceil(8 * f.hmax()),
+                    f.height.div_ceil(8 * f.vmax()),
+                )
+            };
+            let mut counter = 0usize;
+            for my in 0..mcus_y {
+                for mx in 0..mcus_x {
+                    if restart > 0 && counter > 0 && counter.is_multiple_of(restart) {
+                        if !bits.restart() {
+                            return Some(());
+                        }
+                        pred.iter_mut().for_each(|p| *p = 0);
+                    }
+                    counter += 1;
+                    for (si, &(ci, dt, at)) in scan.iter().enumerate() {
+                        let (_, ch, cv, _) = f.comps[ci];
+                        let (nh, nv) = if scan.len() == 1 { (1, 1) } else { (ch, cv) };
+                        for v in 0..nv {
+                            for h in 0..nh {
+                                if let Some(bit_at) = refine {
+                                    // One more bit of this block's DC value.
+                                    let bit = bits.bits(1) as i32;
+                                    if ci == 0 {
+                                        let (bx, by) = (mx * nh + h, my * nv + v);
+                                        if bx < bw0 && by < bh0 {
+                                            luma_dc[by * bw0 + bx] |= bit << bit_at;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                let dctab = dc.get(dt)?.as_ref()?;
+                                let t = u32::from(bits.symbol(dctab)?);
+                                if t > 16 {
+                                    return None;
+                                }
+                                pred[si] += bits.extend(t);
+                                if ci == 0 {
+                                    let (bx, by) = (mx * nh + h, my * nv + v);
+                                    if bx < bw0 && by < bh0 {
+                                        luma_dc[by * bw0 + bx] = if progressive {
+                                            pred[si] << al
+                                        } else {
+                                            pred[si]
+                                        };
+                                    }
+                                }
+                                if !progressive {
+                                    let actab = ac.get(at)?.as_ref()?;
+                                    let mut k = 1;
+                                    while k < 64 {
+                                        let rs = bits.symbol(actab)?;
+                                        let (r, s) = (usize::from(rs >> 4), u32::from(rs & 15));
+                                        if s == 0 {
+                                            if r == 15 {
+                                                k += 16;
+                                                continue;
+                                            }
+                                            break;
+                                        }
+                                        k += r;
+                                        bits.bits(s);
+                                        k += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(())
+        }
     }
 
     /// Who took a photo and with what, read from the file's own EXIF and
@@ -120839,6 +122520,7 @@ mod knowledge_graph {
             sheet_refs: Vec::new(),
             changes_with: Vec::new(),
             mtime: 0,
+            image_hash: None,
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -122218,6 +123900,29 @@ mod knowledge_graph {
         None
     }
 
+    /// The hash of an image and, on request, its plane (for the oracle).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn image_probe(
+        path: &Path,
+        plane: bool,
+    ) -> (Option<u64>, Option<(usize, usize, Vec<u8>)>) {
+        let p = if plane {
+            image_hash::plane(path).map(|c| (c.w, c.h, c.data))
+        } else {
+            None
+        };
+        (image_hash::hash(path), p)
+    }
+
+    /// A file's own-property facts, by its extension.
+    pub(crate) fn file_facts(path: &Path) -> Vec<(String, String)> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        file_metadata(path, &extension_of(&name))
+    }
+
     /// What the graph reads of a document, for tools/check_doc_text.py.
     pub(crate) fn document_text(path: &Path) -> Option<Vec<String>> {
         let name = path
@@ -122566,10 +124271,13 @@ mod knowledge_graph {
         DerivedFrom,
         /// A file to the database table it is an export of.
         ExportedFrom,
+        /// Two pictures that look alike: the same picture resized or saved
+        /// again.
+        LooksLike,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 28] = [
+        pub(crate) const ALL: [Relation; 29] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -122598,6 +124306,7 @@ mod knowledge_graph {
             Relation::VersionOf,
             Relation::DerivedFrom,
             Relation::ExportedFrom,
+            Relation::LooksLike,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -122630,6 +124339,7 @@ mod knowledge_graph {
                 Relation::VersionOf => "version_of",
                 Relation::DerivedFrom => "derived_from",
                 Relation::ExportedFrom => "exported_from",
+                Relation::LooksLike => "looks_like",
             }
         }
 
@@ -122755,21 +124465,45 @@ mod knowledge_graph {
         pub(crate) communities: Vec<Community>,
         /// File references that named no input file (or too many).
         pub(crate) unresolved_references: usize,
+        /// The files nothing links to, with what could link them (only
+        /// with `--unlinked-report`).
+        pub(crate) unlinked: Vec<Unlinked>,
+    }
+
+    /// One file that shares nothing detectable with any other, and what
+    /// there is to go on in linking it by hand or by an agent.
+    pub(crate) struct Unlinked {
+        /// The file's node.
+        pub(crate) node: usize,
+        pub(crate) why: String,
+        pub(crate) terms: Vec<String>,
+        /// (kind, value) of the identifiers found in it.
+        pub(crate) entities: Vec<(String, String)>,
+        pub(crate) columns: Vec<String>,
+        /// Files that share a few words with it, below the similarity bar:
+        /// (node, cosine, the words).
+        pub(crate) candidates: Vec<(usize, f64, Vec<String>)>,
+    }
+
+    /// Distinct neighbors of every node, over non-structural, non-derived
+    /// links.
+    fn content_degrees_of(nodes: usize, edges: &[KgEdge]) -> Vec<usize> {
+        let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); nodes];
+        for e in edges {
+            if e.relation.structural() || e.relation.derived() || e.source == e.target {
+                continue;
+            }
+            neighbors[e.source].insert(e.target);
+            neighbors[e.target].insert(e.source);
+        }
+        neighbors.iter().map(HashSet::len).collect()
     }
 
     impl KnowledgeGraph {
         /// Distinct neighbors of every node, over non-structural,
         /// non-derived links.
         pub(crate) fn content_degrees(&self) -> Vec<usize> {
-            let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); self.nodes.len()];
-            for e in &self.edges {
-                if e.relation.structural() || e.relation.derived() || e.source == e.target {
-                    continue;
-                }
-                neighbors[e.source].insert(e.target);
-                neighbors[e.target].insert(e.source);
-            }
-            neighbors.iter().map(HashSet::len).collect()
+            content_degrees_of(self.nodes.len(), &self.edges)
         }
 
         /// Distinct neighbors of every node, over every link.
@@ -122968,6 +124702,8 @@ mod knowledge_graph {
         pub(crate) people: bool,
         /// Links from outside, rejects, aliases and ignored identifiers.
         pub(crate) overrides: Overrides,
+        /// Work out, for each file nothing links to, what could link it.
+        pub(crate) unlinked_report: bool,
     }
 
     impl Default for BuildOptions {
@@ -122978,6 +124714,7 @@ mod knowledge_graph {
                 columns: false,
                 people: false,
                 overrides: Overrides::default(),
+                unlinked_report: false,
             }
         }
     }
@@ -123090,6 +124827,7 @@ mod knowledge_graph {
         link_same_names(&mut b, &files, &file_node);
         link_versions(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
+        link_looks_like(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
         if opts.folders {
             link_folders(&mut b, &files, &file_node);
@@ -123132,18 +124870,248 @@ mod knowledge_graph {
         let communities =
             communities_from(&mut b.nodes, &membership, &doc_terms, &file_node, &b.edges);
 
+        let unlinked = if opts.unlinked_report {
+            unlinked_files(
+                &b.nodes, &b.edges, &files, &contents, &doc_terms, &file_node,
+            )
+        } else {
+            Vec::new()
+        };
         let mut graph = KnowledgeGraph {
             input,
             nodes: b.nodes,
             edges: b.edges,
             communities,
             unresolved_references: unresolved,
+            unlinked,
         };
         let degrees = graph.degrees();
         for (node, d) in graph.nodes.iter_mut().zip(degrees) {
             node.attrs.insert("degree".to_string(), JsonValue::from(d));
         }
         Ok(graph)
+    }
+
+    /// An identifier of a file with how often and where it was found.
+    type EntityRow<'a> = (&'a (EntityKind, String), &'a (u64, String));
+    /// A candidate's running score and the words that make it.
+    type WordScore<'a> = (f64, Vec<(f64, &'a str)>);
+
+    /// Terms two files must share to be offered as candidates.
+    const UNLINKED_MIN_SHARED: usize = 2;
+    /// Cosine floor for a candidate (a link needs `SIMILARITY_THRESHOLD`).
+    const UNLINKED_MIN_COSINE: f64 = 0.05;
+    /// Candidates listed per file.
+    const UNLINKED_CANDIDATES: usize = 5;
+
+    /// The files nothing links to (no link but structural ones), with what a
+    /// person or an agent has to go on: why nothing was found, the words and
+    /// identifiers in the file, and other files that share a few words with
+    /// it, below the similarity bar.
+    fn unlinked_files(
+        nodes: &[KgNode],
+        edges: &[KgEdge],
+        files: &[KgFile],
+        contents: &[FileContent],
+        doc_terms: &[Vec<(String, f64)>],
+        file_node: &[usize],
+    ) -> Vec<Unlinked> {
+        let degrees = content_degrees_of(nodes.len(), edges);
+        let lonely: Vec<usize> = (0..files.len())
+            .filter(|&fi| degrees[file_node[fi]] == 0)
+            .collect();
+        if lonely.is_empty() {
+            return Vec::new();
+        }
+        // Inverted index of every file's weighted terms.
+        let mut postings: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
+        for (fi, v) in doc_terms.iter().enumerate() {
+            for (t, w) in v {
+                postings.entry(t.as_str()).or_default().push((fi, *w));
+            }
+        }
+        let norm = |v: &[(String, f64)]| v.iter().map(|(_, w)| w * w).sum::<f64>().sqrt();
+        let norms: Vec<f64> = doc_terms.iter().map(|v| norm(v)).collect();
+        let mut out = Vec::new();
+        for fi in lonely {
+            let f = &files[fi];
+            let fc = &contents[fi];
+            let why = if let Some(e) = &f.error {
+                format!("the file could not be read: {e}")
+            } else if f.kind == FileKind::Binary {
+                "binary file with no readable content (an image, video or archive): only a name, a folder or a person can tie it to others".to_string()
+            } else if fc.text_chars == 0 {
+                "no text found in it (a scan or image-only document has no text layer)".to_string()
+            } else if fc.text_chars >= 200 && fc.unmapped_chars * 100 >= fc.text_chars {
+                format!(
+                    "the text did not decode ({:.0}% of its characters have no Unicode mapping)",
+                    fc.unmapped_chars as f64 * 100.0 / fc.text_chars as f64
+                )
+            } else {
+                "nothing shared with any other file: no common words, identifiers, names, references or columns".to_string()
+            };
+            let mut entities: Vec<EntityRow<'_>> = fc.entities.iter().collect();
+            entities.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+            let entities: Vec<(String, String)> = entities
+                .into_iter()
+                .take(10)
+                .map(|((k, v), _)| (k.as_str().to_string(), v.clone()))
+                .collect();
+            let mut columns: Vec<String> = Vec::new();
+            for (_, cols) in &f.tables {
+                for c in cols {
+                    if columns.len() < 20 && !columns.contains(&c.name) {
+                        columns.push(c.name.clone());
+                    }
+                }
+            }
+            let terms: Vec<String> = doc_terms[fi]
+                .iter()
+                .take(12)
+                .map(|(t, _)| t.clone())
+                .collect();
+            // Candidates: other files sharing words, below the bar for a link.
+            let mut scores: HashMap<usize, WordScore<'_>> = HashMap::new();
+            if norms[fi] > 0.0 {
+                for (t, wa) in &doc_terms[fi] {
+                    let Some(list) = postings.get(t.as_str()) else {
+                        continue;
+                    };
+                    for (other, wb) in list {
+                        if *other == fi {
+                            continue;
+                        }
+                        let slot = scores.entry(*other).or_default();
+                        slot.0 += wa * wb;
+                        slot.1.push((wa * wb, t.as_str()));
+                    }
+                }
+            }
+            let mut candidates: Vec<(usize, f64, Vec<String>)> = scores
+                .into_iter()
+                .filter(|(other, (_, shared))| {
+                    shared.len() >= UNLINKED_MIN_SHARED && norms[*other] > 0.0
+                })
+                .map(|(other, (dot, mut shared))| {
+                    let cos = dot / (norms[fi] * norms[other]);
+                    shared.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.1.cmp(b.1))
+                    });
+                    (
+                        file_node[other],
+                        cos,
+                        shared
+                            .into_iter()
+                            .take(5)
+                            .map(|(_, t)| t.to_string())
+                            .collect(),
+                    )
+                })
+                .filter(|(_, cos, _)| *cos >= UNLINKED_MIN_COSINE)
+                .collect();
+            candidates.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| nodes[a.0].id.cmp(&nodes[b.0].id))
+            });
+            candidates.truncate(UNLINKED_CANDIDATES);
+            out.push(Unlinked {
+                node: file_node[fi],
+                why,
+                terms,
+                entities,
+                columns,
+                candidates,
+            });
+        }
+        out.sort_by(|a, b| nodes[a.node].id.cmp(&nodes[b.node].id));
+        out
+    }
+
+    /// The `--unlinked-report` document: for each file nothing links to,
+    /// what it is, why nothing was found, what is in it, who looks close,
+    /// and an empty link ready to fill in and hand to `--links` or
+    /// `graph merge`.
+    pub(crate) fn render_unlinked(kg: &KnowledgeGraph) -> String {
+        let str_array =
+            |v: &[String]| JsonValue::Array(v.iter().cloned().map(JsonValue::from).collect());
+        let mut files = Vec::new();
+        for u in &kg.unlinked {
+            let n = &kg.nodes[u.node];
+            let mut o = json_support::Map::new();
+            o.insert("id".to_string(), JsonValue::from(n.id.clone()));
+            o.insert(
+                "file_type".to_string(),
+                JsonValue::from(n.file_type.clone()),
+            );
+            if let Some(size) = attr_f64(n, "size_bytes") {
+                o.insert("size_bytes".to_string(), JsonValue::from(size as u64));
+            }
+            o.insert("why".to_string(), JsonValue::from(u.why.clone()));
+            o.insert("terms".to_string(), str_array(&u.terms));
+            o.insert(
+                "identifiers".to_string(),
+                JsonValue::Array(
+                    u.entities
+                        .iter()
+                        .map(|(k, v)| {
+                            let mut e = json_support::Map::new();
+                            e.insert("kind".to_string(), JsonValue::from(k.clone()));
+                            e.insert("value".to_string(), JsonValue::from(v.clone()));
+                            JsonValue::Object(e)
+                        })
+                        .collect(),
+                ),
+            );
+            o.insert("columns".to_string(), str_array(&u.columns));
+            o.insert(
+                "candidates".to_string(),
+                JsonValue::Array(
+                    u.candidates
+                        .iter()
+                        .map(|(other, cos, shared)| {
+                            let mut c = json_support::Map::new();
+                            c.insert(
+                                "id".to_string(),
+                                JsonValue::from(kg.nodes[*other].id.clone()),
+                            );
+                            c.insert(
+                                "cosine".to_string(),
+                                JsonValue::from((cos * 1000.0).round() / 1000.0),
+                            );
+                            c.insert("shared_terms".to_string(), str_array(shared));
+                            JsonValue::Object(c)
+                        })
+                        .collect(),
+                ),
+            );
+            let mut t = json_support::Map::new();
+            t.insert("source".to_string(), JsonValue::from(n.id.clone()));
+            t.insert("target".to_string(), JsonValue::from(""));
+            t.insert("relation".to_string(), JsonValue::from("related_to"));
+            t.insert("label".to_string(), JsonValue::from(""));
+            t.insert("confidence".to_string(), JsonValue::from("INFERRED"));
+            t.insert("evidence".to_string(), JsonValue::from(""));
+            t.insert("by".to_string(), JsonValue::from(""));
+            o.insert("link_template".to_string(), JsonValue::Object(t));
+            files.push(JsonValue::Object(o));
+        }
+        let mut doc = json_support::Map::new();
+        doc.insert("version".to_string(), JsonValue::from(1));
+        doc.insert("input".to_string(), JsonValue::from(kg.input.clone()));
+        doc.insert("count".to_string(), JsonValue::from(kg.unlinked.len()));
+        doc.insert(
+            "how_to_use".to_string(),
+            JsonValue::from(
+                "Each file below shares nothing detectable with any other. Read what is in it (terms, identifiers, columns) and the candidates, decide what it relates to, and for each real relation fill in the target (a node id from graph.json), a short relation label, the evidence, and who decided (by). Put the filled links in a JSON file as {\"links\": [...]} and either re-run `sniff-rs graph <INPUT> --links FILE` or add them with `sniff-rs graph merge graph.json FILE -o DIR`. Delete templates you leave empty.",
+            ),
+        );
+        doc.insert("files".to_string(), JsonValue::Array(files));
+        let mut text = json_support::to_pretty_string(&JsonValue::Object(doc));
+        text.push('\n');
+        text
     }
 
     /// One file's mention of an identifier: (file index, occurrences, the
@@ -125420,6 +127388,99 @@ mod knowledge_graph {
         }
     }
 
+    /// Most bits two image hashes may differ in (of 64) to link them.
+    const LOOKS_LIKE_MAX_BITS: u32 = 5;
+    /// Each image links to at most this many of its closest copies.
+    const LOOKS_LIKE_NEIGHBORS: usize = 5;
+    /// A hash band shared by more images than this says nothing (a flat
+    /// background, a template): the band is not used to propose pairs.
+    const LOOKS_LIKE_BAND_CAP: usize = 200;
+
+    /// `looks_like`: pictures that differ in at most `LOOKS_LIKE_MAX_BITS`
+    /// of their 64 hash bits - the same picture resized, recompressed or
+    /// saved again. Byte-identical copies are `duplicate_of` already and
+    /// are left out. Pairs are found by splitting each hash into nine bands
+    /// (a pair within eight bits agrees exactly in at least one band,
+    /// pigeonhole) and checking only images that share a band.
+    fn link_looks_like(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        let hashed: Vec<(usize, u64)> = files
+            .iter()
+            .enumerate()
+            .filter_map(|(fi, f)| f.image_hash.map(|h| (fi, h)))
+            .collect();
+        if hashed.len() < 2 {
+            return;
+        }
+        // 64 bits in nine bands of 7 (the last holds 8).
+        let band = |h: u64, k: u32| -> u64 {
+            let shift = k * 7;
+            if k == 8 {
+                (h >> shift) & 0xFF
+            } else {
+                (h >> shift) & 0x7F
+            }
+        };
+        let mut buckets: HashMap<(u32, u64), Vec<usize>> = HashMap::new();
+        for (i, (_, h)) in hashed.iter().enumerate() {
+            for k in 0..9 {
+                buckets.entry((k, band(*h, k))).or_default().push(i);
+            }
+        }
+        let mut pairs: BTreeMap<(usize, usize), u32> = BTreeMap::new();
+        for members in buckets.values() {
+            if members.len() < 2 || members.len() > LOOKS_LIKE_BAND_CAP {
+                continue;
+            }
+            for (x, &a) in members.iter().enumerate() {
+                for &c in &members[x + 1..] {
+                    let (a, c) = (a.min(c), a.max(c));
+                    pairs
+                        .entry((a, c))
+                        .or_insert_with(|| (hashed[a].1 ^ hashed[c].1).count_ones());
+                }
+            }
+        }
+        let mut near: Vec<Vec<(u32, usize, usize)>> = vec![Vec::new(); hashed.len()];
+        for (&(a, c), &bits) in &pairs {
+            if bits > LOOKS_LIKE_MAX_BITS {
+                continue;
+            }
+            let (fa, fc) = (hashed[a].0, hashed[c].0);
+            // Byte-identical copies have a `duplicate_of` link already.
+            if files[fa].size == files[fc].size
+                && files[fa].hash.is_some()
+                && files[fa].hash == files[fc].hash
+            {
+                continue;
+            }
+            near[a].push((bits, c, a));
+            near[c].push((bits, a, c));
+        }
+        let mut chosen: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for list in &mut near {
+            list.sort();
+            for &(_, other, me) in list.iter().take(LOOKS_LIKE_NEIGHBORS) {
+                chosen.insert((me.min(other), me.max(other)));
+            }
+        }
+        for (a, c) in chosen {
+            let bits = pairs[&(a, c)];
+            let (fa, fc) = (hashed[a].0, hashed[c].0);
+            b.add_edge(
+                file_node[fa],
+                file_node[fc],
+                Relation::LooksLike,
+                Conf::Inferred,
+                1.0 - f64::from(bits) / 64.0,
+                2.0,
+                vec![format!(
+                    "{} and {} look alike: their perceptual hashes differ in {bits} of 64 bits",
+                    files[fa].name, files[fc].name
+                )],
+            );
+        }
+    }
+
     /// `duplicate_of`: files with identical bytes (same size and 128-bit
     /// hash). A group links as a star around its first file by path, so a
     /// hundred copies cost a hundred links, not five thousand.
@@ -125571,8 +127632,15 @@ mod knowledge_graph {
             }
         }
         let too_common = (files.len() / 20).max(12);
+        // An album or an artist is meant to hold many tracks.
+        let too_common_music = (files.len() / 2).max(500);
         for ((kind, norm), (display, members)) in by {
-            if members.len() < 2 || members.len() > too_common {
+            let cap = if matches!(kind.as_str(), "artist" | "composer" | "album") {
+                too_common_music
+            } else {
+                too_common
+            };
+            if members.len() < 2 || members.len() > cap {
                 continue;
             }
             let mut attrs = json_support::Map::new();
@@ -127623,6 +129691,7 @@ mod knowledge_graph {
             edges,
             communities,
             unresolved_references: unresolved,
+            unlinked: Vec::new(),
         })
     }
 
@@ -128133,6 +130202,7 @@ mod knowledge_graph {
             edges,
             communities: Vec::new(),
             unresolved_references: unresolved,
+            unlinked: Vec::new(),
         }
     }
 
@@ -128903,7 +130973,7 @@ mod knowledge_graph {
             }
         }
         if !isolated.is_empty() {
-            out.push_str(&format!("\n## Isolated files\n\n{} file(s) share nothing detectable with any other file:\n\n", isolated.len()));
+            out.push_str(&format!("\n## Isolated files\n\n{} file(s) share nothing detectable with any other file (`--unlinked-report` lists what is in each and which files come close):\n\n", isolated.len()));
             for i in isolated.iter().take(40) {
                 out.push_str(&format!("- {}\n", node_ref(&kg.nodes[*i])));
             }
@@ -131103,6 +133173,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 sheet_refs: Vec::new(),
                 changes_with: Vec::new(),
                 mtime: 0,
+                image_hash: None,
             }
         }
 
@@ -132137,6 +134208,228 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     }
 
     #[cfg(test)]
+    mod audio_meta_tests {
+        use super::audio_meta;
+        use std::path::{Path, PathBuf};
+
+        fn dir() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/edge_graph_audio")
+        }
+
+        fn facts(name: &str) -> Vec<(String, String)> {
+            audio_meta::read(&dir().join(name))
+        }
+
+        fn pair(k: &str, v: &str) -> (String, String) {
+            (k.to_string(), v.to_string())
+        }
+
+        #[test]
+        fn every_tag_format_gives_the_artist_and_the_album() {
+            let want = vec![
+                pair("artist", "Sigur Rós"),
+                pair("album", "Ágætis byrjun - Sigur Rós"),
+            ];
+            for name in [
+                "sigur_01.mp3", // ID3v2.4, UTF-8
+                "sigur_02.mp3", // ID3v2.3, UTF-16
+                "sigur_03.mp3", // ID3v2.2, Latin-1
+                "sigur_04.flac",
+                "sigur_05.ogg",
+            ] {
+                assert_eq!(facts(name), want, "{name}");
+            }
+            let radiohead = vec![
+                pair("artist", "Radiohead"),
+                pair("album", "Kid A - Radiohead"),
+            ];
+            for name in ["radiohead_01.m4a", "radiohead_02.opus", "radiohead_03.mp3"] {
+                assert_eq!(facts(name), radiohead, "{name}");
+            }
+        }
+
+        #[test]
+        fn a_cut_or_damaged_file_gives_fewer_facts_and_never_a_panic() {
+            let tmp = std::env::temp_dir().join(format!("sniff-rs-audio-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            for entry in std::fs::read_dir(dir()).unwrap() {
+                let path = entry.unwrap().path();
+                let ext = path.extension().unwrap().to_string_lossy().into_owned();
+                let bytes = std::fs::read(&path).unwrap();
+                let probe = tmp.join(format!("probe.{ext}"));
+                for cut in (0..bytes.len().min(3000)).step_by(7) {
+                    std::fs::write(&probe, &bytes[..cut]).unwrap();
+                    let _ = audio_meta::read(&probe);
+                }
+                // Flip each byte of the head in turn.
+                for at in 0..bytes.len().min(400) {
+                    let mut bad = bytes.clone();
+                    bad[at] = !bad[at];
+                    std::fs::write(&probe, &bad).unwrap();
+                    let _ = audio_meta::read(&probe);
+                }
+            }
+            // A size field that claims far more than the file holds.
+            let mut huge = b"ID3\x04\x00\x00\x7f\x7f\x7f\x7f".to_vec();
+            huge.extend_from_slice(b"TPE1\x7f\x7f\x7f\x7f\x00\x00\x03abc");
+            let probe = tmp.join("huge.mp3");
+            std::fs::write(&probe, &huge).unwrap();
+            assert!(audio_meta::read(&probe).is_empty());
+            std::fs::remove_dir_all(&tmp).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    mod image_hash_tests {
+        use super::image_hash::{hash, plane};
+        use std::path::{Path, PathBuf};
+
+        fn dir() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/edge_graph_images")
+        }
+
+        fn bits(a: u64, b: u64) -> u32 {
+            (a ^ b).count_ones()
+        }
+
+        #[test]
+        fn copies_of_a_picture_hash_within_a_few_bits() {
+            let scene = hash(&dir().join("scene.png")).expect("the scene has detail");
+            // Interlaced and plain PNG decode to the very same pixels.
+            assert_eq!(hash(&dir().join("scene_adam7.png")), Some(scene));
+            let a = plane(&dir().join("scene.png")).unwrap();
+            let b = plane(&dir().join("scene_adam7.png")).unwrap();
+            assert_eq!((a.w, a.h), (192, 144));
+            assert_eq!(a.data, b.data);
+            for name in ["scene_half.png", "scene_q75.jpg", "scene_progressive.jpg"] {
+                let h = hash(&dir().join(name)).unwrap_or_else(|| panic!("{name}"));
+                assert!(bits(scene, h) <= 5, "{name}: {} bits", bits(scene, h));
+            }
+            let other = hash(&dir().join("other.png")).unwrap();
+            assert!(bits(scene, other) >= 16, "{} bits", bits(scene, other));
+        }
+
+        #[test]
+        fn a_jpeg_plane_is_one_value_per_block() {
+            let p = plane(&dir().join("scene_q75.jpg")).unwrap();
+            assert_eq!((p.w, p.h), (24, 18));
+            assert_eq!(p.data.len(), 24 * 18);
+        }
+
+        #[test]
+        fn tiny_and_flat_pictures_have_no_hash() {
+            assert_eq!(hash(&dir().join("icon.png")), None);
+            assert_eq!(hash(&dir().join("flat.png")), None);
+            assert_eq!(hash(&dir().join("no_such_file.png")), None);
+        }
+
+        /// A PNG with a given IDAT payload is built by hand: 8-bit grey, 40x40.
+        fn grey_png(width: u32, height: u32, raw: &[u8]) -> Vec<u8> {
+            fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+                out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                out.extend_from_slice(kind);
+                out.extend_from_slice(data);
+                out.extend_from_slice(&[0, 0, 0, 0]); // CRC (not checked)
+            }
+            let mut ihdr = Vec::new();
+            ihdr.extend_from_slice(&width.to_be_bytes());
+            ihdr.extend_from_slice(&height.to_be_bytes());
+            ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+            // zlib header, one stored deflate block, and an unchecked Adler-32.
+            let mut z = vec![0x78, 0x01, 0x01];
+            z.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+            z.extend_from_slice(&(!(raw.len() as u16)).to_le_bytes());
+            z.extend_from_slice(raw);
+            z.extend_from_slice(&[0, 0, 0, 0]);
+            let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+            chunk(&mut out, b"IHDR", &ihdr);
+            chunk(&mut out, b"IDAT", &z);
+            chunk(&mut out, b"IEND", &[]);
+            out
+        }
+
+        #[test]
+        fn every_png_filter_is_undone() {
+            // A row per filter type 0..4 over a 40-pixel-wide image whose true
+            // pixels are a ramp; each row is stored filtered, and the plane
+            // must come back as the ramp.
+            let w = 40usize;
+            let ramp: Vec<Vec<u8>> = (0..5)
+                .map(|r| (0..w).map(|x| (x * 5 + r * 7) as u8).collect())
+                .collect();
+            let mut raw = Vec::new();
+            let mut prev = vec![0u8; w];
+            for (f, row) in ramp.iter().enumerate() {
+                raw.push(f as u8);
+                for i in 0..w {
+                    let a = if i > 0 { i32::from(row[i - 1]) } else { 0 };
+                    let b = i32::from(prev[i]);
+                    let c = if i > 0 { i32::from(prev[i - 1]) } else { 0 };
+                    let pred = match f {
+                        0 => 0,
+                        1 => a,
+                        2 => b,
+                        3 => (a + b) / 2,
+                        _ => {
+                            let p = a + b - c;
+                            let (pa, pb, pc) = ((p - a).abs(), (p - b).abs(), (p - c).abs());
+                            if pa <= pb && pa <= pc {
+                                a
+                            } else if pb <= pc {
+                                b
+                            } else {
+                                c
+                            }
+                        }
+                    };
+                    raw.push((i32::from(row[i]) - pred) as u8);
+                }
+                prev = row.clone();
+            }
+            // 40 pixels wide, five rows high is under the 32-pixel minimum on
+            // height, so pad to 40 rows with repeats of the last row (filter 0).
+            for _ in 5..40 {
+                raw.push(0);
+                raw.extend_from_slice(&prev);
+            }
+            let path = std::env::temp_dir().join(format!("sniff-rs-ih-{}.png", std::process::id()));
+            std::fs::write(&path, grey_png(40, 40, &raw)).unwrap();
+            let p = plane(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            for (r, row) in ramp.iter().enumerate() {
+                assert_eq!(&p.data[r * w..(r + 1) * w], &row[..], "row {r}");
+            }
+        }
+
+        #[test]
+        fn damaged_pictures_give_nothing_and_never_panic() {
+            let tmp = std::env::temp_dir().join(format!("sniff-rs-ihd-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            for name in [
+                "scene.png",
+                "scene_adam7.png",
+                "scene_q75.jpg",
+                "scene_progressive.jpg",
+            ] {
+                let bytes = std::fs::read(dir().join(name)).unwrap();
+                let ext = name.rsplit('.').next().unwrap();
+                let probe = tmp.join(format!("probe.{ext}"));
+                for cut in (0..bytes.len()).step_by(bytes.len() / 150 + 1) {
+                    std::fs::write(&probe, &bytes[..cut]).unwrap();
+                    let _ = hash(&probe);
+                }
+                for at in (0..bytes.len().min(2000)).step_by(3) {
+                    let mut bad = bytes.clone();
+                    bad[at] = !bad[at];
+                    std::fs::write(&probe, &bad).unwrap();
+                    let _ = hash(&probe);
+                }
+            }
+            std::fs::remove_dir_all(&tmp).unwrap();
+        }
+    }
+
+    #[cfg(test)]
     mod version_tests {
         use super::*;
 
@@ -132673,6 +134966,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 sheet_refs: Vec::new(),
                 changes_with: Vec::new(),
                 mtime: 0,
+                image_hash: None,
             }
         }
 
@@ -132802,12 +135096,15 @@ USAGE:
                    INSERT INTO, CREATE TABLE); a path or table that no
                    input file has but two code files name becomes a
                    path: or table: node between them
-      similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED)
+      similar_to   files whose wording overlaps (TF-IDF cosine, INFERRED);
+                   Chinese, Japanese, Korean, Thai and other scripts written
+                   without spaces are read as overlapping character pairs
       same_name    files sharing a name stem (report.pdf / report.docx)
       duplicate_of byte-identical files (EXTRACTED, found by content hash)
-      metadata     an author, organization or camera two or more files
-                   name in their own properties: a PDF's or office
-                   document's, or a photo's EXIF and XMP (INFERRED)
+      metadata     an author, organization, camera, artist, composer or
+                   album two or more files name in their own properties: a
+                   PDF's or office document's, a photo's EXIF and XMP, or
+                   an audio file's ID3, MP4 or Vorbis tags (INFERRED)
       in_folder    with --folders: a file and the folder it is kept in
       involves     with --people: a mailbox, address book or calendar
                    to a person it names, with their role (sender,
@@ -132824,6 +135121,10 @@ USAGE:
                    reads (per statement for SQL, per script otherwise; a
                    dbt model to the models and sources it names);
                    directed, INFERRED
+      looks_like   two pictures (PNG or JPEG) that look alike - the same
+                   picture resized, recompressed or saved again; found by
+                   a perceptual hash, never for byte-identical copies
+                   (those are duplicate_of)
       version_of   a file to the older one of its series (budget_v2 ->
                    budget_v1, report_2024-03 -> report_2024-02, plan ->
                    plan_draft); directed, newer to older
@@ -132921,6 +135222,13 @@ OPTIONS:
                                 or mysql://... (or postgres:name,
                                 mysql:name); runs psql or mysql, reads
                                 the catalog only, never the data
+        --unlinked-report       Also write unlinked.json: each file that
+                                shares nothing with any other, why, the
+                                words, identifiers and columns in it,
+                                files that share a few words with it, and
+                                a link to fill in (for --links or
+                                graph merge). With OUTPUT_DIR "-" use
+                                --output-format unlinked
         --columns               Add a node for each column that tables
                                 share or a query uses, so "which tables
                                 hold customer_id" and "which columns
@@ -133020,6 +135328,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
     let mut columns: Option<bool> = None;
     let mut people: Option<bool> = None;
     let mut git: Option<bool> = None;
+    let mut unlinked_report = false;
     let mut databases: Vec<String> = Vec::new();
     let mut resolution: Option<f64> = None;
     let mut config_arg: Option<PathBuf> = None;
@@ -133100,6 +135409,12 @@ fn run_graph(raw: &[String]) -> Result<()> {
                     }
                     git = Some(true);
                 }
+                "unlinked-report" => {
+                    if inline_value.is_some() {
+                        bail!("--unlinked-report takes no value");
+                    }
+                    unlinked_report = true;
+                }
                 "db" => databases.push(value(&mut i)?),
                 "resolution" => {
                     let v = value(&mut i)?;
@@ -133176,15 +135491,20 @@ fn run_graph(raw: &[String]) -> Result<()> {
     }
     // With OUTPUT_DIR "-": json, md, or one of the export formats.
     let mut stdout_export: Option<String> = None;
+    let mut stdout_unlinked = false;
     let stdout_format = match output_format.as_deref().map(str::to_lowercase).as_deref() {
         None | Some("json") => GraphFormat::Json,
         Some("md") | Some("markdown") => GraphFormat::Md,
+        Some("unlinked") => {
+            stdout_unlinked = true;
+            GraphFormat::Json
+        }
         Some(other) if knowledge_graph::EXPORT_FORMATS.contains(&other) => {
             stdout_export = Some(other.to_string());
             GraphFormat::Json
         }
         Some(other) => bail!(
-            "unrecognized --output-format '{other}' (expected json, md, {})",
+            "unrecognized --output-format '{other}' (expected json, md, unlinked, {})",
             knowledge_graph::EXPORT_FORMATS.join(", ")
         ),
     };
@@ -133262,6 +135582,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
             columns,
             people,
             overrides,
+            unlinked_report: unlinked_report || stdout_unlinked,
         },
     )?;
     let summary = format!(
@@ -133277,6 +135598,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
 
     if to_stdout {
         let rendered = match (&stdout_export, stdout_format) {
+            _ if stdout_unlinked => knowledge_graph::render_unlinked(&kg),
             (Some(kind), _) => knowledge_graph::render_export(&kg, kind)?,
             (None, GraphFormat::Json) => {
                 json_support::to_pretty_string(&knowledge_graph::to_json(&kg))
@@ -133308,6 +135630,15 @@ fn run_graph(raw: &[String]) -> Result<()> {
     fs::write(&report_path, knowledge_graph::render_report(&kg))
         .with_context(|| format!("failed to write {report_path:?}"))?;
     let mut status = format!("{summary} -> {}", dir.display());
+    if unlinked_report {
+        let path = dir.join("unlinked.json");
+        fs::write(&path, knowledge_graph::render_unlinked(&kg))
+            .with_context(|| format!("failed to write {path:?}"))?;
+        status.push_str(&format!(
+            " ({} unlinked file(s) in unlinked.json)",
+            kg.unlinked.len()
+        ));
+    }
     for kind in &exports {
         let path = dir.join(knowledge_graph::export_file_name(kind));
         fs::write(&path, knowledge_graph::render_export(&kg, kind)?)
@@ -133521,6 +135852,7 @@ fn load_knowledge_graph_input(
                 columns: cfg.columns.unwrap_or(false),
                 people: cfg.people.unwrap_or(false) || cfg.git.unwrap_or(false),
                 overrides: std::mem::take(&mut cfg.overrides),
+                unlinked_report: false,
             },
         )?));
     }

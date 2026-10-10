@@ -18930,6 +18930,79 @@ an input it does not use. `version_of` reads names only (not a document's own
 sketches (a graph run) and 3 or more shared columns; a sheet or JSON export
 with renamed columns is not found.
 
+### Phase 7: reading more of what a file is (words in CJK, audio tags, look-alike pictures, the unlinked report)
+
+- **Scripts written without spaces.** `scan_chunk_terms` cuts a run of Han,
+  kana, Hangul, Thai, Lao, Myanmar or Khmer into overlapping pairs of
+  characters (`spaceless_script`), which are the terms of `similar_to`; a lone
+  character is no term, punctuation and other scripts end a run, and a Latin
+  word next to a run is still a word. The 256-byte "no whitespace means blob"
+  rule no longer applies to text in these scripts (a Chinese paragraph is one
+  run). Checked by `tools/gen_cjk_vectors.py` (600 texts, the script of each
+  character taken from its Unicode *name*, not from the ranges the code uses;
+  each range edge was mutated and the test fails) and by `tools/check_cjk.py`:
+  four topics in four languages, related documents found by `similar_to`,
+  none across topics. Chinese and Japanese were 0 of 40 linked before; now 37
+  and 40. Korean and Thai went from 19 and 0 of 40 to 40 and 40.
+- **Audio tags** (`audio_meta`): ID3v1, and v2.2, v2.3, v2.4 (unsynchronised
+  tags and frames, extended headers, the four text encodings, several
+  NUL-separated values), MP4 `moov/udta/meta/ilst`, Vorbis comments in FLAC,
+  Ogg Vorbis and Ogg Opus (packets across pages), an ID3 tag in front of a
+  FLAC. Read: artist and album artist (both `artist`), composer, album (as
+  `Album - Artist`, so two records called "Greatest Hits" are two albums).
+  ID3v1 fills only what v2 left empty, as mutagen does. These become `metadata`
+  links; the cap on how many files may share a fact is 500 for music (12 for
+  authors), since an album holds many tracks. Checked against mutagen on 400
+  files in five containers with random Unicode tags, written by mutagen and by
+  hand (`tools/check_audio.py`: every fact equal); fuzzed truncations and bit
+  flips in a debug build.
+- **Look-alike pictures** (`image_hash`, relation `looks_like`). A 64-bit
+  difference hash of nine by eight cells of average brightness. PNG: every colour
+  type and bit depth, Adam7, streamed row by row through the DEFLATE decoder
+  already used for gzip. JPEG: baseline, extended and progressive, any
+  subsampling, restart intervals, grey; only the DC coefficient of each luma
+  block is used (an eighth-size picture), so the AC symbols are read to be
+  skipped and never transformed; progressive DC refinement scans are applied.
+  Not hashed: under 32 pixels (PNG) or 72x64 (JPEG), flat pictures (cells
+  differing by less than 8 levels, or fewer than 8 or more than 56 bits set),
+  over 400 megapixels, arithmetic-coded, 12-bit, lossless, CMYK and RGB JPEG,
+  and anything that is not PNG or JPEG. Pairs within 5 bits are linked
+  (INFERRED), each picture to its five closest, found through nine 7-bit bands
+  (a pair within eight bits shares a band). Byte-identical copies are left to
+  `duplicate_of`. The threshold came from the distances of 120 synthetic
+  pictures and their copies: 4 bits gave no false pair, 6 gave 33, 8 gave 257;
+  `imagehash.dhash` at 5 bits gives 50 wrong pairs where this gives 8 on the
+  same 480 images. Rotated, mirrored and cropped copies are not found, and an
+  EXIF orientation is not applied. Checked by `tools/check_images.py`: PNG
+  planes from pypng equal exactly (150 files in every mode), JPEG block means
+  within 0.75 of Pillow's luma (150 files), and the linking rule checked pair
+  by pair against the hashes.
+- **`--unlinked-report`** writes `unlinked.json` next to `graph.json` (or
+  `--output-format unlinked` with output `-`): each file that nothing links to
+  but structure, with why (could not be read; binary; no text layer; text that
+  did not decode; nothing shared), its top words, identifiers and columns,
+  up to five other files that share at least two words below the similarity
+  bar, and an empty `link_template` shaped as `--links` reads it. The loop is
+  report, an agent or a person fills in `target`, `label`, `evidence` and
+  `by`, then `--links FILE` or `graph merge` adds the links, and the file is
+  no longer unlinked. `tools/check_unlinked.py` checks the set against the
+  graph, the candidates against the bar, and closes the loop (161 files, 81
+  with candidates, all linked after the second run).
+
+**Fixtures.** `tests/fixtures/edge_graph_audio` (9 tracks, made by
+`tools/make_audio_fixtures.py`) and `edge_graph_images` (made by
+`tools/make_image_fixtures.py`: a picture, its JPEG, progressive, half-size,
+interlaced and byte-identical copies, a different picture, an icon and a flat
+one), `cjk_bigram_vectors.jsonl`. Graph cache format 7. Corpus run: 57 PNG/JPEG
+files, 4 links, 0.8 s slower of 24 s, same memory; no other link changed.
+
+**Disclosed.** CJK pairs are not words (no dictionary segmentation, so a pair
+across a word boundary is also a term, which IDF weighs down); Thai and the
+others share the rule. Audio: WMA, AIFF and WAV tags, APE, and chapter or
+lyrics frames are not read; track, year and genre are left out on purpose.
+Pictures: see above. `--unlinked-report` is a flag only (not in the config
+file).
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

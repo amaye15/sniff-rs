@@ -7,6 +7,18 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph` reads more of what files are: `looks_like` links two
+  PNG or JPEG pictures that are the same picture resized, recompressed or saved
+  again (a 64-bit perceptual hash; a PNG is decoded in full in any colour type
+  and bit depth, interlaced or not, a JPEG only as far as its DC coefficients,
+  baseline or progressive), the artist, composer and album in the tags of MP3
+  (ID3v1, v2.2, v2.3, v2.4), M4A, FLAC, Ogg Vorbis and Opus files become
+  `metadata` links, and Chinese, Japanese, Korean, Thai and other scripts
+  written without spaces now count in `similar_to` (character pairs; a long
+  paragraph with no spaces is text, not a blob). `--unlinked-report` writes
+  `unlinked.json` for the files nothing links to: why, what is in them, the
+  files that come close, and a link to fill in for `--links` or `graph merge`.
+  Checked against Pillow, pypng, mutagen, `imagehash` and ffmpeg-made files.
 - `sniff-rs graph` lineage: `derived_from` (what a script or SQL statement
   writes, to what it reads; per statement for SQL, per script for Python and
   the other languages; a dbt model to the models and sources it names),

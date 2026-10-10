@@ -20736,3 +20736,154 @@ fn graph_links_a_csv_to_the_database_table_its_values_come_from() {
                 && l["source"] == "exports/other_tickets.csv")
     );
 }
+
+#[test]
+fn graph_links_tracks_by_the_artist_and_album_in_their_tags() {
+    let dir = format!(
+        "{}/tests/fixtures/edge_graph_audio",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let doc = graph_doc(&["graph", &dir, "-", "--no-cache"]);
+    let sigur = [
+        "sigur_01.mp3",
+        "sigur_02.mp3",
+        "sigur_03.mp3",
+        "sigur_04.flac",
+        "sigur_05.ogg",
+    ];
+    let radiohead = ["radiohead_01.m4a", "radiohead_02.opus", "radiohead_03.mp3"];
+    for (entity, tracks) in [
+        ("artist:sigur rós", &sigur[..]),
+        ("album:ágætis byrjun - sigur rós", &sigur[..]),
+        ("artist:radiohead", &radiohead[..]),
+        ("album:kid a - radiohead", &radiohead[..]),
+    ] {
+        for t in tracks {
+            assert!(
+                link_of(&doc, "metadata", t, entity).is_some(),
+                "{t} -> {entity}"
+            );
+        }
+    }
+    // A track that shares its artist and album with nobody has no entity.
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "metadata" && l["source"] == "alone.mp3")
+    );
+}
+
+#[test]
+fn graph_unlinked_report_lists_what_nothing_links_to_and_how_to_link_it() {
+    let dir = format!(
+        "{}/tests/fixtures/edge_knowledge_graph",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    // To stdout.
+    let doc = graph_doc(&[
+        "graph",
+        &dir,
+        "-",
+        "--no-cache",
+        "--output-format",
+        "unlinked",
+    ]);
+    assert_eq!(doc["version"], 1);
+    let files = doc["files"].as_array().unwrap();
+    assert_eq!(doc["count"], files.len());
+    let recipes = files
+        .iter()
+        .find(|f| f["id"] == "lectures/recipes.txt")
+        .expect("recipes.txt shares nothing with the other files");
+    assert!(
+        recipes["terms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "butter")
+    );
+    assert!(
+        recipes["why"]
+            .as_str()
+            .unwrap()
+            .contains("nothing shared with any other file")
+    );
+    // The template is a link as --links reads it, with the target left to fill in.
+    assert_eq!(recipes["link_template"]["source"], "lectures/recipes.txt");
+    assert_eq!(recipes["link_template"]["target"], "");
+    assert_eq!(recipes["link_template"]["relation"], "related_to");
+    // To a directory, beside graph.json.
+    let out = std::env::temp_dir().join(format!("sniff-rs-unlinked-{}", std::process::id()));
+    let run = run_graph(&[
+        "graph",
+        &dir,
+        out.to_str().unwrap(),
+        "--no-cache",
+        "--unlinked-report",
+    ]);
+    assert!(run.status.success());
+    assert!(out.join("graph.json").exists());
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("unlinked.json")).unwrap()).unwrap();
+    assert_eq!(written, doc);
+    assert!(
+        String::from_utf8_lossy(&std::fs::read(out.join("GRAPH_REPORT.md")).unwrap())
+            .contains("--unlinked-report")
+    );
+    std::fs::remove_dir_all(&out).unwrap();
+    // Without the flag there is no such file, and a value is refused.
+    let plain = run_graph(&["graph", &dir, "-", "--no-cache", "--unlinked-report=yes"]);
+    assert!(!plain.status.success());
+}
+
+#[test]
+fn graph_links_pictures_that_look_alike_but_not_identical_copies() {
+    let dir = format!(
+        "{}/tests/fixtures/edge_graph_images",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let doc = graph_doc(&["graph", &dir, "-", "--no-cache"]);
+    let looks: Vec<(&str, &str)> = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["relation"] == "looks_like")
+        .map(|l| (l["source"].as_str().unwrap(), l["target"].as_str().unwrap()))
+        .collect();
+    let linked = |a: &str, b: &str| {
+        looks
+            .iter()
+            .any(|&(x, y)| (x == a && y == b) || (x == b && y == a))
+    };
+    // The copies join into one group: each is linked to another of them.
+    let family = [
+        "scene.png",
+        "scene_adam7.png",
+        "scene_half.png",
+        "scene_q75.jpg",
+        "scene_progressive.jpg",
+    ];
+    for f in family {
+        assert!(
+            family.iter().any(|g| *g != f && linked(f, g)),
+            "{f} is linked to none of its copies: {looks:?}"
+        );
+    }
+    // A different picture, a too-small one and a flat one are linked to nothing.
+    for f in ["other.png", "icon.png", "flat.png"] {
+        assert!(
+            !looks.iter().any(|&(x, y)| x == f || y == f),
+            "{f} should have no looks_like link: {looks:?}"
+        );
+    }
+    // The byte-identical copy is a duplicate, said once, not twice.
+    assert!(doc["links"].as_array().unwrap().iter().any(|l| {
+        l["relation"] == "duplicate_of"
+            && [l["source"].as_str().unwrap(), l["target"].as_str().unwrap()]
+                .iter()
+                .all(|n| *n == "scene.png" || *n == "scene_copy.png")
+    }));
+    assert!(!linked("scene.png", "scene_copy.png"));
+}
