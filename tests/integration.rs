@@ -20627,3 +20627,112 @@ fn graph_git_outside_a_repository_is_an_error_and_so_is_a_bad_database() {
         );
     }
 }
+
+fn lineage_fixture() -> String {
+    format!(
+        "{}/tests/fixtures/edge_graph_lineage",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+#[test]
+fn graph_links_derived_tables_versions_and_schema_only_exports() {
+    let doc = graph_doc(&["graph", &lineage_fixture(), "-", "--no-cache"]);
+    // SQL: what a statement writes comes from what that statement reads.
+    for (from, to) in [
+        ("table:clean_orders", "raw_orders.csv"),
+        ("table:clean_orders", "customers.csv"),
+        ("table:region_totals", "table:clean_orders"),
+    ] {
+        let l = link_of(&doc, "derived_from", from, to).unwrap_or_else(|| panic!("{from} -> {to}"));
+        assert_eq!(l["directed"], true);
+    }
+    // dbt: a model is made from the models and sources it names.
+    assert!(
+        link_of(
+            &doc,
+            "derived_from",
+            "models/stg_orders.sql",
+            "raw_orders.csv"
+        )
+        .is_some()
+    );
+    assert!(
+        link_of(
+            &doc,
+            "derived_from",
+            "models/orders_by_customer.sql",
+            "models/stg_orders.sql"
+        )
+        .is_some()
+    );
+    // Nothing reads the other way, and the report only reads.
+    assert!(link_of(&doc, "derived_from", "raw_orders.csv", "table:clean_orders").is_none());
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "derived_from" && l["source"] == "report.sql")
+    );
+    // Versions: newer to older, by number, then by date, then by marks; the
+    // numbered and the dated names of one base are separate series.
+    for (new, old, conf) in [
+        ("notes/log_v10.txt", "notes/log_v2.txt", "EXTRACTED"),
+        (
+            "notes/log_2024-02-10.txt",
+            "notes/log_2024-01-05.txt",
+            "EXTRACTED",
+        ),
+        ("notes/plan.md", "notes/plan_draft.md", "INFERRED"),
+        ("notes/plan_final.md", "notes/plan.md", "INFERRED"),
+    ] {
+        let l = link_of(&doc, "version_of", new, old).unwrap_or_else(|| panic!("{new} -> {old}"));
+        assert_eq!(l["confidence"], conf, "{new}");
+    }
+    let versions = doc["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["relation"] == "version_of")
+        .count();
+    assert_eq!(
+        versions, 4,
+        "part_1/part_2 and the cross-scheme pair are not versions"
+    );
+    // A schema with no values: a CSV is an export only if it is named for the table.
+    let l = link_of(&doc, "exported_from", "audit_log.csv", "archive_schema.sql")
+        .expect("audit_log.csv is named for the table");
+    assert_eq!(l["confidence"], "INFERRED");
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "exported_from" && l["source"] == "misc.csv")
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn graph_links_a_csv_to_the_database_table_its_values_come_from() {
+    let doc = graph_doc(&["graph", &lineage_fixture(), "-", "--no-cache"]);
+    let l = link_of(&doc, "exported_from", "exports/tickets_2024.csv", "shop.db")
+        .expect("the export is found by its values");
+    assert!(
+        l["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("values"))
+    );
+    // Same columns, unrelated values: not an export.
+    assert!(
+        !doc["links"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["relation"] == "exported_from"
+                && l["source"] == "exports/other_tickets.csv")
+    );
+}

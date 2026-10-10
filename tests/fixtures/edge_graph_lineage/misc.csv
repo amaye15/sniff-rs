@@ -1,0 +1,4 @@
+event_id,actor,action,at,detail
+1,ann,login,2024-01-02 10:00:00,ok
+2,bo,logout,2024-01-02 11:00:00,ok
+3,cy,login,2024-01-03 09:30:00,failed

@@ -112521,6 +112521,14 @@ mod code_facts {
         pub(crate) write: bool,
         /// `sql`, `dbt ref` or `dbt source`.
         pub(crate) origin: String,
+        /// Which statement of the script (counting `;`), so what one
+        /// statement reads and writes can be told from the next one's.
+        pub(crate) statement: u32,
+        /// Whether the statement creates or fills the table it writes
+        /// (CREATE, INSERT, MERGE, SELECT INTO), which makes it derived
+        /// from what the statement reads; an UPDATE, DELETE or DROP does
+        /// not.
+        pub(crate) fills: bool,
     }
 
     const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -113938,11 +113946,15 @@ mod code_facts {
                         table: (*name).to_string(),
                         write: false,
                         origin: "dbt ref".to_string(),
+                        statement: 0,
+                        fills: false,
                     }),
                     ("source", [schema, table]) => refs.push(SqlRef {
                         table: format!("{schema}.{table}"),
                         write: false,
                         origin: "dbt source".to_string(),
+                        statement: 0,
+                        fills: false,
                     }),
                     _ => {}
                 }
@@ -114160,7 +114172,13 @@ mod code_facts {
         Some((parts.join("."), i))
     }
 
-    fn add_sql_ref(refs: &mut Vec<SqlRef>, ctes: &[String], name: String, write: bool) {
+    fn add_sql_ref(
+        refs: &mut Vec<SqlRef>,
+        ctes: &[String],
+        name: String,
+        write: bool,
+        statement: u32,
+    ) {
         let lower = name.to_ascii_lowercase();
         if name == "__jinja__" || ctes.contains(&lower) || refs.len() >= MAX_FACTS {
             return;
@@ -114169,6 +114187,8 @@ mod code_facts {
             table: name,
             write,
             origin: "sql".to_string(),
+            statement,
+            fills: false,
         };
         if !refs.contains(&r) {
             refs.push(r);
@@ -114185,6 +114205,8 @@ mod code_facts {
         };
         let t = sql_lex(&cleaned);
         let mut ctes: Vec<String> = Vec::new();
+        let mut statement: u32 = 0;
+        let mut statement_start = 0usize;
         // One scope per open paren (the first is the top level): the
         // function name before it, for `EXTRACT(x FROM y)`, and whether a
         // FROM clause is open in it, so a comma starts the next table.
@@ -114207,7 +114229,10 @@ mod code_facts {
                     scopes.truncate(1);
                     scopes[0].1 = false;
                     delete_pending = false;
+                    mark_fills(&t[statement_start..i], &mut refs, statement);
+                    statement = statement.saturating_add(1);
                     i += 1;
+                    statement_start = i;
                     continue;
                 }
                 SqlTok::Punct(b'(') => {
@@ -114224,7 +114249,7 @@ mod code_facts {
                         && sql_table_name(&t, i + 1)
                             .is_some_and(|(_, next)| t.get(next) != Some(&SqlTok::Punct(b'(')));
                     if table_list && let Some((name, _)) = sql_table_name(&t, i + 1) {
-                        add_sql_ref(&mut refs, &ctes, name, false);
+                        add_sql_ref(&mut refs, &ctes, name, false, statement);
                     }
                     scopes.push((func, table_list));
                     i += 1;
@@ -114242,7 +114267,7 @@ mod code_facts {
                         && let Some((name, next)) = sql_table_name(&t, i + 1)
                         && t.get(next) != Some(&SqlTok::Punct(b'('))
                     {
-                        add_sql_ref(&mut refs, &ctes, name, false);
+                        add_sql_ref(&mut refs, &ctes, name, false, statement);
                     }
                     i += 1;
                     continue;
@@ -114323,7 +114348,7 @@ mod code_facts {
                                 if let Some((name, next)) = sql_table_name(&t, i + 1)
                                     && t.get(next) != Some(&SqlTok::Punct(b'('))
                                 {
-                                    add_sql_ref(&mut refs, &ctes, name, write);
+                                    add_sql_ref(&mut refs, &ctes, name, write, statement);
                                 }
                             }
                         }
@@ -114333,7 +114358,7 @@ mod code_facts {
                                 j += 1;
                             }
                             if let Some((name, _)) = sql_table_name(&t, j) {
-                                add_sql_ref(&mut refs, &ctes, name, true);
+                                add_sql_ref(&mut refs, &ctes, name, true, statement);
                             }
                         }
                         "update" => {
@@ -114346,7 +114371,7 @@ mod code_facts {
                                     j += 1;
                                 }
                                 if let Some((name, _)) = sql_table_name(&t, j) {
-                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                    add_sql_ref(&mut refs, &ctes, name, true, statement);
                                 }
                             }
                         }
@@ -114372,7 +114397,7 @@ mod code_facts {
                                 if !word_is(prev, "into")
                                     && let Some((name, _)) = sql_table_name(&t, j)
                                 {
-                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                    add_sql_ref(&mut refs, &ctes, name, true, statement);
                                 }
                             }
                         }
@@ -114415,7 +114440,7 @@ mod code_facts {
                                     }
                                 }
                                 if let Some((name, _)) = sql_table_name(&t, j) {
-                                    add_sql_ref(&mut refs, &ctes, name, true);
+                                    add_sql_ref(&mut refs, &ctes, name, true, statement);
                                 }
                             }
                         }
@@ -114425,7 +114450,7 @@ mod code_facts {
                                 && let Some((name, next)) = sql_table_name(&t, i + 1)
                                 && t.get(next) != Some(&SqlTok::Punct(b'('))
                             {
-                                add_sql_ref(&mut refs, &ctes, name, false);
+                                add_sql_ref(&mut refs, &ctes, name, false, statement);
                             }
                         }
                         _ => {}
@@ -114435,7 +114460,35 @@ mod code_facts {
             }
             i += 1;
         }
+        mark_fills(&t[statement_start.min(t.len())..], &mut refs, statement);
         refs
+    }
+
+    /// Marks the written tables of statement `statement` as filled when the
+    /// statement creates or fills a table: its words include CREATE,
+    /// INSERT, MERGE or REPLACE, or it is a SELECT ... INTO.
+    fn mark_fills(tokens: &[SqlTok], refs: &mut [SqlRef], statement: u32) {
+        let words: Vec<String> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                SqlTok::Word(w) => Some(w.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let has = |w: &str| words.iter().any(|x| x == w);
+        let fills = has("create")
+            || has("insert")
+            || has("merge")
+            || has("replace")
+            || (has("select") && has("into"));
+        if !fills {
+            return;
+        }
+        for r in refs.iter_mut() {
+            if r.statement == statement && r.write {
+                r.fills = true;
+            }
+        }
     }
 
     /// Words in SQL that are not keywords or functions of the kind a column
@@ -119050,6 +119103,9 @@ mod knowledge_graph {
         /// cached, as it depends on the repository, not on this file):
         /// (other file, commits both are in, this file's, the other's).
         pub(crate) changes_with: Vec<(String, u32, u32, u32)>,
+        /// When the file was last modified, in seconds since the epoch
+        /// (0 when unknown): the last resort for ordering versions.
+        pub(crate) mtime: u64,
     }
 
     pub(crate) struct CollectOptions {
@@ -119242,6 +119298,7 @@ mod knowledge_graph {
             people: Vec::new(),
             sheet_refs: Vec::new(),
             changes_with: Vec::new(),
+            mtime: 0,
         }
     }
 
@@ -119308,7 +119365,7 @@ mod knowledge_graph {
 
     /// The cache's own format version; bumped when an entry's shape
     /// changes.
-    const CACHE_FORMAT: u64 = 5;
+    const CACHE_FORMAT: u64 = 6;
 
     fn display_rel(root: &Path, path: &Path) -> String {
         if root.as_os_str().is_empty() {
@@ -119840,6 +119897,9 @@ mod knowledge_graph {
                 ),
             );
         }
+        if f.mtime != 0 {
+            o.insert("mtime".to_string(), JsonValue::from(f.mtime));
+        }
         if !f.sheet_refs.is_empty() {
             o.insert(
                 "sheet_refs".to_string(),
@@ -119949,6 +120009,8 @@ mod knowledge_graph {
                             JsonValue::from(r.table.clone()),
                             JsonValue::from(r.write),
                             JsonValue::from(r.origin.clone()),
+                            JsonValue::from(u64::from(r.statement)),
+                            JsonValue::from(r.fills),
                         ])
                     })
                     .collect(),
@@ -119994,6 +120056,8 @@ mod knowledge_graph {
                 table: r.first()?.as_str()?.to_string(),
                 write: r.get(1)?.as_bool()?,
                 origin: r.get(2)?.as_str()?.to_string(),
+                statement: u32::try_from(r.get(3)?.as_u64()?).ok()?,
+                fills: r.get(4)?.as_bool()?,
             });
         }
         if let Some(cols) = v.get("columns") {
@@ -120083,6 +120147,7 @@ mod knowledge_graph {
                 Some(p) => sheet_refs_from_json(p)?,
             },
             changes_with: Vec::new(),
+            mtime: v.get("mtime").and_then(|m| m.as_u64()).unwrap_or(0),
         })
     }
 
@@ -120135,6 +120200,7 @@ mod knowledge_graph {
         known: &Arc<KnownFiles>,
     ) -> KgFile {
         let mut file = read_one_inner(root, path, opts, known);
+        file.mtime = mtime_ns(path).map_or(0, |ns| ns / 1_000_000_000);
         let ext = extension_of(&file.name);
         if file.kind != FileKind::Failed {
             file.meta = file_metadata(path, &ext);
@@ -120772,6 +120838,7 @@ mod knowledge_graph {
             people: Vec::new(),
             sheet_refs: Vec::new(),
             changes_with: Vec::new(),
+            mtime: 0,
         };
         let (read_path, logical_path, _decompressed) = match decompress_for_walk(path) {
             Ok(Some(paths)) => paths,
@@ -122492,10 +122559,17 @@ mod knowledge_graph {
         MemberOf,
         /// Two files that change in the same commits (`--git`).
         ChangesWith,
+        /// A file or table to the older version of it, as the names say.
+        VersionOf,
+        /// A file or table to what it was made from: what a script that
+        /// writes it also reads.
+        DerivedFrom,
+        /// A file to the database table it is an export of.
+        ExportedFrom,
     }
 
     impl Relation {
-        pub(crate) const ALL: [Relation; 25] = [
+        pub(crate) const ALL: [Relation; 28] = [
             Relation::Contains,
             Relation::HasSchema,
             Relation::Joins,
@@ -122521,6 +122595,9 @@ mod knowledge_graph {
             Relation::SamePerson,
             Relation::MemberOf,
             Relation::ChangesWith,
+            Relation::VersionOf,
+            Relation::DerivedFrom,
+            Relation::ExportedFrom,
         ];
 
         pub(crate) fn as_str(self) -> &'static str {
@@ -122550,6 +122627,9 @@ mod knowledge_graph {
                 Relation::SamePerson => "same_person",
                 Relation::MemberOf => "member_of",
                 Relation::ChangesWith => "changes_with",
+                Relation::VersionOf => "version_of",
+                Relation::DerivedFrom => "derived_from",
+                Relation::ExportedFrom => "exported_from",
             }
         }
 
@@ -123008,6 +123088,7 @@ mod knowledge_graph {
         link_sheet_refs(&mut b, &files, &file_node, &table_nodes);
         link_changes_with(&mut b, &files, &file_node);
         link_same_names(&mut b, &files, &file_node);
+        link_versions(&mut b, &files, &file_node);
         link_duplicates(&mut b, &files, &file_node);
         link_metadata(&mut b, &files, &file_node);
         if opts.folders {
@@ -123018,6 +123099,7 @@ mod knowledge_graph {
         }
         let doc_terms = link_similar(&mut b, &files, &contents, &file_node);
         let column_ctx = link_schemas_and_joins(&mut b, &files, &table_nodes);
+        link_exports(&mut b, &files, &table_nodes);
         if opts.columns {
             link_columns(&mut b, &files, &file_node, &column_ctx, &code_links);
         }
@@ -123707,9 +123789,13 @@ mod knowledge_graph {
         // and no input file is: (key) -> (label, [(file, write, evidence)]).
         type Phantom = (String, Vec<(usize, bool, String)>);
         let mut phantoms: BTreeMap<(&'static str, String), Phantom> = BTreeMap::new();
+        // What each code file reads and writes, by statement (group 0 is a
+        // whole file's file accesses), for `derived_from`.
+        let mut all_flows: Vec<(usize, Vec<Flow>)> = Vec::new();
 
         for (fi, f) in files.iter().enumerate() {
             let Some(code) = &f.code else { continue };
+            let mut flows: Vec<Flow> = Vec::new();
             // (target node, relation) -> (confidence, evidence), in order.
             let mut edges: BTreeMap<(usize, Relation), (Conf, Vec<String>)> = BTreeMap::new();
             let note = |edges: &mut BTreeMap<(usize, Relation), (Conf, Vec<String>)>,
@@ -123767,12 +123853,22 @@ mod knowledge_graph {
                         for t in targets {
                             typed.insert((fi, t));
                             note(&mut edges, file_node[t], rel, conf, ev.clone());
+                            flows.push(Flow {
+                                group: 0,
+                                write: acc.write,
+                                end: FlowEnd::Node(file_node[t]),
+                            });
                         }
                     }
                     None => {
                         if let Some(key) = clean_code_path(&acc.path)
                             && code_facts::known_extension(&key)
                         {
+                            flows.push(Flow {
+                                group: 0,
+                                write: acc.write,
+                                end: FlowEnd::Phantom(format!("path:{}", key.to_lowercase())),
+                            });
                             let label = key.rsplit('/').next().unwrap_or(&key).to_string();
                             phantoms
                                 .entry(("path", key.to_lowercase()))
@@ -123814,6 +123910,17 @@ mod knowledge_graph {
                         for m in ms.into_iter().take(5) {
                             typed.insert((fi, m));
                             note(&mut edges, file_node[m], rel, conf, ev.clone());
+                            flows.push(Flow {
+                                group: r.statement + 1,
+                                write: false,
+                                end: FlowEnd::Node(file_node[m]),
+                            });
+                            // A dbt model is the table it selects into.
+                            flows.push(Flow {
+                                group: r.statement + 1,
+                                write: true,
+                                end: FlowEnd::Node(file_node[fi]),
+                            });
                         }
                         continue;
                     }
@@ -123837,10 +123944,38 @@ mod knowledge_graph {
                                 u.push((tfi, ti));
                             }
                             note(&mut edges, node, rel, conf, ev.clone());
+                            if !r.write || r.fills {
+                                flows.push(Flow {
+                                    group: r.statement + 1,
+                                    write: r.write,
+                                    end: FlowEnd::Node(node),
+                                });
+                            }
+                            if r.origin.starts_with("dbt") {
+                                flows.push(Flow {
+                                    group: r.statement + 1,
+                                    write: true,
+                                    end: FlowEnd::Node(file_node[fi]),
+                                });
+                            }
                         }
                     }
                     Some(_) => {}
                     None => {
+                        if !r.write || r.fills {
+                            flows.push(Flow {
+                                group: r.statement + 1,
+                                write: r.write,
+                                end: FlowEnd::Phantom(format!("table:{lower}")),
+                            });
+                        }
+                        if r.origin.starts_with("dbt") {
+                            flows.push(Flow {
+                                group: r.statement + 1,
+                                write: true,
+                                end: FlowEnd::Node(file_node[fi]),
+                            });
+                        }
                         phantoms
                             .entry(("table", lower.clone()))
                             .or_insert_with(|| (r.table.clone(), Vec::new()))
@@ -123852,6 +123987,9 @@ mod knowledge_graph {
 
             for ((node, rel), (conf, evidence)) in edges {
                 add_directed(b, file_node[fi], node, rel, conf, evidence);
+            }
+            if !flows.is_empty() {
+                all_flows.push((fi, flows));
             }
         }
 
@@ -123889,7 +124027,87 @@ mod knowledge_graph {
                 add_directed(b, file_node[fi], node, rel, Conf::Inferred, evidence);
             }
         }
+        link_derived_from(b, files, file_node, &all_flows);
         CodeLinks { typed, used }
+    }
+
+    /// One thing a piece of code reads or writes, as a node.
+    struct Flow {
+        /// Which statement (`1 +` its index) or 0 for the whole file.
+        group: u32,
+        write: bool,
+        end: FlowEnd,
+    }
+
+    enum FlowEnd {
+        Node(usize),
+        /// A path or table no input file has: its phantom node's id, which
+        /// exists only if two code files name it.
+        Phantom(String),
+    }
+
+    /// Most pairs one statement or script contributes.
+    const MAX_DERIVED_PER_GROUP: usize = 12;
+
+    /// `derived_from`: what a script or statement writes was made from what
+    /// it reads. Within one statement for SQL, within the file for the
+    /// calls of other languages. A dbt model is derived from the models and
+    /// sources it refs. INFERRED: the code need not use every input for
+    /// every output.
+    fn link_derived_from(
+        b: &mut Builder,
+        files: &[KgFile],
+        file_node: &[usize],
+        all_flows: &[(usize, Vec<Flow>)],
+    ) {
+        let mut found: BTreeMap<(usize, usize), Vec<String>> = BTreeMap::new();
+        for (fi, flows) in all_flows {
+            let mut groups: BTreeMap<u32, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+            for fl in flows {
+                let node = match &fl.end {
+                    FlowEnd::Node(n) => Some(*n),
+                    FlowEnd::Phantom(id) => b.node_index.get(id).copied(),
+                };
+                let Some(n) = node else { continue };
+                let g = groups.entry(fl.group).or_default();
+                let side = if fl.write { &mut g.0 } else { &mut g.1 };
+                if !side.contains(&n) {
+                    side.push(n);
+                }
+            }
+            for (writes, reads) in groups.values() {
+                let mut pairs = 0;
+                'pairs: for &w in writes {
+                    for &r in reads {
+                        if w == r {
+                            continue;
+                        }
+                        if pairs >= MAX_DERIVED_PER_GROUP {
+                            break 'pairs;
+                        }
+                        pairs += 1;
+                        let ev = if w == file_node[*fi] {
+                            format!(
+                                "{} is a model made from {}",
+                                files[*fi].name, b.nodes[r].label
+                            )
+                        } else {
+                            format!(
+                                "{} writes {} and reads {}",
+                                files[*fi].name, b.nodes[w].label, b.nodes[r].label
+                            )
+                        };
+                        let e = found.entry((w, r)).or_default();
+                        if e.len() < 3 && !e.contains(&ev) {
+                            e.push(ev);
+                        }
+                    }
+                }
+            }
+        }
+        for ((w, r), evidence) in found {
+            add_directed(b, w, r, Relation::DerivedFrom, Conf::Inferred, evidence);
+        }
     }
 
     /// What `link_code` found that later passes use.
@@ -124750,6 +124968,250 @@ mod knowledge_graph {
         stem
     }
 
+    // ---- Versions ----
+
+    /// What a file name says about which version it is.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub(crate) struct VersionName {
+        /// The name without its version marks, lower case, words joined by `_`.
+        pub(crate) base: String,
+        /// `v2` -> [2], `v1.10` -> [1, 10].
+        pub(crate) number: Option<Vec<u64>>,
+        /// (year, month, day); the day is 0 for a year and month only.
+        pub(crate) date: Option<(u32, u32, u32)>,
+        /// `draft`, `old`, `backup` count -1 each; `final`, `latest`, `new` +1.
+        pub(crate) rank: i32,
+    }
+
+    impl VersionName {
+        pub(crate) fn marked(&self) -> bool {
+            self.number.is_some() || self.date.is_some() || self.rank != 0
+        }
+    }
+
+    fn valid_date(y: u32, m: u32, d: u32) -> bool {
+        (1990..=2100).contains(&y) && (1..=12).contains(&m) && (d == 0 || (1..=31).contains(&d))
+    }
+
+    /// Reads version marks out of a file's name without its extension.
+    pub(crate) fn version_name(stem: &str) -> VersionName {
+        let chars: Vec<char> = stem.to_lowercase().chars().collect();
+        let n = chars.len();
+        let alnum = |i: usize| chars.get(i).is_some_and(|c| c.is_alphanumeric());
+        let digit_run = |i: usize| chars[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let mut out = VersionName::default();
+        let mut base = String::new();
+        let mut i = 0;
+        while i < n {
+            let word_start = i == 0 || !alnum(i - 1);
+            let c = chars[i];
+            if c.is_ascii_digit() && word_start {
+                let run = digit_run(i);
+                let num = |a: usize, b: usize| -> u32 {
+                    chars[a..b].iter().collect::<String>().parse().unwrap_or(0)
+                };
+                // YYYYMMDD
+                if run == 8 && !alnum(i + 8) {
+                    let (y, m, d) = (num(i, i + 4), num(i + 4, i + 6), num(i + 6, i + 8));
+                    if valid_date(y, m, d) && d != 0 {
+                        out.date.get_or_insert((y, m, d));
+                        i += 8;
+                        continue;
+                    }
+                }
+                // YYYY-MM-DD, YYYY_MM_DD, YYYY.MM.DD, then YYYY-MM
+                if run == 4 && matches!(chars.get(i + 4), Some('-' | '_' | '.')) {
+                    let sep = chars[i + 4];
+                    if digit_run(i + 5) == 2 {
+                        let (y, m) = (num(i, i + 4), num(i + 5, i + 7));
+                        if chars.get(i + 7) == Some(&sep) && digit_run(i + 8) == 2 {
+                            let d = num(i + 8, i + 10);
+                            if valid_date(y, m, d) && d != 0 && !alnum(i + 10) {
+                                out.date.get_or_insert((y, m, d));
+                                i += 10;
+                                continue;
+                            }
+                        }
+                        if valid_date(y, m, 0) && sep != '.' && !alnum(i + 7) {
+                            out.date.get_or_insert((y, m, 0));
+                            i += 7;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // v2, ver2, version 2, rev3, v1.2.3
+            if word_start && c.is_alphabetic() {
+                let word: String = chars[i..]
+                    .iter()
+                    .take_while(|c| c.is_alphabetic())
+                    .collect();
+                let after = i + word.chars().count();
+                if matches!(word.as_str(), "v" | "ver" | "version" | "rev" | "revision") {
+                    let mut j = after;
+                    if matches!(chars.get(j), Some(' ' | '_' | '-')) {
+                        j += 1;
+                    }
+                    let run = if j < n { digit_run(j) } else { 0 };
+                    if run > 0 && run <= 6 {
+                        let mut parts: Vec<u64> = Vec::new();
+                        let mut k = j;
+                        loop {
+                            let r = digit_run(k);
+                            if r == 0 || r > 6 {
+                                break;
+                            }
+                            parts.push(
+                                chars[k..k + r]
+                                    .iter()
+                                    .collect::<String>()
+                                    .parse()
+                                    .unwrap_or(0),
+                            );
+                            k += r;
+                            if chars.get(k) == Some(&'.')
+                                && chars.get(k + 1).is_some_and(|c| c.is_ascii_digit())
+                            {
+                                k += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if !alnum(k) {
+                            out.number.get_or_insert(parts);
+                            i = k;
+                            continue;
+                        }
+                    }
+                }
+                if !alnum(after) || after >= n {
+                    match word.as_str() {
+                        "draft" | "wip" | "rough" | "old" | "orig" | "original" | "bak"
+                        | "backup" => {
+                            out.rank -= 1;
+                            i = after;
+                            continue;
+                        }
+                        "final" | "latest" | "current" | "new" | "fin" => {
+                            out.rank += 1;
+                            i = after;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                base.push_str(&word);
+                i = after;
+                continue;
+            }
+            if c.is_alphanumeric() {
+                base.push(c);
+            } else if !base.ends_with('_') && !base.is_empty() {
+                base.push('_');
+            }
+            i += 1;
+        }
+        out.base = base.trim_matches('_').to_string();
+        out
+    }
+
+    /// Most files in one version series.
+    const MAX_VERSION_SERIES: usize = 1000;
+
+    /// `version_of`: files whose names mark them as versions of one
+    /// another (`report_v1.docx`, `report_v2.docx`, `report_final.docx`,
+    /// `sales_2024-01.csv`, `sales_2024-02.csv`), in the same folder with
+    /// the same extension. Each is linked to the one before it, newer to
+    /// older, in the order the names give: version numbers, then dates,
+    /// then draft/final marks, then the modified time. EXTRACTED when two
+    /// numbers or two dates settle the order, INFERRED when a mark or the
+    /// modified time does.
+    fn link_versions(b: &mut Builder, files: &[KgFile], file_node: &[usize]) {
+        type Series = Vec<(usize, VersionName)>;
+        let mut series: BTreeMap<(String, String, String), Series> = BTreeMap::new();
+        for (fi, f) in files.iter().enumerate() {
+            let Some((stem, ext)) = f.name.rsplit_once('.') else {
+                continue;
+            };
+            let name = version_name(stem);
+            if name.base.chars().count() < 3 {
+                continue;
+            }
+            let dir = f.rel.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+            series
+                .entry((dir, name.base.clone(), ext.to_lowercase()))
+                .or_default()
+                .push((fi, name));
+        }
+        // Numbered names and dated names of one base are two series, not one
+        // line: nothing says where `log_v2` falls among `log_2024-02-10`. An
+        // unmarked name (the original) goes with the numbered ones if there
+        // are any, else with the dated ones.
+        let mut split: Vec<(String, Series)> = Vec::new();
+        for ((_, base, _), members) in series {
+            let (numbered, rest): (Series, Series) =
+                members.into_iter().partition(|(_, v)| v.number.is_some());
+            let (dated, plain): (Series, Series) =
+                rest.into_iter().partition(|(_, v)| v.date.is_some());
+            if numbered.is_empty() || dated.is_empty() {
+                let mut all = numbered;
+                all.extend(dated);
+                all.extend(plain);
+                split.push((base, all));
+            } else {
+                let mut with_plain = numbered;
+                with_plain.extend(plain);
+                split.push((base.clone(), with_plain));
+                split.push((base, dated));
+            }
+        }
+        for (base, mut members) in split {
+            if members.len() < 2 || members.len() > MAX_VERSION_SERIES {
+                continue;
+            }
+            if !members.iter().any(|(_, v)| v.marked()) {
+                continue;
+            }
+            members.sort_by(|(fa, a), (fb, c)| {
+                a.number
+                    .cmp(&c.number)
+                    .then(a.date.cmp(&c.date))
+                    .then(a.rank.cmp(&c.rank))
+                    .then(files[*fa].mtime.cmp(&files[*fb].mtime))
+                    .then(files[*fa].rel.cmp(&files[*fb].rel))
+            });
+            for pair in members.windows(2) {
+                let ((old, a), (new, c)) = (&pair[0], &pair[1]);
+                if a == c && files[*old].mtime == files[*new].mtime {
+                    continue;
+                }
+                let (conf, why) =
+                    if a.number.is_some() && c.number.is_some() && a.number != c.number {
+                        (Conf::Extracted, "its version number is higher")
+                    } else if a.date.is_some() && c.date.is_some() && a.date != c.date {
+                        (Conf::Extracted, "its date is later")
+                    } else if a.rank != c.rank {
+                        (Conf::Inferred, "its name marks it as the later one")
+                    } else {
+                        (Conf::Inferred, "it was modified later")
+                    };
+                b.add_edge(
+                    file_node[*new],
+                    file_node[*old],
+                    Relation::VersionOf,
+                    conf,
+                    if conf == Conf::Extracted { 1.0 } else { 0.7 },
+                    2.0,
+                    vec![format!(
+                        "{} is a later version of {} ({base}: {why})",
+                        files[*new].name, files[*old].name
+                    )],
+                );
+                b.edges.last_mut().expect("just pushed").directed = true;
+            }
+        }
+    }
+
     /// `same_name`: files sharing a name stem - one document saved as
     /// several formats, a download saved twice, the same dataset in two
     /// folders. Groups larger than eight, and generic stems, are skipped.
@@ -124781,6 +125243,179 @@ mod knowledge_graph {
                         )],
                     );
                 }
+            }
+        }
+    }
+
+    /// A table name a reader gives when the file has no name for it (an INI
+    /// section, a sheet): two files sharing it say nothing.
+    fn generic_table_name(canon: &str) -> bool {
+        let letters = canon.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+        matches!(
+            letters,
+            "data"
+                | "sheet"
+                | "table"
+                | "records"
+                | "rows"
+                | "items"
+                | "main"
+                | "export"
+                | "output"
+                | "result"
+                | "results"
+                | "dataset"
+                | "value"
+                | "values"
+                | "untitled"
+                | "query"
+                | "report"
+                | "stdin"
+        )
+    }
+
+    /// `exported_from`: a flat file (CSV, spreadsheet, JSON lines, Parquet)
+    /// that is an export of a database table - a table of a SQLite file, a
+    /// SQL script or a running database. The columns have to be (nearly)
+    /// the same set, and either the values show it (the file's values are
+    /// found in the table, from the value sketches) or, when the table has
+    /// no values to compare (a dump's schema, a live catalog), the file is
+    /// named for the table. Directed, file to table.
+    fn link_exports(b: &mut Builder, files: &[KgFile], table_nodes: &[(usize, usize, usize)]) {
+        let is_source = |f: &KgFile| matches!(f.file_type.as_str(), "sqlite" | "database" | "sql");
+        let sources: Vec<&(usize, usize, usize)> = table_nodes
+            .iter()
+            .filter(|&&(_, fi, ti)| is_source(&files[fi]) && files[fi].tables[ti].1.len() >= 3)
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        let canon_set = |cols: &[ColumnProfile]| -> BTreeSet<String> {
+            cols.iter().map(|c| canon_name(&c.name)).collect()
+        };
+        let source_sets: Vec<BTreeSet<String>> = sources
+            .iter()
+            .map(|&&(_, fi, ti)| canon_set(&files[fi].tables[ti].1))
+            .collect();
+        let mut by_column: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (si, set) in source_sets.iter().enumerate() {
+            for c in set {
+                by_column.entry(c.as_str()).or_default().push(si);
+            }
+        }
+        for &(node, fi, ti) in table_nodes {
+            let f = &files[fi];
+            if is_source(f) || f.fixed_schema || f.kind != FileKind::Data {
+                continue;
+            }
+            let (table_name, cols) = &f.tables[ti];
+            if cols.len() < 3 {
+                continue;
+            }
+            let set = canon_set(cols);
+            let mut shared: BTreeMap<usize, usize> = BTreeMap::new();
+            for c in &set {
+                if let Some(holders) = by_column.get(c.as_str())
+                    && holders.len() <= 200
+                {
+                    for &si in holders {
+                        *shared.entry(si).or_insert(0) += 1;
+                    }
+                }
+            }
+            let stem = canon_name(f.name.rsplit_once('.').map_or(f.name.as_str(), |(s, _)| s));
+            let table_stem = canon_name(table_name);
+            let mut best: Option<(f64, usize, Conf, Vec<String>)> = None;
+            for (si, common) in shared {
+                let union = set.len() + source_sets[si].len() - common;
+                let jaccard = common as f64 / union as f64;
+                if common < 3 || jaccard < 0.8 {
+                    continue;
+                }
+                let (snode, sfi, sti) = *sources[si];
+                if snode == node {
+                    continue;
+                }
+                let s_cols = &files[sfi].tables[sti].1;
+                let s_table = canon_name(&files[sfi].tables[sti].0);
+                // The file is named for the table: `orders.csv`, `orders_2024.csv`.
+                let named = s_table.len() >= 4
+                    && (stem == s_table
+                        || stem.starts_with(&format!("{s_table}_"))
+                        || stem.ends_with(&format!("_{s_table}"))
+                        || (table_stem == s_table && !generic_table_name(&s_table)));
+                // Values: how much of the file's column is in the table's.
+                let mut best_in = 0.0f64;
+                let mut contradicted = false;
+                let mut value_col = String::new();
+                for c in cols {
+                    let canon = canon_name(&c.name);
+                    let Some(sc) = s_cols.iter().find(|x| canon_name(&x.name) == canon) else {
+                        continue;
+                    };
+                    let (Some(a), Some(z)) = (&c.content, &sc.content) else {
+                        continue;
+                    };
+                    if a.distinct_estimate() < 5.0 || z.distinct_estimate() < 5.0 {
+                        continue;
+                    }
+                    let (in_table, _) = content_scan::containment_estimates(a, z);
+                    if in_table > best_in {
+                        best_in = in_table;
+                        value_col = c.name.clone();
+                    }
+                    if a.distinct_estimate() >= 20.0 && in_table < 0.2 {
+                        contradicted = true;
+                    }
+                }
+                if contradicted && best_in < 0.5 {
+                    continue;
+                }
+                let have_values = best_in > 0.0;
+                let (conf, score, mut evidence) = if best_in >= 0.9 {
+                    (
+                        if named && jaccard >= 0.95 {
+                            Conf::Extracted
+                        } else {
+                            Conf::Inferred
+                        },
+                        0.5 * jaccard + 0.5 * best_in,
+                        vec![format!(
+                            "{:.0}% of the values in column \"{value_col}\" are in the table",
+                            best_in * 100.0
+                        )],
+                    )
+                } else if !have_values && named && jaccard >= 0.9 {
+                    (
+                        Conf::Inferred,
+                        0.8 * jaccard,
+                        vec![
+                            "named for the table (the table has no values to compare)".to_string(),
+                        ],
+                    )
+                } else {
+                    continue;
+                };
+                evidence.insert(
+                    0,
+                    format!(
+                        "{common} of {union} column names are the same as table \"{}\"",
+                        files[sfi].tables[sti].0
+                    ),
+                );
+                if best.as_ref().is_none_or(|(s, ..)| score > *s) {
+                    best = Some((score, si, conf, evidence));
+                }
+            }
+            if let Some((_, si, conf, evidence)) = best {
+                add_directed(
+                    b,
+                    node,
+                    sources[si].0,
+                    Relation::ExportedFrom,
+                    conf,
+                    evidence,
+                );
             }
         }
     }
@@ -130467,6 +131102,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 people: Vec::new(),
                 sheet_refs: Vec::new(),
                 changes_with: Vec::new(),
+                mtime: 0,
             }
         }
 
@@ -131501,6 +132137,65 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     }
 
     #[cfg(test)]
+    mod version_tests {
+        use super::*;
+
+        #[test]
+        fn numbers_and_their_styles() {
+            for (stem, base, number) in [
+                ("budget_v2", "budget", vec![2]),
+                ("Budget-V3", "budget", vec![3]),
+                ("budget v1.10", "budget", vec![1, 10]),
+                ("budget_ver4", "budget", vec![4]),
+                ("survey results version 5", "survey_results", vec![5]),
+                ("plan_rev7", "plan", vec![7]),
+            ] {
+                let v = version_name(stem);
+                assert_eq!(v.base, base, "{stem}");
+                assert_eq!(v.number, Some(number), "{stem}");
+            }
+        }
+
+        #[test]
+        fn dates_in_three_shapes_and_months() {
+            assert_eq!(version_name("report_2024-03-09").date, Some((2024, 3, 9)));
+            assert_eq!(version_name("report_20240309").date, Some((2024, 3, 9)));
+            assert_eq!(version_name("report_2024_03_09").date, Some((2024, 3, 9)));
+            assert_eq!(version_name("report_2024-03").date, Some((2024, 3, 0)));
+            assert_eq!(version_name("report_2024-03-09").base, "report");
+            // A month 13 or a year out of range is not a date.
+            assert_eq!(version_name("report_2024-13-09").date, None);
+            assert_eq!(version_name("report_1850-01-01").date, None);
+        }
+
+        #[test]
+        fn markers_rank_below_and_above_the_plain_name() {
+            assert_eq!(version_name("minutes_draft").rank, -1);
+            assert_eq!(version_name("minutes_old_backup").rank, -2);
+            assert_eq!(version_name("minutes").rank, 0);
+            assert_eq!(version_name("minutes_final").rank, 1);
+            assert!(version_name("minutes_final").marked());
+            assert!(!version_name("minutes").marked());
+        }
+
+        #[test]
+        fn words_and_numbers_that_only_look_like_versions() {
+            for stem in [
+                "part_1", "chapter2", "data_2", "figure 4", "overview", "version",
+            ] {
+                let v = version_name(stem);
+                assert_eq!(v.number, None, "{stem}");
+                assert_eq!(v.date, None, "{stem}");
+            }
+            // A word that merely starts with a marker is a word.
+            assert_eq!(version_name("newsletter").rank, 0);
+            assert_eq!(version_name("finalists").rank, 0);
+            // Seven digits after `v` is a number in the name, not a version.
+            assert_eq!(version_name("v1234567").number, None);
+        }
+    }
+
+    #[cfg(test)]
     mod tests {
         use super::*;
 
@@ -131977,6 +132672,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
                 people: Vec::new(),
                 sheet_refs: Vec::new(),
                 changes_with: Vec::new(),
+                mtime: 0,
             }
         }
 
@@ -132124,6 +132820,17 @@ USAGE:
                    address belongs to
       changes_with with --git: two files that change in the same commits
                    (INFERRED, scored by how often)
+      derived_from what a script or SQL statement writes, to what it
+                   reads (per statement for SQL, per script otherwise; a
+                   dbt model to the models and sources it names);
+                   directed, INFERRED
+      version_of   a file to the older one of its series (budget_v2 ->
+                   budget_v1, report_2024-03 -> report_2024-02, plan ->
+                   plan_draft); directed, newer to older
+      exported_from a CSV, sheet or JSON file to the database table it
+                   was exported from (the same columns, and the values
+                   found in the table; or named for a table whose values
+                   are not available); directed
       has_column   with --columns: a table (or a schema shared by several)
                    to a column node it has; the column is shared by two or
                    more tables or used by a query; generic names (id,

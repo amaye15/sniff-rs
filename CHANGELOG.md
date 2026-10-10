@@ -7,6 +7,16 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs graph` lineage: `derived_from` (what a script or SQL statement
+  writes, to what it reads; per statement for SQL, per script for Python and
+  the other languages; a dbt model to the models and sources it names),
+  `version_of` (a file to the older one of its series, from `v2`/`version 5`,
+  dates in three shapes, and `draft`/`final` marks; newer to older) and
+  `exported_from` (a flat file to the database table it came from: the same
+  columns and the values found in the table, or, for a schema with no values,
+  a file named for the table). Checked against `sqlglot` and `ast`
+  (153 derived pairs), scripted version series (1,100 links) and scripted
+  SQLite exports (119 links).
 - `sniff-rs graph` reads more: `.eml` and Outlook `.msg` messages (as
   one-message mailboxes, with `--people` too), the tables and declared keys
   of a `.sql` script (`CREATE TABLE`, `pg_dump`'s `ALTER TABLE ... ADD

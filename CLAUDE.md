@@ -18872,6 +18872,64 @@ are not read, and a MySQL target has to name a database. Not covered by an
 automated test: the live servers (as for `--load-into`; `check_live_db.py`
 needs them running).
 
+### Phase 6: lineage (`derived_from`, `version_of`, `exported_from`)
+
+Three directed relations that say where a file came from. All are INFERRED
+unless the name or the values settle it.
+
+- **`derived_from`** (output to input). `code_facts` now numbers the
+  statements of a SQL script and marks, per statement, the tables it fills
+  (`CREATE TABLE ... AS`, `INSERT`, `MERGE`, `REPLACE`, `SELECT ... INTO`;
+  `DELETE` and `UPDATE` write but fill nothing). A filled table is derived
+  from the tables that same statement reads, and only from those. Other
+  languages have no statement, so a script's outputs are derived from all
+  its inputs. A dbt model (`{{ ref() }}`, `{{ source() }}`) is derived from
+  the models and sources it names. One statement or script contributes at most
+  `MAX_DERIVED_PER_GROUP` (12) pairs. A path or table that only one code file
+  names has no node, so it has no link.
+- **`version_of`** (newer to older). `version_name` reads marks out of the
+  name without its extension: `v2`, `ver2`, `rev3`, `version 5`, `v1.10`
+  (compared part by part, so 10 is after 2), dates (`2024-03-09`,
+  `20240309`, `2024_03_09`, `2024-03`), and the marks `draft`/`wip`/`old`/
+  `backup` (below the plain name) and `final`/`latest`/`new` (above). A
+  series is the files of one folder with the same base name and extension;
+  it needs two files, at most 1,000, and one mark. Order: number, then date,
+  then mark, then modified time, then path. Numbered and dated names of one
+  base are two series (nothing says where `log_v2` falls among `log_2024-02-10`);
+  an unmarked name goes with the numbered ones, else the dated ones. Number
+  and date differences are EXTRACTED; a mark or a modified time is INFERRED.
+  `part_1`, `chapter2` and `data_2` are not versions (no `v`, no date).
+- **`exported_from`** (file to table). A flat file (CSV, sheet, JSON lines,
+  Parquet; never a fixed-schema file) and a table of a SQLite file, a SQL
+  script or a `--db` database are candidates when they share at least 3
+  column names (after `canon_name`) and the Jaccard of the name sets is at
+  least 0.8. The values decide: for a column with at least 5 distinct values
+  on both sides, `containment_estimates` of the two sketches says how much of
+  the file's values are in the table; 0.9 or more links (EXTRACTED when the
+  file is also named for the table and the names match at 0.95), and a key
+  column (20 or more distinct values) with under 0.2 rules the pair out. A
+  table with no values to compare (a dump's schema, a live catalog) links only
+  when the file is named for it (`orders.csv`, `orders_2024.csv`,
+  `export_orders.csv`) and the names match at 0.9. A table of one table
+  file is the file's node.
+
+**Verified** with `tools/check_derived.py` (random SQL and Python scripts
+against `sqlglot` and `ast`: 153 pairs, exact), `tools/check_versions.py`
+(150 folders of scripted series with scrambled modified times, mixed schemes
+and look-alike names: 1,100 links, exact) and `tools/check_exports.py` (60
+folders of SQLite databases exported by pandas, whole or sampled, under the
+table's name or not, with decoys of the same columns and other values: 119
+links, exact). The version oracle found nothing wrong; the fixture found the
+mixed-scheme link. Integration tests on `tests/fixtures/edge_graph_lineage`.
+
+**Disclosed.** `derived_from` ignores a column list (every input of a
+statement feeds every output), views, stored procedures and a table built
+through a variable name; Python is per script, so an output may be linked to
+an input it does not use. `version_of` reads names only (not a document's own
+"v2" in its text) and a series never crosses folders. `exported_from` needs the
+sketches (a graph run) and 3 or more shared columns; a sheet or JSON export
+with renamed columns is not found.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike
