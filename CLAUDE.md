@@ -19127,6 +19127,82 @@ only, since FTS5 keeps such a run as one word. Duplicate words in a query count
 once (FTS5 would count them twice). Modularity uses the link weights the
 communities were found with. A `subgraph` drops the `unlinked` report.
 
+### Phase 10: scale, memory, completions, README
+
+Measured first, then fixed where the numbers were bad. Synthetic inputs, made
+by scripts in the session scratchpad (50,000 small CSV/JSONL/Markdown/text
+files that share 20,000 customer e-mails; 1,000 SQLite files of 100 tables;
+one SQLite file of 5,000 and of 10,000 tables), default build, 10 cores.
+
+- **Memory of `graph`.** `to_json` built a value tree of every link and then a
+  second string of the whole document: 1.65 GB at 1 million links.
+  `write_graph_json` now writes the header, then each node and each link
+  alone, through `json_support::write_pretty_at` (pretty-print at a given
+  indent), so the text is exactly what `to_pretty_string(&to_json(kg))` gives
+  (a test pins that, including a graph with no links and one with no nodes;
+  the 50,000-file graph.json is byte-identical to the old one). Used by the
+  file write, `graph -`, and `graph merge`. 1.65 GB to 1.0 GB, same speed.
+- **Memory of reading `graph.json`.** `from_json` parsed the whole file into
+  one tree: 1.35 GB for a 317 MB file. `json_support::stream_object_members`
+  walks the top-level object and, per member, skips it (a byte scan, no
+  parse), parses it whole, or parses it element by element
+  (`MemberMode`). `from_json` reads the file twice: the header and nodes,
+  then the links (which need the node index), so member order in the file
+  does not matter. A semantic error (`a link names unknown node`) keeps its
+  message. 1.35 GB to 0.45 GB; 2.65 s instead of 1.9 s because of the second
+  pass.
+- **Dictionary mode had no bound.** `explain`/`path`/`rank`/`--combine` on a
+  table-level input (one database; a saved dictionary) passed `usize::MAX` as
+  the name-group bound that `graph` sets at `MAX_NAME_GROUP` (512). 5,000
+  tables sharing a few key names made 3.7 million sibling links (99.5%
+  `shared_reference`): 24 s, 5 GB, a 2.8 GB JSON. The bound is now the same
+  512: past it, a name pairs only with the table that owns it (the rule
+  `name_candidates` already had), an identifier kind past it is skipped, and
+  `relationship_candidates` returns the count so `detect_relationships_with`
+  prints a note on stderr. 5,000 tables 0.8 s and 65 MB; 10,000 tables 1.5 s
+  and 112 MB (were 75 s, 6.5 GB). Output is unchanged under the bound
+  (`relationship_candidates_miss_no_edge_a_scan_of_every_pair_finds`, 600
+  random table sets, still equal to a scan of every pair); a test builds 600
+  tables on one key name and checks the pairs stay linear.
+- **Numbers.** 50,000 files and 1 million `mentions` links: 18 s cold, 12 s
+  warm (Louvain and the join engine, as expected), 1.0 GB. 100,000 tables in
+  1,000 SQLite files: 11 s, 0.9 GB, 200,000 links. A question on the
+  317 MB graph.json: 2.3-2.8 s, 0.4-0.5 GB; on the 99 MB one: 0.9-1.2 s, 0.2-0.4 GB.
+- **A bug the scale runs found in phase 9.** `modularity` summed over a
+  `HashMap`, so its last digits changed from run to run; it uses `BTreeMap`
+  now (`modularity_is_the_same_on_every_call` fails with a `HashMap`). Every
+  query command was checked for the same output on three runs on both graphs.
+- **A query on the folder `graph` wrote** (it holds `.sniff-rs-graph` and
+  `graph.json`) reads the graph.json. Before, `search ./data.graph ...`
+  graphed the folder again with its own outputs in it.
+- **Shell completions.** `sniff-rs completions <bash|zsh|fish|powershell>`.
+  `completions::flags_in` reads the lines of each help text's `OPTIONS:`
+  section (indent up to eight, starting with a dash), so a completion offers
+  what `--help` shows and a new flag needs no second edit; the values of
+  `--output-format`, `--format` (from `FORMAT_CATALOG`), `--encoding`,
+  `--relation`, `--export`, `--type`, `--sort`, `--sql-mode` and
+  `--confidence` are a small table, tested against the parsers they feed.
+  Checked: bash by calling the function with `COMP_WORDS` for 12 cases; fish
+  4.9 by `fish -n` and `complete -C` for 10 cases; zsh by `zsh -n` and by
+  `compinit` registering `_sniff-rs` both sourced and from `fpath`. **Not
+  tested by running:** zsh's `_arguments` menu and PowerShell (no
+  PowerShell here; a `zpty` harness was too flaky to trust).
+  `completions` is a reserved first word, like `diff`.
+- **Release.** The archives hold `completions/` (written by the binary just
+  built); the smoke test runs `graph`, `search` and `completions`.
+  `.github/workflows/ci.yml` already ran the whole suite on three systems
+  and the minimal build on stable; the Homebrew formula and `install.sh` are
+  unchanged.
+- **README.** The graph section lists every relation and the opt-in flags,
+  how to add links, the query commands, the exports, the schema flag, and the
+  measured scale above; completions are in the install section.
+
+**Disclosed.** The scale inputs are synthetic: real corpora have more varied
+files, and a name shared by a few hundred tables still makes tens of
+thousands of sibling links. `from_json` reads the file twice.
+`tools/gen_scale.py` makes the inputs; there is no oracle (the point is time
+and memory), only byte equality with the old output and the unit tests above.
+
 ## Known limitations / roadmap
 
 - **No LZO support for Parquet's own `LZO` compression codec.** Unlike

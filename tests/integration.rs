@@ -21393,3 +21393,115 @@ fn graph_communities_report_size_cohesion_and_modularity() {
     assert!(text.contains("modularity") && text.contains("| ID |"));
     assert_eq!(text.matches("\n| ").count(), 3, "{text}");
 }
+
+#[test]
+fn completions_print_a_script_for_each_shell_and_refuse_an_unknown_one() {
+    for (shell, needle) in [
+        ("bash", "complete -o filenames"),
+        ("zsh", "#compdef sniff-rs"),
+        ("fish", "complete -c sniff-rs"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let out = Command::new(bin())
+            .args(["completions", shell])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(needle), "{shell}: {needle} missing");
+        // Every subcommand and a flag from each help text are offered.
+        for word in [
+            "diff",
+            "explain",
+            "search",
+            "neighbors",
+            "subgraph",
+            "communities",
+            "graph",
+            "completions",
+            "--output-format",
+            "--encoding",
+            "--export",
+        ] {
+            // fish spells a long flag `-l name`.
+            let spelled = match (shell, word.strip_prefix("--")) {
+                ("fish", Some(name)) => format!("-l {name}"),
+                _ => word.to_string(),
+            };
+            assert!(text.contains(&spelled), "{shell} lacks {word}");
+        }
+    }
+    let bad = Command::new(bin())
+        .args(["completions", "tcsh"])
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown shell"));
+    let none = Command::new(bin()).arg("completions").output().unwrap();
+    assert!(!none.status.success());
+    assert!(String::from_utf8_lossy(&none.stderr).contains("usage"));
+    let help = Command::new(bin())
+        .args(["completions", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("powershell"));
+}
+
+#[test]
+fn graph_json_to_stdout_is_the_file_it_writes_and_both_stream() {
+    let tmp = TempDir::new();
+    let out = tmp.path().join("g");
+    let run = run_graph(&[
+        "graph",
+        &lineage_fixture(),
+        out.to_str().unwrap(),
+        "--no-cache",
+    ]);
+    assert!(run.status.success());
+    let file = std::fs::read_to_string(out.join("graph.json")).unwrap();
+    let piped = run_graph(&["graph", &lineage_fixture(), "-", "--no-cache"]);
+    assert!(piped.status.success());
+    let stdout = String::from_utf8(piped.stdout).unwrap();
+    // The file has no trailing newline; stdout adds one.
+    assert_eq!(stdout, format!("{file}\n"));
+    // It parses with a real JSON parser and has the node-link shape.
+    let doc: serde_json::Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(doc["multigraph"], true);
+    assert!(doc["nodes"].as_array().unwrap().len() > 3);
+    assert!(!doc["links"].as_array().unwrap().is_empty());
+    assert_eq!(doc["graph"]["version"], 1);
+    // And it reads back through every query command.
+    let found = run_graph(&["search", out.join("graph.json").to_str().unwrap(), "audit"]);
+    assert!(found.status.success());
+}
+
+#[test]
+fn a_query_on_the_folder_graph_wrote_reads_its_graph_json() {
+    let tmp = TempDir::new();
+    let graph = query_graph_json(tmp.path());
+    let folder = graph.parent().unwrap();
+    for query in [
+        vec!["search", "audit", "--output-format", "json"],
+        vec!["communities", "--output-format", "json"],
+        vec!["rank", "--output-format", "json"],
+    ] {
+        let mut by_folder = vec![query[0], folder.to_str().unwrap()];
+        by_folder.extend(&query[1..]);
+        let mut by_file = vec![query[0], graph.to_str().unwrap()];
+        by_file.extend(&query[1..]);
+        let a = run_graph(&by_folder);
+        let b = run_graph(&by_file);
+        assert!(a.status.success() && b.status.success(), "{}", query[0]);
+        if query[0] != "rank" {
+            // (`rank` echoes the input path it was given.)
+            assert_eq!(a.stdout, b.stdout, "{}", query[0]);
+        }
+        // It was read, not graphed again with its own outputs included.
+        assert!(
+            !String::from_utf8_lossy(&a.stderr).contains("graphed"),
+            "{}",
+            query[0]
+        );
+    }
+}

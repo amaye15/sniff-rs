@@ -2148,6 +2148,103 @@ mod json_support {
         Ok(())
     }
 
+    /// What `stream_object_members` does with one member of the top-level
+    /// object.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum MemberMode {
+        /// Walk past the value without parsing it.
+        Skip,
+        /// Parse the value whole and hand it over.
+        Whole,
+        /// The value must be an array: parse and hand over one element at a
+        /// time, freeing each before the next is read.
+        Elements,
+    }
+
+    /// Reads a top-level JSON object straight off a byte stream, member by
+    /// member. `mode` picks what to do with each key; `on_value` receives
+    /// the key and the parsed value (or element). Peak memory is one
+    /// bounded read window plus one value's span and tree, however large
+    /// the members that are skipped or streamed are. The whole document
+    /// must be well-formed JSON, with nothing but whitespace after it -
+    /// the rule `from_str` enforces - but a skipped member is walked, not
+    /// parsed, so a malformed number inside one is not caught.
+    pub(crate) fn stream_object_members<R: std::io::Read>(
+        reader: R,
+        mut mode: impl FnMut(&str) -> MemberMode,
+        mut on_value: impl FnMut(&str, Value) -> std::result::Result<(), ParseError>,
+    ) -> std::result::Result<(), ParseError> {
+        let mut win = ByteWindow::new(reader);
+        let mut span: Vec<u8> = Vec::new();
+        let parse_span = |span: &[u8]| -> std::result::Result<Value, ParseError> {
+            let s = std::str::from_utf8(span).map_err(|e| ParseError {
+                message: format!("invalid UTF-8 in JSON: {e}"),
+                line: 0,
+                column: 0,
+            })?;
+            from_str(s)
+        };
+
+        win.skip_ws()?;
+        if win.bump()? != Some(b'{') {
+            return Err(win.err("expected a top-level JSON object"));
+        }
+        win.skip_ws()?;
+        if win.peek()? == Some(b'}') {
+            win.pos += 1;
+        } else {
+            loop {
+                win.skip_ws()?;
+                let key = win.scan_string()?;
+                win.skip_ws()?;
+                if win.bump()? != Some(b':') {
+                    return Err(win.err("expected ':' after an object key"));
+                }
+                win.skip_ws()?;
+                match mode(&key) {
+                    MemberMode::Skip => win.scan_value(&mut span)?,
+                    MemberMode::Whole => {
+                        win.scan_value(&mut span)?;
+                        on_value(&key, parse_span(&span)?)?;
+                    }
+                    MemberMode::Elements => {
+                        if win.bump()? != Some(b'[') {
+                            return Err(win.err(format!("expected \"{key}\" to be an array")));
+                        }
+                        win.skip_ws()?;
+                        if win.peek()? == Some(b']') {
+                            win.pos += 1;
+                        } else {
+                            loop {
+                                win.scan_value(&mut span)?;
+                                on_value(&key, parse_span(&span)?)?;
+                                win.skip_ws()?;
+                                match win.bump()? {
+                                    Some(b',') => win.skip_ws()?,
+                                    Some(b']') => break,
+                                    _ => {
+                                        return Err(win.err("expected ',' or ']' in a JSON array"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                win.skip_ws()?;
+                match win.bump()? {
+                    Some(b',') => continue,
+                    Some(b'}') => break,
+                    _ => return Err(win.err("expected ',' or '}' in a JSON object")),
+                }
+            }
+        }
+        win.skip_ws()?;
+        if win.peek()?.is_some() {
+            return Err(win.err("trailing characters after a complete JSON value"));
+        }
+        Ok(())
+    }
+
     // Only called from feature-gated readers (Avro's schema bytes, and
     // several oracle tests) - unused in a plain default build.
     #[allow(dead_code)]
@@ -2163,6 +2260,51 @@ mod json_support {
     #[cfg(test)]
     mod parser_tests {
         use super::*;
+
+        #[test]
+        fn stream_object_members_skips_wholes_and_streams_elements() {
+            let doc = br#" {"skip": {"a": [1, "]", {"b": "}"}]}, "one": {"x": 1},
+                "many": [10, {"y": 2}, "z"], "empty": [], "tail": true} "#;
+            let mut seen: Vec<(String, Value)> = Vec::new();
+            stream_object_members(
+                &doc[..],
+                |k| match k {
+                    "one" => MemberMode::Whole,
+                    "many" | "empty" => MemberMode::Elements,
+                    _ => MemberMode::Skip,
+                },
+                |k, v| {
+                    seen.push((k.to_string(), v));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let keys: Vec<&str> = seen.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["one", "many", "many", "many"]);
+            assert_eq!(seen[0].1.get("x").and_then(Value::as_u64), Some(1));
+            assert_eq!(seen[1].1.as_u64(), Some(10));
+        }
+
+        #[test]
+        fn stream_object_members_rejects_bad_shapes() {
+            let run = |doc: &str, mode: MemberMode| {
+                stream_object_members(doc.as_bytes(), |_| mode, |_, _| Ok(()))
+            };
+            assert!(run("{}", MemberMode::Skip).is_ok());
+            assert!(run("[1]", MemberMode::Skip).is_err());
+            assert!(run("{\"a\": 1} x", MemberMode::Skip).is_err());
+            assert!(run("{\"a\": 1", MemberMode::Skip).is_err());
+            assert!(run("{\"a\": 1}", MemberMode::Elements).is_err());
+            assert!(run("{\"a\": [1 2]}", MemberMode::Elements).is_err());
+            // A callback error stops the walk and comes back as it was raised.
+            let err = stream_object_members(
+                &b"{\"a\": [1, 2]}"[..],
+                |_| MemberMode::Elements,
+                |_, _| Err(ParseError::custom("stop here")),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("stop here"));
+        }
 
         fn stream_collect(bytes: &[u8]) -> std::result::Result<Vec<Value>, ParseError> {
             let mut out = Vec::new();
@@ -2955,6 +3097,14 @@ mod json_support {
         out
     }
 
+    /// Appends `v` pretty-printed as if it sat `indent` spaces deep inside a
+    /// larger document. A caller that writes a big document one element at a
+    /// time uses this to get the exact text `to_pretty_string` would give
+    /// for the whole, without holding the whole tree.
+    pub(crate) fn write_pretty_at(out: &mut String, v: &Value, indent: usize) {
+        write_pretty(out, v, indent);
+    }
+
     // -----------------------------------------------------------------
     // The `json!` macro
     // -----------------------------------------------------------------
@@ -3458,6 +3608,12 @@ USAGE:
     sniff-rs graph <INPUT> [OUTPUT_DIR]             (see `sniff-rs graph --help`):
                                                     a knowledge graph across every file
                                                     and data type, with an Obsidian vault
+    sniff-rs search <INPUT> <QUERY>                 words -> the best matching nodes of a graph
+    sniff-rs neighbors <INPUT> <NODE>               the nodes around one node
+    sniff-rs subgraph <INPUT>                       cut a piece out of a graph
+    sniff-rs communities <INPUT>                    what the communities are, and how well they split
+                                                    (these four: see `sniff-rs <command> --help`)
+    sniff-rs completions <SHELL>                    a completion script for bash, zsh, fish or powershell
 
     If INPUT_PATH is a directory, every file under it (recursively) that
     sniff-rs can identify on its own is profiled, one output per input
@@ -3487,7 +3643,7 @@ USAGE:
     communities. Each takes a dictionary or a raw data file, like `diff`
     does - and like `diff`, a file or directory literally named
     "explain", "path", "rank", "search", "neighbors", "subgraph",
-    "communities", or "graph" needs a "./" prefix to be profiled instead
+    "communities", "completions", or "graph" needs a "./" prefix to be profiled instead
     of triggering its subcommand.
 
     `sniff-rs search`, `neighbors`, `subgraph` and `communities` query a
@@ -87610,6 +87766,10 @@ fn detect_relationships_scored(
     detect_relationships_with(tables, keep_all, false)
 }
 
+/// What `relationship_candidates` returns: the column pairs to judge, and
+/// how many over-large names or identifier kinds it left to their owners.
+type CandidatePairs = (Vec<((usize, u32), (usize, u32))>, usize);
+
 /// Every column pair `(table, column)` x `(table, column)` in different
 /// tables that `join_candidate` or `value_candidate` could turn into an
 /// edge, each pair once, ordered by (first table, first column, second
@@ -87618,12 +87778,17 @@ fn detect_relationships_scored(
 /// are asked about, so a table pair with nothing in common is never
 /// opened. A pair is proposed when:
 ///
-/// - the names say so (`knowledge_graph::name_candidates`, with no cap on
-///   a name group: the same name, a bare key and the foreign key named
-///   for its table, a role-prefixed key, the same noun) - exactly the name
-///   signals `join_candidate` accepts;
+/// - the names say so (`knowledge_graph::name_candidates`: the same name,
+///   a bare key and the foreign key named for its table, a role-prefixed
+///   key, the same noun) - exactly the name signals `join_candidate`
+///   accepts. A name held by more than `MAX_NAME_GROUP` tables pairs only
+///   with the table that owns it (the same bound the knowledge graph uses;
+///   without one, 5,000 tables sharing a few key names are millions of
+///   sibling edges and gigabytes of output). The count of such names is the
+///   second value returned;
 /// - both are identifiers of one kind (UUID, ULID, e-mail), under any
-///   names, since `join_candidate` links those on the domain alone;
+///   names, since `join_candidate` links those on the domain alone (a kind
+///   held by more than `MAX_NAME_GROUP` tables is skipped, and counted);
 /// - one is a table's own key (its first column or named for the table,
 ///   with nearly all distinct values) holding values the other also holds,
 ///   which is the only way `value_candidate` finds a join. A value sketch
@@ -87644,7 +87809,8 @@ fn detect_relationships_scored(
 fn relationship_candidates(
     tables: &[(&String, &Vec<ColumnProfile>)],
     idx: &LinkIndex,
-) -> Vec<((usize, u32), (usize, u32))> {
+) -> CandidatePairs {
+    let mut skipped = 0usize;
     let mut found: Vec<((usize, u32), (usize, u32))> = Vec::new();
     let named: Vec<(usize, usize, &str, &Vec<ColumnProfile>)> = tables
         .iter()
@@ -87695,9 +87861,14 @@ fn relationship_candidates(
         &named,
         &joinable,
         idx,
-        usize::MAX,
+        knowledge_graph::MAX_NAME_GROUP,
+        &mut skipped,
     ));
     for group in identifiers.values() {
+        if group.len() > knowledge_graph::MAX_NAME_GROUP {
+            skipped += 1;
+            continue;
+        }
         for (x, a) in group.iter().enumerate() {
             for b in &group[x + 1..] {
                 found.push((*a, *b));
@@ -87754,7 +87925,7 @@ fn relationship_candidates(
     found.retain(|(a, b)| a.0 != b.0);
     found.sort_unstable();
     found.dedup();
-    found
+    (found, skipped)
 }
 
 /// `detect_relationships_scored`; `exhaustive` asks every pair of columns
@@ -87846,7 +88017,15 @@ fn detect_relationships_with(
             }
         }
     } else {
-        for ((i, ci), (j, cj)) in relationship_candidates(&tables_vec, &idx) {
+        let (candidates, skipped) = relationship_candidates(&tables_vec, &idx);
+        if skipped > 0 {
+            eprintln!(
+                "note: {skipped} column name(s) or identifier kind(s) are held by more than {} tables each; \
+                 they pair only with the table that owns them, not with each other",
+                knowledge_graph::MAX_NAME_GROUP
+            );
+        }
+        for ((i, ci), (j, cj)) in candidates {
             if group_of[i] != group_of[j] {
                 out.extend(pair((i, ci as usize), (j, cj as usize), false));
             }
@@ -105885,6 +106064,8 @@ pub fn run() -> Result<()> {
         run_communities(&raw[1..])
     } else if raw.first().map(String::as_str) == Some("graph") {
         run_graph(&raw[1..])
+    } else if raw.first().map(String::as_str) == Some("completions") {
+        run_completions(&raw[1..])
     } else {
         run_main(&raw)
     };
@@ -105902,6 +106083,596 @@ pub fn run() -> Result<()> {
             std::process::exit(1);
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Shell completions for bash, zsh, fish and PowerShell.
+///
+/// The flag lists are read out of the help texts themselves (the lines of
+/// each `OPTIONS:` section), so a completion can never offer a flag the
+/// help does not show, and a new flag in a help text is completed with no
+/// second edit. Only the values some flags take (`--output-format md|json`)
+/// are listed here by hand.
+mod completions {
+    use super::*;
+
+    /// `(words, help)`: a command as typed after `sniff-rs`, and its help.
+    /// The empty command is the profiler itself.
+    const COMMANDS: &[(&str, &str)] = &[
+        ("", HELP_TEXT),
+        ("diff", DIFF_HELP_TEXT),
+        ("explain", EXPLAIN_HELP_TEXT),
+        ("path", PATH_HELP_TEXT),
+        ("rank", RANK_HELP_TEXT),
+        ("search", SEARCH_HELP_TEXT),
+        ("neighbors", NEIGHBORS_HELP_TEXT),
+        ("subgraph", SUBGRAPH_HELP_TEXT),
+        ("communities", COMMUNITIES_HELP_TEXT),
+        ("graph", GRAPH_HELP_TEXT),
+        ("graph merge", GRAPH_MERGE_HELP_TEXT),
+        ("completions", COMPLETIONS_HELP_TEXT),
+    ];
+
+    pub(super) const SHELLS: [&str; 4] = ["bash", "zsh", "fish", "powershell"];
+
+    struct Flag {
+        /// `--name`, or `-h`.
+        name: String,
+        takes_value: bool,
+        values: Vec<String>,
+    }
+
+    struct Command {
+        /// `"graph merge"`, or `""` for the profiler.
+        words: &'static str,
+        /// One line, from the help's first line (`sniff-rs diff - compare ...`).
+        summary: String,
+        flags: Vec<Flag>,
+    }
+
+    /// The options a help text lists: lines inside `OPTIONS:` with at most
+    /// eight spaces of indent that start with a dash (longer-indented lines
+    /// continue the description above them).
+    fn flags_in(help: &str) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = Vec::new();
+        let mut in_options = false;
+        for line in help.lines() {
+            if line.trim_end() == "OPTIONS:" {
+                in_options = true;
+                continue;
+            }
+            if !in_options {
+                continue;
+            }
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim_start();
+            if indent > 8 || !t.starts_with('-') {
+                continue;
+            }
+            // The spec ends where the description starts: two spaces.
+            let spec = t.split("  ").next().unwrap_or(t);
+            let takes_value = spec.contains('<');
+            for part in spec.split(", ") {
+                let name = part.split_whitespace().next().unwrap_or("");
+                if name.starts_with('-') && !out.iter().any(|(n, _)| n == name) {
+                    out.push((name.to_string(), takes_value));
+                }
+            }
+        }
+        out
+    }
+
+    fn summary_of(help: &str) -> String {
+        let first = help.lines().next().unwrap_or("");
+        match first.split_once(" - ") {
+            Some((_, rest)) => rest.trim().to_string(),
+            None => String::new(),
+        }
+    }
+
+    fn values_for(words: &str, flag: &str) -> Vec<String> {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match flag {
+            "--output-format" => match words {
+                "" => v(&["md", "json", "json-schema", "sql"]),
+                "graph" => {
+                    let mut all = v(&["md", "json"]);
+                    all.extend(
+                        knowledge_graph::EXPORT_FORMATS
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                    all
+                }
+                _ => v(&["md", "json"]),
+            },
+            "--sql-mode" => v(&["inline", "staging"]),
+            "--format" if words.is_empty() || words == "diff" => FORMAT_CATALOG
+                .iter()
+                .filter(|f| !f.directory)
+                .map(|f| f.name.to_string())
+                .collect(),
+            "--encoding" => v(&[
+                "utf-8",
+                "utf-16",
+                "utf-16le",
+                "utf-16be",
+                "utf-32",
+                "utf-32le",
+                "utf-32be",
+                "windows-1252",
+                "latin1",
+                "iso-8859-1",
+                "iso-8859-15",
+                "cp437",
+                "cp866",
+                "koi8-r",
+                "macintosh",
+                "shift_jis",
+                "euc-jp",
+                "iso-2022-jp",
+                "euc-kr",
+                "gbk",
+                "gb18030",
+                "big5",
+            ]),
+            "--confidence" => v(&["extracted", "inferred", "any"]),
+            "--relation" => knowledge_graph::relation_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            "--export" => knowledge_graph::EXPORT_FORMATS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "--sort" => v(&["degree", "importance"]),
+            "--type" => knowledge_graph::node_type_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn commands() -> Vec<Command> {
+        COMMANDS
+            .iter()
+            .map(|&(words, help)| Command {
+                words,
+                summary: summary_of(help),
+                flags: flags_in(help)
+                    .into_iter()
+                    .map(|(name, takes_value)| Flag {
+                        values: if takes_value {
+                            values_for(words, &name)
+                        } else {
+                            Vec::new()
+                        },
+                        takes_value,
+                        name,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The first words of the subcommands (`graph merge` is under `graph`).
+    fn subcommand_names(cmds: &[Command]) -> Vec<&'static str> {
+        cmds.iter()
+            .filter(|c| !c.words.is_empty() && !c.words.contains(' '))
+            .map(|c| c.words)
+            .collect()
+    }
+
+    fn id_of(words: &str) -> String {
+        words.replace(' ', "_")
+    }
+
+    pub(super) fn script(shell: &str) -> Result<String> {
+        let cmds = commands();
+        match shell {
+            "bash" => Ok(bash(&cmds)),
+            "zsh" => Ok(zsh(&cmds)),
+            "fish" => Ok(fish(&cmds)),
+            "powershell" | "pwsh" => Ok(powershell(&cmds)),
+            other => bail!(
+                "unknown shell {other:?} - choose one of {}",
+                SHELLS.join(", ")
+            ),
+        }
+    }
+
+    fn bash(cmds: &[Command]) -> String {
+        let subs = subcommand_names(cmds).join(" ");
+        let mut s = String::new();
+        s.push_str("# bash completion for sniff-rs. Load it with:\n");
+        s.push_str("#   source <(sniff-rs completions bash)\n");
+        s.push_str("_sniff_rs() {\n");
+        s.push_str("    local cur prev cmd\n");
+        s.push_str("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
+        s.push_str("    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n");
+        s.push_str("    cmd=\"\"\n");
+        s.push_str("    case \"${COMP_WORDS[1]}\" in\n");
+        s.push_str(&format!(
+            "        {}) cmd=\"${{COMP_WORDS[1]}}\" ;;\n",
+            subs.replace(' ', "|")
+        ));
+        s.push_str("    esac\n");
+        s.push_str("    if [[ \"$cmd\" == graph && \"${COMP_WORDS[2]}\" == merge ]]; then cmd=graph_merge; fi\n");
+        s.push_str("    case \"$cmd:$prev\" in\n");
+        for c in cmds {
+            for f in &c.flags {
+                if !f.values.is_empty() {
+                    s.push_str(&format!(
+                        "        \"{}:{}\") COMPREPLY=( $(compgen -W \"{}\" -- \"$cur\") ); return ;;\n",
+                        id_of(c.words),
+                        f.name,
+                        f.values.join(" ")
+                    ));
+                }
+            }
+        }
+        s.push_str("    esac\n");
+        s.push_str("    local opts\n");
+        s.push_str("    case \"$cmd\" in\n");
+        for c in cmds {
+            let names: Vec<&str> = c.flags.iter().map(|f| f.name.as_str()).collect();
+            let label = if c.words.is_empty() {
+                "\"\"".to_string()
+            } else {
+                id_of(c.words)
+            };
+            s.push_str(&format!(
+                "        {label}) opts=\"{}\" ;;\n",
+                names.join(" ")
+            ));
+        }
+        s.push_str("    esac\n");
+        s.push_str("    if [[ \"$cur\" == -* ]]; then\n");
+        s.push_str("        COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )\n");
+        s.push_str("    elif [[ $COMP_CWORD -eq 1 ]]; then\n");
+        s.push_str(&format!(
+            "        COMPREPLY=( $(compgen -W \"{subs}\" -- \"$cur\") $(compgen -f -- \"$cur\") )\n"
+        ));
+        s.push_str("    elif [[ \"$cmd\" == graph && $COMP_CWORD -eq 2 ]]; then\n");
+        s.push_str(
+            "        COMPREPLY=( $(compgen -W \"merge\" -- \"$cur\") $(compgen -f -- \"$cur\") )\n",
+        );
+        s.push_str("    else\n");
+        s.push_str("        COMPREPLY=( $(compgen -f -- \"$cur\") )\n");
+        s.push_str("    fi\n");
+        s.push_str("}\n");
+        s.push_str("complete -o filenames -o bashdefault -F _sniff_rs sniff-rs\n");
+        s
+    }
+
+    /// Flags whose value is a file or directory name.
+    fn is_path_flag(name: &str) -> bool {
+        name.contains("dir")
+            || matches!(
+                name,
+                "--config" | "--links" | "--resolution-sql" | "--obsidian" | "--widths-file"
+            )
+    }
+
+    fn zsh_quote(text: &str) -> String {
+        text.replace('\'', "'\\''")
+    }
+
+    fn zsh(cmds: &[Command]) -> String {
+        let mut s = String::new();
+        s.push_str("#compdef sniff-rs\n");
+        s.push_str("# zsh completion for sniff-rs. Put it on your fpath as _sniff-rs, or:\n");
+        s.push_str("#   source <(sniff-rs completions zsh)\n");
+        s.push_str("_sniff-rs() {\n");
+        s.push_str("    local -a subcommands\n    subcommands=(\n");
+        for c in cmds
+            .iter()
+            .filter(|c| !c.words.is_empty() && !c.words.contains(' '))
+        {
+            s.push_str(&format!(
+                "        '{}:{}'\n",
+                c.words,
+                zsh_quote(&c.summary.replace(':', " "))
+            ));
+        }
+        s.push_str("    )\n");
+        s.push_str("    local cmd=\"\"\n");
+        s.push_str("    if (( CURRENT > 2 )) && (( ${subcommands[(I)${words[2]}:*]} )); then cmd=${words[2]}; fi\n");
+        s.push_str(
+            "    if [[ $cmd == graph && ${words[3]} == merge ]]; then cmd=graph_merge; fi\n",
+        );
+        s.push_str("    if (( CURRENT == 2 )); then\n");
+        s.push_str("        _describe -t subcommands 'subcommand' subcommands\n");
+        s.push_str("        _files\n");
+        s.push_str("        return\n    fi\n");
+        s.push_str("    case $cmd in\n");
+        for c in cmds {
+            let label = if c.words.is_empty() {
+                "''".to_string()
+            } else {
+                id_of(c.words)
+            };
+            s.push_str(&format!("        {label})\n            _arguments \\\n"));
+            for f in &c.flags {
+                let spec = if f.takes_value {
+                    let action = if !f.values.is_empty() {
+                        format!("({})", f.values.join(" "))
+                    } else if is_path_flag(&f.name) {
+                        "_files".to_string()
+                    } else {
+                        " ".to_string()
+                    };
+                    format!("'{}=:value:{}'", f.name, zsh_quote(&action))
+                } else {
+                    format!("'{}'", f.name)
+                };
+                s.push_str(&format!("                {spec} \\\n"));
+            }
+            s.push_str("                '*:file:_files'\n            ;;\n");
+        }
+        s.push_str("    esac\n}\n");
+        s.push_str("if [[ ${funcstack[1]} == _sniff-rs ]]; then _sniff-rs \"$@\"; else compdef _sniff-rs sniff-rs; fi\n");
+        s
+    }
+
+    fn fish(cmds: &[Command]) -> String {
+        let subs = subcommand_names(cmds);
+        let mut s = String::new();
+        s.push_str("# fish completion for sniff-rs. Load it with:\n");
+        s.push_str("#   sniff-rs completions fish | source\n");
+        for c in cmds
+            .iter()
+            .filter(|c| !c.words.is_empty() && !c.words.contains(' '))
+        {
+            s.push_str(&format!(
+                "complete -c sniff-rs -n '__fish_use_subcommand' -a {} -d '{}'\n",
+                c.words,
+                c.summary.replace('\'', "")
+            ));
+        }
+        s.push_str("complete -c sniff-rs -n '__fish_seen_subcommand_from graph' -a merge -d 'one graph from several'\n");
+        for c in cmds {
+            let cond = if c.words.is_empty() {
+                format!("-n 'not __fish_seen_subcommand_from {}'", subs.join(" "))
+            } else if c.words == "graph merge" {
+                "-n '__fish_seen_subcommand_from merge'".to_string()
+            } else if c.words == "graph" {
+                "-n '__fish_seen_subcommand_from graph; and not __fish_seen_subcommand_from merge'"
+                    .to_string()
+            } else {
+                format!("-n '__fish_seen_subcommand_from {}'", c.words)
+            };
+            for f in &c.flags {
+                let mut line = format!("complete -c sniff-rs {cond}");
+                if let Some(long) = f.name.strip_prefix("--") {
+                    line.push_str(&format!(" -l {long}"));
+                } else if let Some(short) = f.name.strip_prefix('-') {
+                    line.push_str(&format!(" -s {short}"));
+                }
+                if f.takes_value {
+                    if f.values.is_empty() {
+                        line.push_str(if is_path_flag(&f.name) {
+                            " -r -F"
+                        } else {
+                            " -x"
+                        });
+                    } else {
+                        line.push_str(&format!(" -x -a '{}'", f.values.join(" ")));
+                    }
+                }
+                line.push('\n');
+                s.push_str(&line);
+            }
+        }
+        s
+    }
+
+    fn powershell(cmds: &[Command]) -> String {
+        let subs = subcommand_names(cmds);
+        let mut s = String::new();
+        s.push_str("# PowerShell completion for sniff-rs. Load it with:\n");
+        s.push_str("#   sniff-rs completions powershell | Out-String | Invoke-Expression\n");
+        s.push_str("Register-ArgumentCompleter -Native -CommandName 'sniff-rs' -ScriptBlock {\n");
+        s.push_str("    param($wordToComplete, $commandAst, $cursorPosition)\n");
+        s.push_str(
+            "    $words = @($commandAst.CommandElements | ForEach-Object { $_.ToString() })\n",
+        );
+        s.push_str(&format!(
+            "    $subs = @({})\n",
+            subs.iter()
+                .map(|w| format!("'{w}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        s.push_str("    $cmd = ''\n");
+        s.push_str(
+            "    if ($words.Count -gt 1 -and $subs -contains $words[1]) { $cmd = $words[1] }\n",
+        );
+        s.push_str("    if ($cmd -eq 'graph' -and $words.Count -gt 2 -and $words[2] -eq 'merge') { $cmd = 'graph_merge' }\n");
+        s.push_str("    $prev = if ($wordToComplete -eq '') { $words[-1] } else { if ($words.Count -gt 1) { $words[-2] } else { '' } }\n");
+        s.push_str("    $values = @{\n");
+        for c in cmds {
+            for f in &c.flags {
+                if !f.values.is_empty() {
+                    s.push_str(&format!(
+                        "        '{}:{}' = @({})\n",
+                        id_of(c.words),
+                        f.name,
+                        f.values
+                            .iter()
+                            .map(|v| format!("'{v}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+        }
+        s.push_str("    }\n");
+        s.push_str("    $key = \"${cmd}:${prev}\"\n");
+        s.push_str("    if ($values.ContainsKey($key)) {\n");
+        s.push_str("        $values[$key] | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n");
+        s.push_str("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n");
+        s.push_str("        }\n        return\n    }\n");
+        s.push_str("    $flags = @{\n");
+        for c in cmds {
+            let names: Vec<String> = c.flags.iter().map(|f| format!("'{}'", f.name)).collect();
+            s.push_str(&format!(
+                "        '{}' = @({})\n",
+                id_of(c.words),
+                names.join(", ")
+            ));
+        }
+        s.push_str("    }\n");
+        s.push_str("    if ($wordToComplete -like '-*') {\n");
+        s.push_str("        $flags[$cmd] | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n");
+        s.push_str("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)\n");
+        s.push_str("        }\n");
+        s.push_str("    } elseif ($words.Count -le 2) {\n");
+        s.push_str(
+            "        $subs | Where-Object { $_ -like \"$wordToComplete*\" } | ForEach-Object {\n",
+        );
+        s.push_str("            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)\n");
+        s.push_str("        }\n");
+        s.push_str("    }\n");
+        s.push_str("}\n");
+        s
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn flags_come_out_of_the_options_section_only() {
+            let help = "USAGE:\n    sniff-rs x\n\n    prose with --not-a-flag in it\n\nOPTIONS:\n        --samples <N>   how many\n                        --wrapped-mention in a description\n    -h, --help          Print this help\n        --combine       one output\n";
+            let flags = flags_in(help);
+            let names: Vec<&str> = flags.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["--samples", "-h", "--help", "--combine"]);
+            assert!(flags[0].1);
+            assert!(!flags[3].1);
+        }
+
+        #[test]
+        fn every_command_lists_its_help_and_the_main_flags_are_found() {
+            let cmds = commands();
+            assert_eq!(cmds.len(), COMMANDS.len());
+            for c in &cmds {
+                assert!(
+                    c.flags.iter().any(|f| f.name == "--help"),
+                    "{:?} lists no --help",
+                    c.words
+                );
+            }
+            let main = &cmds[0];
+            for want in [
+                "--output-format",
+                "--format",
+                "--encoding",
+                "--nrows",
+                "--combine",
+            ] {
+                assert!(
+                    main.flags.iter().any(|f| f.name == want),
+                    "main lacks {want}"
+                );
+            }
+            let of = main
+                .flags
+                .iter()
+                .find(|f| f.name == "--output-format")
+                .unwrap();
+            assert_eq!(of.values, ["md", "json", "json-schema", "sql"]);
+            let graph = cmds.iter().find(|c| c.words == "graph").unwrap();
+            assert!(graph.flags.iter().any(|f| f.name == "--export"));
+            assert!(graph.flags.iter().any(|f| f.name == "--links"));
+            let merge = cmds.iter().find(|c| c.words == "graph merge").unwrap();
+            assert!(merge.flags.iter().any(|f| f.name == "--by"));
+        }
+
+        #[test]
+        fn every_value_list_names_something_the_parser_accepts() {
+            let cmds = commands();
+            for c in &cmds {
+                for f in &c.flags {
+                    if f.name == "--relation" {
+                        for v in &f.values {
+                            assert!(knowledge_graph::Relation::parse(v).is_some(), "{v}");
+                        }
+                    }
+                    if f.name == "--type" {
+                        for v in &f.values {
+                            assert!(knowledge_graph::NodeType::parse(v).is_some(), "{v}");
+                        }
+                    }
+                    if f.name == "--format" && c.words.is_empty() {
+                        assert!(f.values.iter().any(|v| v == "csv"));
+                        assert!(!f.values.iter().any(|v| v == "delta"));
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn each_script_mentions_every_subcommand_and_rejects_an_unknown_shell() {
+            for shell in SHELLS {
+                let text = script(shell).unwrap();
+                for sub in subcommand_names(&commands()) {
+                    assert!(text.contains(sub), "{shell} script lacks {sub}");
+                }
+                // fish spells a long flag `-l name`.
+                let flag = if shell == "fish" {
+                    "-l output-format"
+                } else {
+                    "--output-format"
+                };
+                assert!(text.contains(flag), "{shell}");
+            }
+            let err = script("tcsh").unwrap_err().to_string();
+            assert!(
+                err.contains("unknown shell") && err.contains("bash"),
+                "{err}"
+            );
+        }
+    }
+}
+
+const COMPLETIONS_HELP_TEXT: &str = r#"sniff-rs completions - shell completion script
+
+USAGE:
+    sniff-rs completions <SHELL>
+
+    Prints a completion script for <SHELL>: bash, zsh, fish or powershell.
+    It completes the subcommands, every flag of each (read from the same
+    help text `--help` prints), and the values of the flags that take a
+    fixed set (--output-format, --format, --encoding, --relation, ...).
+    A file or directory literally named "completions" needs a "./" prefix
+    to be profiled instead of triggering this subcommand.
+
+      bash         source <(sniff-rs completions bash)
+      zsh          sniff-rs completions zsh > "${fpath[1]}/_sniff-rs"
+      fish         sniff-rs completions fish | source
+      powershell   sniff-rs completions powershell | Out-String | Invoke-Expression
+
+OPTIONS:
+    -h, --help                  Print this help
+"#;
+
+/// `sniff-rs completions <SHELL>`: prints the script to stdout.
+fn run_completions(raw: &[String]) -> Result<()> {
+    match raw {
+        [a] if a == "-h" || a == "--help" => {
+            print!("{COMPLETIONS_HELP_TEXT}");
+            Ok(())
+        }
+        [shell] => {
+            print!("{}", completions::script(shell)?);
+            Ok(())
+        }
+        _ => bail!(
+            "usage: sniff-rs completions <{}>",
+            completions::SHELLS.join("|")
+        ),
     }
 }
 
@@ -111886,6 +112657,27 @@ fn run_subgraph(raw: &[String]) -> Result<()> {
         GraphFormat::Md => knowledge_graph::render_report(&sub),
     };
     emit_graph_output(&rendered, &args.output, &status)
+}
+
+/// Writes `graph.json` for `kg` to `path` without building the whole
+/// document in memory (see `knowledge_graph::write_graph_json`).
+fn write_graph_json_file(kg: &knowledge_graph::KnowledgeGraph, path: &Path) -> Result<()> {
+    use std::io::Write;
+    let file = fs::File::create(path).with_context(|| format!("failed to write {path:?}"))?;
+    let mut out = std::io::BufWriter::new(file);
+    knowledge_graph::write_graph_json(kg, &mut out)
+        .and_then(|()| out.flush())
+        .with_context(|| format!("failed to write {path:?}"))
+}
+
+/// Prints `graph.json` for `kg` to stdout, streamed, with a final newline.
+fn print_graph_json(kg: &knowledge_graph::KnowledgeGraph) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    knowledge_graph::write_graph_json(kg, &mut out)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush())
+        .context("failed to write the graph")
 }
 
 fn run_communities(raw: &[String]) -> Result<()> {
@@ -125697,6 +126489,27 @@ mod knowledge_graph {
         Near,
     }
 
+    /// The names `--relation` accepts, in declaration order.
+    pub(crate) fn relation_names() -> Vec<&'static str> {
+        Relation::ALL.iter().map(|r| r.as_str()).collect()
+    }
+
+    /// The names `--type` accepts.
+    pub(crate) fn node_type_names() -> Vec<&'static str> {
+        [
+            NodeType::File,
+            NodeType::Table,
+            NodeType::Entity,
+            NodeType::Schema,
+            NodeType::Folder,
+            NodeType::Column,
+            NodeType::Person,
+        ]
+        .iter()
+        .map(|t| t.as_str())
+        .collect()
+    }
+
     impl Relation {
         pub(crate) const ALL: [Relation; 30] = [
             Relation::Contains,
@@ -129780,7 +130593,7 @@ mod knowledge_graph {
     /// every member with every other: past that, a name is shared by so
     /// many tables that it names a convention. The tables that own the
     /// key still pair with all of them.
-    const MAX_NAME_GROUP: usize = 512;
+    pub(crate) const MAX_NAME_GROUP: usize = 512;
 
     /// Table pairs `(i, j)`, `i < j`, in different schema groups, that can
     /// hold a join, in ascending order. Two ways make a column pair
@@ -129846,7 +130659,10 @@ mod knowledge_graph {
             i = j;
         }
         drop(entries);
-        for ((ta, ca), (tb, cb)) in name_candidates(tables, &joinable, idx, MAX_NAME_GROUP) {
+        let mut skipped = 0;
+        for ((ta, ca), (tb, cb)) in
+            name_candidates(tables, &joinable, idx, MAX_NAME_GROUP, &mut skipped)
+        {
             if skip(ta, tb) {
                 continue;
             }
@@ -129884,6 +130700,7 @@ mod knowledge_graph {
         cols: &BTreeSet<(u32, u32)>,
         idx: &LinkIndex,
         max_group: usize,
+        skipped: &mut usize,
     ) -> Vec<((usize, u32), (usize, u32))> {
         if cols.is_empty() {
             return Vec::new();
@@ -129962,6 +130779,10 @@ mod knowledge_graph {
                 }
                 continue;
             }
+            if marked {
+                // Too many tables hold it: only its owners pair with the rest.
+                *skipped += 1;
+            }
             let lead_owner: Option<&str> =
                 if idx.name_tables.get(name).is_some_and(|ts| ts.len() == 2) || marked {
                     match idx.lead_tables.get(name).map(Vec::as_slice) {
@@ -129988,6 +130809,7 @@ mod knowledge_graph {
             let groups: Vec<&Vec<usize>> = names.values().collect();
             let total: usize = groups.iter().map(|g| g.len()).sum();
             if total > max_group {
+                *skipped += 1;
                 continue;
             }
             for x in 0..groups.len() {
@@ -130851,7 +131673,8 @@ mod knowledge_graph {
     /// The JSON Schema (draft-07) `graph.json` follows.
     pub(crate) const GRAPH_JSON_SCHEMA: &str = include_str!("graph.schema.json");
 
-    pub(crate) fn to_json(kg: &KnowledgeGraph) -> JsonValue {
+    /// The `graph` object at the top of `graph.json`: counts and communities.
+    fn graph_header_json(kg: &KnowledgeGraph) -> json_support::Map {
         let mut graph = json_support::Map::new();
         graph.insert(
             "generator".to_string(),
@@ -130897,80 +131720,122 @@ mod knowledge_graph {
                     .collect(),
             ),
         );
-        let nodes: Vec<JsonValue> = kg
-            .nodes
-            .iter()
-            .map(|n| {
-                let mut m = json_support::Map::with_capacity(6 + n.attrs.len());
-                m.insert("id".to_string(), JsonValue::from(n.id.clone()));
-                m.insert("label".to_string(), JsonValue::from(n.label.clone()));
-                m.insert("type".to_string(), JsonValue::from(n.node_type.as_str()));
-                m.insert(
-                    "file_type".to_string(),
-                    JsonValue::from(n.file_type.clone()),
-                );
-                if let Some(s) = &n.source_file {
-                    m.insert("source_file".to_string(), JsonValue::from(s.clone()));
-                }
-                m.insert("community".to_string(), JsonValue::from(n.community));
-                for (k, v) in n.attrs.iter() {
-                    m.insert(k.clone(), v.clone());
-                }
-                JsonValue::Object(m)
-            })
-            .collect();
-        let links: Vec<JsonValue> = kg
-            .edges
-            .iter()
-            .map(|e| {
-                let mut m = json_support::Map::with_capacity(7);
-                m.insert(
-                    "source".to_string(),
-                    JsonValue::from(kg.nodes[e.source].id.clone()),
-                );
-                m.insert(
-                    "target".to_string(),
-                    JsonValue::from(kg.nodes[e.target].id.clone()),
-                );
-                m.insert("relation".to_string(), JsonValue::from(e.relation.as_str()));
-                m.insert(
-                    "confidence".to_string(),
-                    JsonValue::from(e.confidence.as_str()),
-                );
-                m.insert(
-                    "confidence_score".to_string(),
-                    JsonValue::from(round3(e.score)),
-                );
-                m.insert("weight".to_string(), JsonValue::from(round3(e.weight)));
-                m.insert(
-                    "evidence".to_string(),
-                    JsonValue::Array(e.evidence.iter().cloned().map(JsonValue::from).collect()),
-                );
-                if e.directed {
-                    m.insert("directed".to_string(), JsonValue::from(true));
-                }
-                if e.provenance != Provenance::Extracted {
-                    m.insert(
-                        "provenance".to_string(),
-                        JsonValue::from(e.provenance.as_str()),
-                    );
-                }
-                if let Some(by) = &e.by {
-                    m.insert("by".to_string(), JsonValue::from(by.clone()));
-                }
-                if let Some(label) = &e.label {
-                    m.insert("label".to_string(), JsonValue::from(label.clone()));
-                }
-                JsonValue::Object(m)
-            })
-            .collect();
+        graph
+    }
+
+    fn node_to_json(n: &KgNode) -> JsonValue {
+        let mut m = json_support::Map::with_capacity(6 + n.attrs.len());
+        m.insert("id".to_string(), JsonValue::from(n.id.clone()));
+        m.insert("label".to_string(), JsonValue::from(n.label.clone()));
+        m.insert("type".to_string(), JsonValue::from(n.node_type.as_str()));
+        m.insert(
+            "file_type".to_string(),
+            JsonValue::from(n.file_type.clone()),
+        );
+        if let Some(s) = &n.source_file {
+            m.insert("source_file".to_string(), JsonValue::from(s.clone()));
+        }
+        m.insert("community".to_string(), JsonValue::from(n.community));
+        for (k, v) in n.attrs.iter() {
+            m.insert(k.clone(), v.clone());
+        }
+        JsonValue::Object(m)
+    }
+
+    fn link_to_json(kg: &KnowledgeGraph, e: &KgEdge) -> JsonValue {
+        let mut m = json_support::Map::with_capacity(7);
+        m.insert(
+            "source".to_string(),
+            JsonValue::from(kg.nodes[e.source].id.clone()),
+        );
+        m.insert(
+            "target".to_string(),
+            JsonValue::from(kg.nodes[e.target].id.clone()),
+        );
+        m.insert("relation".to_string(), JsonValue::from(e.relation.as_str()));
+        m.insert(
+            "confidence".to_string(),
+            JsonValue::from(e.confidence.as_str()),
+        );
+        m.insert(
+            "confidence_score".to_string(),
+            JsonValue::from(round3(e.score)),
+        );
+        m.insert("weight".to_string(), JsonValue::from(round3(e.weight)));
+        m.insert(
+            "evidence".to_string(),
+            JsonValue::Array(e.evidence.iter().cloned().map(JsonValue::from).collect()),
+        );
+        if e.directed {
+            m.insert("directed".to_string(), JsonValue::from(true));
+        }
+        if e.provenance != Provenance::Extracted {
+            m.insert(
+                "provenance".to_string(),
+                JsonValue::from(e.provenance.as_str()),
+            );
+        }
+        if let Some(by) = &e.by {
+            m.insert("by".to_string(), JsonValue::from(by.clone()));
+        }
+        if let Some(label) = &e.label {
+            m.insert("label".to_string(), JsonValue::from(label.clone()));
+        }
+        JsonValue::Object(m)
+    }
+
+    pub(crate) fn to_json(kg: &KnowledgeGraph) -> JsonValue {
+        let nodes: Vec<JsonValue> = kg.nodes.iter().map(node_to_json).collect();
+        let links: Vec<JsonValue> = kg.edges.iter().map(|e| link_to_json(kg, e)).collect();
         let mut doc = json_support::Map::with_capacity(5);
         doc.insert("directed".to_string(), JsonValue::from(false));
         doc.insert("multigraph".to_string(), JsonValue::from(true));
-        doc.insert("graph".to_string(), JsonValue::Object(graph));
+        doc.insert(
+            "graph".to_string(),
+            JsonValue::Object(graph_header_json(kg)),
+        );
         doc.insert("nodes".to_string(), JsonValue::Array(nodes));
         doc.insert("links".to_string(), JsonValue::Array(links));
         JsonValue::Object(doc)
+    }
+
+    /// Writes exactly the text `to_pretty_string(&to_json(kg))` gives, one node
+    /// or link at a time, so a graph of a million links never exists as a
+    /// value tree. No trailing newline.
+    pub(crate) fn write_graph_json(
+        kg: &KnowledgeGraph,
+        w: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        const FLUSH_AT: usize = 1 << 16;
+        let mut buf = String::with_capacity(FLUSH_AT * 2);
+        buf.push_str("{\n  \"directed\": false,\n  \"multigraph\": true,\n  \"graph\": ");
+        json_support::write_pretty_at(&mut buf, &JsonValue::Object(graph_header_json(kg)), 2);
+        for (name, count) in [("nodes", kg.nodes.len()), ("links", kg.edges.len())] {
+            buf.push_str(",\n  \"");
+            buf.push_str(name);
+            buf.push_str("\": ");
+            if count == 0 {
+                buf.push_str("[]");
+                continue;
+            }
+            buf.push('[');
+            for i in 0..count {
+                buf.push_str(if i == 0 { "\n    " } else { ",\n    " });
+                let v = if name == "nodes" {
+                    node_to_json(&kg.nodes[i])
+                } else {
+                    link_to_json(kg, &kg.edges[i])
+                };
+                json_support::write_pretty_at(&mut buf, &v, 4);
+                if buf.len() >= FLUSH_AT {
+                    w.write_all(buf.as_bytes())?;
+                    buf.clear();
+                }
+            }
+            buf.push_str("\n  ]");
+        }
+        buf.push_str("\n}");
+        w.write_all(buf.as_bytes())
     }
 
     /// Whether a file looks like a `graph.json` this tool wrote: a
@@ -130990,164 +131855,227 @@ mod knowledge_graph {
     }
 
     /// Read a `graph.json` back (for `explain`/`path`/`rank`).
-    pub(crate) fn from_json(path: &Path) -> Result<KnowledgeGraph> {
-        let text = fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let doc =
-            json_support::from_str(&text).with_context(|| format!("{path:?} is not valid JSON"))?;
-        drop(text);
-        let JsonValue::Object(doc) = doc else {
-            bail!("{path:?} is not a graph.json object");
+    /// Reads the `graph` object of a `graph.json`: the input name, the
+    /// unresolved-reference count, the community labels, and the version
+    /// check.
+    fn read_graph_header(
+        path: &Path,
+        g: JsonValue,
+        input: &mut String,
+        unresolved: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<()> {
+        let JsonValue::Object(g) = g else {
+            return Ok(());
         };
-        let mut input = String::new();
-        let mut labels: Vec<String> = Vec::new();
-        let mut unresolved = 0;
-        let mut nodes_json = Vec::new();
-        let mut links_json = Vec::new();
-        for (k, v) in doc {
-            match (k.as_str(), v) {
-                ("graph", JsonValue::Object(g)) => {
-                    for (gk, gv) in g {
-                        match (gk.as_str(), gv) {
-                            ("version", n) => {
-                                let v = n.as_u64().unwrap_or(0);
-                                if v > GRAPH_JSON_VERSION {
-                                    bail!(
-                                        "{path:?} is graph.json version {v}, written by a newer sniff-rs; this one reads up to version {GRAPH_JSON_VERSION}"
-                                    );
-                                }
-                            }
-                            ("input", JsonValue::String(s)) => input = s,
-                            ("unresolved_references", n) => {
-                                unresolved = n.as_u64().unwrap_or(0) as usize;
-                            }
-                            ("communities", JsonValue::Array(cs)) => {
-                                for c in cs {
-                                    labels.push(
-                                        c.get("label")
-                                            .and_then(|l| l.as_str())
-                                            .unwrap_or("")
-                                            .to_string(),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
+        for (gk, gv) in g {
+            match (gk.as_str(), gv) {
+                ("version", n) => {
+                    let v = n.as_u64().unwrap_or(0);
+                    if v > GRAPH_JSON_VERSION {
+                        bail!(
+                            "{path:?} is graph.json version {v}, written by a newer sniff-rs; this one reads up to version {GRAPH_JSON_VERSION}"
+                        );
                     }
                 }
-                ("nodes", JsonValue::Array(a)) => nodes_json = a,
-                ("links", JsonValue::Array(a)) => links_json = a,
+                ("input", JsonValue::String(s)) => *input = s,
+                ("unresolved_references", n) => {
+                    *unresolved = n.as_u64().unwrap_or(0) as usize;
+                }
+                ("communities", JsonValue::Array(cs)) => {
+                    for c in cs {
+                        labels.push(
+                            c.get("label")
+                                .and_then(|l| l.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
-        let mut nodes = Vec::with_capacity(nodes_json.len());
-        let mut index: HashMap<String, usize> = HashMap::new();
-        for v in nodes_json {
-            let JsonValue::Object(obj) = v else {
-                bail!("{path:?}: a node isn't a JSON object");
-            };
-            let mut id = None;
-            let mut label = String::new();
-            let mut node_type = NodeType::File;
-            let mut file_type = String::new();
-            let mut source_file = None;
-            let mut community = 0usize;
-            let mut attrs = json_support::Map::new();
-            for (k, v) in obj {
-                match k.as_str() {
-                    "id" => id = v.as_str().map(str::to_string),
-                    "label" => label = v.as_str().unwrap_or("").to_string(),
-                    "type" => {
-                        node_type = v
-                            .as_str()
-                            .and_then(NodeType::parse)
-                            .unwrap_or(NodeType::File)
-                    }
-                    "file_type" => file_type = v.as_str().unwrap_or("").to_string(),
-                    "source_file" => source_file = v.as_str().map(str::to_string),
-                    "community" => community = v.as_u64().unwrap_or(0) as usize,
-                    _ => {
-                        attrs.insert(k, v);
-                    }
+        Ok(())
+    }
+
+    /// One node of a `graph.json`.
+    fn node_from_json(path: &Path, v: JsonValue) -> Result<KgNode> {
+        let JsonValue::Object(obj) = v else {
+            bail!("{path:?}: a node isn't a JSON object");
+        };
+        let mut id = None;
+        let mut label = String::new();
+        let mut node_type = NodeType::File;
+        let mut file_type = String::new();
+        let mut source_file = None;
+        let mut community = 0usize;
+        let mut attrs = json_support::Map::new();
+        for (k, v) in obj {
+            match k.as_str() {
+                "id" => id = v.as_str().map(str::to_string),
+                "label" => label = v.as_str().unwrap_or("").to_string(),
+                "type" => {
+                    node_type = v
+                        .as_str()
+                        .and_then(NodeType::parse)
+                        .unwrap_or(NodeType::File)
+                }
+                "file_type" => file_type = v.as_str().unwrap_or("").to_string(),
+                "source_file" => source_file = v.as_str().map(str::to_string),
+                "community" => community = v.as_u64().unwrap_or(0) as usize,
+                _ => {
+                    attrs.insert(k, v);
                 }
             }
-            let id = id.ok_or_else(|| anyhow!("{path:?}: a node has no \"id\""))?;
-            index.insert(id.clone(), nodes.len());
-            nodes.push(KgNode {
-                id,
-                label,
-                node_type,
-                file_type,
-                source_file,
-                attrs,
-                community,
-            });
         }
-        let mut edges = Vec::with_capacity(links_json.len());
-        for v in links_json {
-            let node_of = |key: &str| -> Result<usize> {
-                let id = v
-                    .get(key)
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| anyhow!("{path:?}: a link has no {key:?}"))?;
-                index
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| anyhow!("{path:?}: a link names unknown node {id:?}"))
-            };
-            let source = node_of("source")?;
-            let target = node_of("target")?;
-            let relation = v
-                .get("relation")
+        let id = id.ok_or_else(|| anyhow!("{path:?}: a node has no \"id\""))?;
+        Ok(KgNode {
+            id,
+            label,
+            node_type,
+            file_type,
+            source_file,
+            attrs,
+            community,
+        })
+    }
+
+    /// One link of a `graph.json`; both ends must name a node already read.
+    fn edge_from_json(
+        path: &Path,
+        v: &JsonValue,
+        index: &HashMap<String, usize>,
+    ) -> Result<KgEdge> {
+        let node_of = |key: &str| -> Result<usize> {
+            let id = v
+                .get(key)
                 .and_then(|s| s.as_str())
-                .and_then(Relation::parse)
-                .unwrap_or(Relation::Mentions);
-            let confidence = v
-                .get("confidence")
-                .and_then(|s| s.as_str())
-                .and_then(Conf::parse)
-                .unwrap_or(Conf::Inferred);
-            let score = v
-                .get("confidence_score")
-                .and_then(|s| s.as_f64())
-                .unwrap_or(0.0);
-            let weight = v.get("weight").and_then(|s| s.as_f64()).unwrap_or(1.0);
-            let evidence = v
-                .get("evidence")
-                .and_then(|e| e.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|s| s.as_str().map(str::to_string))
-                        .collect()
+                .ok_or_else(|| anyhow!("{path:?}: a link has no {key:?}"))?;
+            index
+                .get(id)
+                .copied()
+                .ok_or_else(|| anyhow!("{path:?}: a link names unknown node {id:?}"))
+        };
+        let source = node_of("source")?;
+        let target = node_of("target")?;
+        let relation = v
+            .get("relation")
+            .and_then(|s| s.as_str())
+            .and_then(Relation::parse)
+            .unwrap_or(Relation::Mentions);
+        let confidence = v
+            .get("confidence")
+            .and_then(|s| s.as_str())
+            .and_then(Conf::parse)
+            .unwrap_or(Conf::Inferred);
+        let score = v
+            .get("confidence_score")
+            .and_then(|s| s.as_f64())
+            .unwrap_or(0.0);
+        let weight = v.get("weight").and_then(|s| s.as_f64()).unwrap_or(1.0);
+        let evidence = v
+            .get("evidence")
+            .and_then(|e| e.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let directed = v
+            .get("directed")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let provenance = v
+            .get("provenance")
+            .and_then(JsonValue::as_str)
+            .and_then(Provenance::parse)
+            .unwrap_or(Provenance::Extracted);
+        let by = v.get("by").and_then(JsonValue::as_str).map(str::to_string);
+        let label = v
+            .get("label")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string);
+        Ok(KgEdge {
+            source,
+            target,
+            relation,
+            confidence,
+            score,
+            weight,
+            evidence,
+            directed,
+            provenance,
+            by,
+            label,
+        })
+    }
+
+    pub(crate) fn from_json(path: &Path) -> Result<KnowledgeGraph> {
+        use json_support::MemberMode;
+        // The file is read in two passes that walk past what they don't
+        // need, so a graph of a million links is never one value tree. Pass
+        // one takes the header and the nodes; pass two takes the links,
+        // which need the node index.
+        let open = || fs::File::open(path).with_context(|| format!("failed to read {path:?}"));
+        let mut input = String::new();
+        let mut labels: Vec<String> = Vec::new();
+        let mut unresolved = 0;
+        let mut nodes: Vec<KgNode> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        let mut first_error: Option<Error> = None;
+        let streamed = json_support::stream_object_members(
+            open()?,
+            |k| match k {
+                "graph" => MemberMode::Whole,
+                "nodes" => MemberMode::Elements,
+                _ => MemberMode::Skip,
+            },
+            |k, v| {
+                let step = if k == "graph" {
+                    read_graph_header(path, v, &mut input, &mut unresolved, &mut labels)
+                } else {
+                    node_from_json(path, v).map(|node| {
+                        index.insert(node.id.clone(), nodes.len());
+                        nodes.push(node);
+                    })
+                };
+                step.map_err(|e| {
+                    let message = e.to_string();
+                    first_error = Some(e);
+                    json_support::ParseError::custom(message)
                 })
-                .unwrap_or_default();
-            let directed = v
-                .get("directed")
-                .and_then(JsonValue::as_bool)
-                .unwrap_or(false);
-            let provenance = v
-                .get("provenance")
-                .and_then(JsonValue::as_str)
-                .and_then(Provenance::parse)
-                .unwrap_or(Provenance::Extracted);
-            let by = v.get("by").and_then(JsonValue::as_str).map(str::to_string);
-            let label = v
-                .get("label")
-                .and_then(JsonValue::as_str)
-                .map(str::to_string);
-            edges.push(KgEdge {
-                source,
-                target,
-                relation,
-                confidence,
-                score,
-                weight,
-                evidence,
-                directed,
-                provenance,
-                by,
-                label,
-            });
+            },
+        );
+        if let Some(e) = first_error.take() {
+            return Err(e);
         }
+        streamed.with_context(|| format!("{path:?} is not valid JSON"))?;
+
+        let mut edges: Vec<KgEdge> = Vec::new();
+        let streamed = json_support::stream_object_members(
+            open()?,
+            |k| {
+                if k == "links" {
+                    MemberMode::Elements
+                } else {
+                    MemberMode::Skip
+                }
+            },
+            |_, v| {
+                edge_from_json(path, &v, &index)
+                    .map(|edge| edges.push(edge))
+                    .map_err(|e| {
+                        let message = e.to_string();
+                        first_error = Some(e);
+                        json_support::ParseError::custom(message)
+                    })
+            },
+        );
+        if let Some(e) = first_error.take() {
+            return Err(e);
+        }
+        streamed.with_context(|| format!("{path:?} is not valid JSON"))?;
         let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (i, n) in nodes.iter().enumerate() {
             members.entry(n.community).or_default().push(i);
@@ -134374,7 +135302,7 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
     pub(crate) fn modularity(kg: &KnowledgeGraph) -> f64 {
         let mut strength = vec![0.0f64; kg.nodes.len()];
         let mut total = 0.0;
-        let mut inside: HashMap<usize, f64> = HashMap::new();
+        let mut inside: BTreeMap<usize, f64> = BTreeMap::new();
         for e in &kg.edges {
             if e.source == e.target {
                 continue;
@@ -134389,7 +135317,8 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         if total == 0.0 {
             return 0.0;
         }
-        let mut by_comm: HashMap<usize, f64> = HashMap::new();
+        // Ordered, so the floating-point sum is the same on every run.
+        let mut by_comm: BTreeMap<usize, f64> = BTreeMap::new();
         for (i, n) in kg.nodes.iter().enumerate() {
             *by_comm.entry(n.community).or_insert(0.0) += strength[i];
         }
@@ -137747,6 +138676,99 @@ q.oninput=()=>{const t=q.value.trim().toLowerCase();found=t?new Set(N.filter(n=>
         }
 
         #[test]
+        fn modularity_is_the_same_on_every_call() {
+            // Many communities and weights that are not exact in binary: a sum
+            // taken in a different order each call would differ in the last bits.
+            let mut kg = tiny_graph();
+            kg.nodes = (0..90usize)
+                .map(|i| KgNode {
+                    id: format!("n{i}"),
+                    label: format!("n{i}"),
+                    node_type: NodeType::File,
+                    file_type: "csv".to_string(),
+                    source_file: None,
+                    attrs: json_support::Map::new(),
+                    community: i % 30,
+                })
+                .collect();
+            kg.edges = (0..89usize)
+                .map(|i| KgEdge {
+                    source: i,
+                    target: i + 1,
+                    relation: Relation::Joins,
+                    confidence: Conf::Extracted,
+                    score: 1.0,
+                    weight: 0.1 + (i as f64) * 0.037,
+                    evidence: Vec::new(),
+                    directed: false,
+                    provenance: Provenance::Extracted,
+                    by: None,
+                    label: None,
+                })
+                .collect();
+            let first = modularity(&kg).to_bits();
+            for _ in 0..40 {
+                assert_eq!(modularity(&kg).to_bits(), first);
+            }
+        }
+
+        #[test]
+        fn streamed_graph_json_is_the_text_of_the_value_tree() {
+            let mut graphs = vec![tiny_graph()];
+            let mut no_links = tiny_graph();
+            no_links.edges.clear();
+            graphs.push(no_links);
+            let mut empty = tiny_graph();
+            empty.nodes.clear();
+            empty.edges.clear();
+            empty.communities.clear();
+            graphs.push(empty);
+            for kg in &graphs {
+                let mut streamed = Vec::new();
+                write_graph_json(kg, &mut streamed).unwrap();
+                assert_eq!(
+                    String::from_utf8(streamed).unwrap(),
+                    json_support::to_pretty_string(&to_json(kg))
+                );
+            }
+        }
+
+        #[test]
+        fn from_json_reads_links_listed_before_the_nodes_and_names_a_bad_link() {
+            let kg = tiny_graph();
+            let text = json_support::to_pretty_string(&to_json(&kg));
+            let JsonValue::Object(doc) = json_support::from_str(&text).unwrap() else {
+                panic!("a graph.json is an object");
+            };
+            // The same members, links first: a file from another writer may do this.
+            let mut flipped = json_support::Map::new();
+            for key in ["links", "nodes", "graph", "directed", "multigraph"] {
+                flipped.insert(key.to_string(), doc.get(key).unwrap().clone());
+            }
+            let dir =
+                std::env::temp_dir().join(format!("sniff-rs-kg-order-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("graph.json");
+            fs::write(
+                &path,
+                json_support::to_pretty_string(&JsonValue::Object(flipped)),
+            )
+            .unwrap();
+            let back = from_json(&path).unwrap();
+            assert_eq!(back.nodes.len(), kg.nodes.len());
+            assert_eq!(back.edges.len(), kg.edges.len());
+            // A link to a node that is not there is an error that says so.
+            let broken = text.replacen("\"target\": \"", "\"target\": \"no-such-", 1);
+            fs::write(&path, broken).unwrap();
+            let err = from_json(&path).err().unwrap().to_string();
+            assert!(err.contains("unknown node"), "{err}");
+            // So is a document that is not an object.
+            fs::write(&path, "[1, 2]").unwrap();
+            assert!(from_json(&path).is_err());
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
         fn search_scores_a_rarer_word_higher_and_needs_a_match() {
             let mut kg = tiny_graph();
             kg.nodes[0].label = "alpha budget".to_string();
@@ -138598,16 +139620,20 @@ fn run_graph(raw: &[String]) -> Result<()> {
             return Ok(());
         }
         let rendered = match (&stdout_export, stdout_format) {
-            _ if stdout_unlinked => knowledge_graph::render_unlinked(&kg),
-            (Some(kind), _) => knowledge_graph::render_export(&kg, kind)?,
+            _ if stdout_unlinked => Some(knowledge_graph::render_unlinked(&kg)),
+            (Some(kind), _) => Some(knowledge_graph::render_export(&kg, kind)?),
+            // Streamed here, newline included, so there is nothing left to print.
             (None, GraphFormat::Json) => {
-                json_support::to_pretty_string(&knowledge_graph::to_json(&kg))
+                print_graph_json(&kg)?;
+                None
             }
-            (None, GraphFormat::Md) => knowledge_graph::render_report(&kg),
+            (None, GraphFormat::Md) => Some(knowledge_graph::render_report(&kg)),
         };
-        print!("{rendered}");
-        if !rendered.ends_with('\n') {
-            println!();
+        if let Some(rendered) = rendered {
+            print!("{rendered}");
+            if !rendered.ends_with('\n') {
+                println!();
+            }
         }
         if let Some(dir) = obsidian_dir {
             let notes = knowledge_graph::write_obsidian(&kg, &dir)?;
@@ -138621,11 +139647,7 @@ fn run_graph(raw: &[String]) -> Result<()> {
 
     let dir = dir.expect("a graph directory was chosen above unless the output is stdout");
     let graph_path = dir.join("graph.json");
-    fs::write(
-        &graph_path,
-        json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
-    )
-    .with_context(|| format!("failed to write {graph_path:?}"))?;
+    write_graph_json_file(&kg, &graph_path)?;
     let report_path = dir.join("GRAPH_REPORT.md");
     fs::write(&report_path, knowledge_graph::render_report(&kg))
         .with_context(|| format!("failed to write {report_path:?}"))?;
@@ -138736,21 +139758,13 @@ fn run_graph_merge(raw: &[String]) -> Result<()> {
         summary.nodes_added
     );
     if output == Path::new("-") {
-        print!(
-            "{}",
-            json_support::to_pretty_string(&knowledge_graph::to_json(&kg))
-        );
-        println!();
+        print_graph_json(&kg)?;
         eprintln!("{status}");
         return Ok(());
     }
     knowledge_graph::prepare_generated_dir(&output)?;
     let graph_path = output.join("graph.json");
-    fs::write(
-        &graph_path,
-        json_support::to_pretty_string(&knowledge_graph::to_json(&kg)),
-    )
-    .with_context(|| format!("failed to write {graph_path:?}"))?;
+    write_graph_json_file(&kg, &graph_path)?;
     let report_path = output.join("GRAPH_REPORT.md");
     fs::write(&report_path, knowledge_graph::render_report(&kg))
         .with_context(|| format!("failed to write {report_path:?}"))?;
@@ -138819,6 +139833,14 @@ fn load_knowledge_graph_input(
     input: &Path,
     samples: Option<usize>,
 ) -> Result<Option<knowledge_graph::KnowledgeGraph>> {
+    // The folder `sniff-rs graph` wrote (it holds a marker and a graph.json)
+    // is a graph already: read it, rather than graph its own outputs.
+    if input.is_dir()
+        && input.join(knowledge_graph::MARKER_FILE).is_file()
+        && input.join("graph.json").is_file()
+    {
+        return Ok(Some(knowledge_graph::from_json(&input.join("graph.json"))?));
+    }
     if input.is_dir() {
         let mut cfg = load_graph_config(input, None)?;
         let patterns = cfg.patterns()?;
@@ -149711,6 +150733,52 @@ mod tests {
         ]);
         let n = assert_candidates_match_a_scan(&tables);
         assert!(n >= 1, "the join was not found at all");
+    }
+
+    /// A key name held by more tables than `MAX_NAME_GROUP` is a convention,
+    /// not a join: it pairs only with the table that owns it, the pairs stay
+    /// linear in the table count, and the caller is told.
+    #[test]
+    fn a_key_name_held_by_too_many_tables_pairs_only_with_its_owner() {
+        let ids: Vec<String> = (1..=30).map(|i| i.to_string()).collect();
+        let many = knowledge_graph::MAX_NAME_GROUP + 88;
+        let mut specs: Vec<(String, Vec<ColumnProfile>)> = (0..many)
+            .map(|i| {
+                (
+                    format!("fact_{i:04}"),
+                    vec![
+                        sketched("customer_id", "i64", &ids),
+                        rel_col(&format!("measure_{i}"), "f64", &[]),
+                    ],
+                )
+            })
+            .collect();
+        specs.push((
+            "customers".to_string(),
+            vec![sketched("customer_id", "i64", &ids)],
+        ));
+        let tables: BTreeMap<String, Vec<ColumnProfile>> = specs.into_iter().collect();
+        let tables_vec: Vec<(&String, &Vec<ColumnProfile>)> = tables.iter().collect();
+        let idx = LinkIndex::build(&tables);
+        let (pairs, skipped) = relationship_candidates(&tables_vec, &idx);
+        assert_eq!(skipped, 1, "one over-large name was left to its owner");
+        // Every fact table pairs with the owner; none pairs with another.
+        assert_eq!(pairs.len(), many);
+        let owner = tables_vec
+            .iter()
+            .position(|(n, _)| *n == "customers")
+            .unwrap();
+        assert!(pairs.iter().all(|(a, b)| a.0 == owner || b.0 == owner));
+        // Below the bound, nothing is skipped.
+        let few: BTreeMap<String, Vec<ColumnProfile>> = tables
+            .iter()
+            .take(40)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let few_vec: Vec<(&String, &Vec<ColumnProfile>)> = few.iter().collect();
+        let (pairs, skipped) = relationship_candidates(&few_vec, &LinkIndex::build(&few));
+        assert_eq!(skipped, 0);
+        assert!(pairs.len() >= 40 * 39 / 2 - 40, "{}", pairs.len());
     }
 
     #[test]

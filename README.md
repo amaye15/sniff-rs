@@ -45,24 +45,81 @@ breaking, like a removed column).
 
 ## Knowledge graph
 
-`sniff-rs graph <DIR>` links every file in a folder, of every data type:
-table joins, shared identifiers found in content (emails, DOIs, ISBNs,
-IBANs, UUIDs, reference numbers, ...), one file naming another, similar
-wording, shared schemas, and the same document saved twice. Each link
-carries a confidence (extracted / inferred / ambiguous) and its evidence;
-Louvain communities group what belongs together.
+`sniff-rs graph <DIR>` links every file in a folder, of every data type.
+Each link carries a confidence (extracted / inferred / ambiguous), a score
+and its evidence, and Louvain communities group what belongs together.
 
 ```bash
 sniff-rs graph ./data/                    # ./data.graph/graph.json + GRAPH_REPORT.md
 sniff-rs graph ./data/ --obsidian         # plus an Obsidian vault
-sniff-rs explain data.graph/graph.json crm/customers.csv
-sniff-rs path data.graph/graph.json crm/customers.csv crm/orders.json
-sniff-rs rank ./data/                     # graph the folder in memory
+sniff-rs graph ./data/ --export graphml,sqlite,html
 ```
 
-`graph.json` is networkx node-link JSON (the shape graphify writes). The
-graph and vault contain the identifiers found in your files, so keep them
-as private as the input. `sniff-rs graph --help` lists every option.
+**What it links**
+
+| Link | What it says |
+|---|---|
+| `joins`, `shares_key`, `has_schema` | tables whose columns line up by name or by value; declared foreign keys (SQLite, SQL dumps, `--db`) |
+| `mentions`, `references`, `similar_to`, `same_name`, `duplicate_of` | identifiers (emails, DOIs, ISBNs, IBANs, UUIDs, ...) found in content, one file naming another, similar wording, one document saved twice |
+| `imports`, `reads`, `writes`, `derived_from` | code to data: Python, JS/TS, R, Rust, Go, Java, SQL, dbt and notebook cells; which script reads which file or table, and what a query builds from what |
+| `version_of`, `exported_from` | `report_v2` after `report_v1`; a CSV that is an export of a database table |
+| `metadata`, `looks_like` | the same author, camera or artist in the files' own properties (EXIF, XMP, ID3, Office); near-identical pictures |
+| `has_column`, `same_column`, `type_drift`, `uses_column` | with `--columns`: a node per column that tables share |
+| `involves`, `authored_by`, `same_person`, `member_of` | with `--people`: mail, contacts, calendars and document authors |
+| `changes_with` | with `--git`: files that change in the same commits |
+| `near` | with `--geo` / `--timeline`: files from the same place or day |
+
+Reads mail (`.mbox`, `.eml`, `.msg`), contact cards and calendars, Word,
+PowerPoint, OpenDocument, RTF and EPUB text, PDFs, workbooks (formulas
+that read other sheets), SQL dumps and live PostgreSQL/MySQL schemas
+(`--db`). `--geo` and `--timeline` keep a place as a grid cell (about
+11 km) and a time as a day, never an exact position or time, and are off
+by default; so are `--people`, `--git` and `--columns`.
+
+**Add what you know.** Write links as JSON and hand them in, or put rules
+in `.sniff-rs.toml` (custom identifier patterns, aliases, links to add or
+reject, entities to ignore):
+
+```bash
+sniff-rs graph ./data/ --links extra-links.json
+sniff-rs graph merge a/graph.json b/graph.json -o merged/
+sniff-rs graph ./data/ --unlinked-report   # unlinked.json: what nothing links to, and why
+```
+
+**Ask it.** Every query takes a directory or a `graph.json`:
+
+```bash
+sniff-rs search ./data.graph "invoice 2024"      # BM25, like SQLite FTS5
+sniff-rs neighbors ./data.graph crm/customers.csv --depth 2
+sniff-rs subgraph ./data.graph --node crm/customers.csv --depth 2 -
+sniff-rs communities ./data.graph --members
+sniff-rs explain ./data.graph crm/customers.csv
+sniff-rs path ./data.graph crm/customers.csv crm/orders.json
+sniff-rs rank ./data.graph --sort importance
+sniff-rs diff old.graph/graph.json new.graph/graph.json
+```
+
+`graph.json` is networkx node-link JSON (the shape graphify writes) and
+has a published JSON Schema: `sniff-rs graph --schema`. Exports:
+GraphML, GEXF, DOT, Cypher, JSON-LD, Mermaid, a self-contained HTML
+viewer, and a SQLite database.
+
+The graph and vault contain the identifiers found in your files (card
+numbers only as their last four digits), so keep them as private as the
+input. `sniff-rs graph --help` lists every option.
+
+**Scale.** Measured on a laptop (10 cores), default build:
+
+| Input | Cold | Warm cache | Peak memory |
+|---|---|---|---|
+| 50,000 files, 1 million links | 18 s | 12 s | 1.0 GB |
+| 100,000 tables in 1,000 SQLite files | 11 s | 10 s | 0.9 GB |
+| A question on the 50,000-file `graph.json` (317 MB) | | 2-3 s | 0.5 GB |
+
+A table-level input (one database with 10,000 tables) answers `explain`,
+`path` and `rank` in 1.5 s. A column name held by more than 512 tables is
+a convention, not a join: it pairs only with the table that owns it, and
+a note says so.
 
 ## Install
 
@@ -86,6 +143,17 @@ Verify any install:
 ```bash
 sniff-rs --version
 sniff-rs --list-formats          # every format this binary can read
+```
+
+**Shell completions** (bash, zsh, fish, PowerShell) are built from the
+help texts, so they follow every flag. The release archives hold them in
+`completions/`; or print them:
+
+```bash
+source <(sniff-rs completions bash)                    # ~/.bashrc
+sniff-rs completions zsh > "${fpath[1]}/_sniff-rs"     # then restart zsh
+sniff-rs completions fish > ~/.config/fish/completions/sniff-rs.fish
+sniff-rs completions powershell | Out-String | Invoke-Expression
 ```
 
 ## Quick start

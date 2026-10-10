@@ -2,7 +2,8 @@
 # Asset names are a contract: install.sh, the Homebrew formula, and
 # [package.metadata.binstall] in Cargo.toml all construct URLs from them.
 # Archives contain a top-level `sniff-rs-<target>/` dir holding the binary
-# plus README and both LICENSE files.
+# plus README, both LICENSE files, and a `completions/` dir (bash, zsh,
+# fish, PowerShell scripts written by the binary just built).
 name: release
 
 on:
@@ -65,6 +66,16 @@ jobs:
           # timing-dependent way. A file makes the check deterministic.
           "$bin" --list-formats > formats.txt
           grep -q parquet formats.txt
+          # The graph and its query commands ship in every binary.
+          mkdir -p smoke-dir
+          printf 'id,email\n1,ann@example.com\n2,bob@example.com\n' > smoke-dir/a.csv
+          printf 'id,email\n1,ann@example.com\n' > smoke-dir/b.csv
+          "$bin" graph smoke-dir smoke-graph
+          test -s smoke-graph/graph.json
+          "$bin" search smoke-graph/graph.json email > search.txt
+          test -s search.txt
+          "$bin" completions bash > completions.txt
+          grep -q _sniff_rs completions.txt
       - name: Package
         shell: bash
         run: |
@@ -73,6 +84,13 @@ jobs:
           mkdir "$stage"
           cp "target/${{ matrix.target }}/release/sniff-rs$exe" "$stage/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
+          # Shell completions, written by the binary that was just built.
+          bin="target/${{ matrix.target }}/release/sniff-rs$exe"
+          mkdir "$stage/completions"
+          "$bin" completions bash > "$stage/completions/sniff-rs.bash"
+          "$bin" completions zsh > "$stage/completions/_sniff-rs"
+          "$bin" completions fish > "$stage/completions/sniff-rs.fish"
+          "$bin" completions powershell > "$stage/completions/sniff-rs.ps1"
           if [ "${{ matrix.archive }}" = "zip" ]; then
             tar -acf "$stage.zip" "$stage"
           else

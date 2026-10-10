@@ -7,6 +7,18 @@ All notable changes to sniff-rs are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- `sniff-rs completions <bash|zsh|fish|powershell>` prints a shell
+  completion script. The flags come from each command's own help text, so
+  a completion offers exactly what `--help` shows; the values of
+  `--output-format`, `--format`, `--encoding`, `--relation` and a few more
+  are completed too. The release archives carry the four scripts in
+  `completions/`, and the release smoke test now also runs `graph`,
+  `search` and `completions` on every shipped binary.
+- `search`, `neighbors`, `subgraph`, `communities` and `rank` accept the
+  folder `sniff-rs graph` wrote (the one with `graph.json` in it), not only
+  the `graph.json`; before, that folder was graphed again, outputs included.
+- The main `--help` lists the `search`, `neighbors`, `subgraph`,
+  `communities` and `completions` commands.
 - `sniff-rs search`, `neighbors`, `subgraph` and `communities` query a
   knowledge graph (a directory or a `graph.json`). `search` ranks nodes by
   words with BM25 as SQLite FTS5 computes it (weighted fields, `word*`
@@ -243,11 +255,24 @@ All notable changes to sniff-rs are documented here. Format follows
   column pairs that could join instead of comparing every pair, with
   byte-identical output: 2,000 tables 37 s to 3.2 s, a 1,476-table real
   dictionary 16 s to 1.6 s.
+- A column name (or identifier kind) held by more than 512 tables pairs
+  only with the table that owns it in `explain`, `path`, `rank` and
+  `--combine`, as it already did in `graph`, and a note says so. Before, a
+  database of 5,000 tables sharing a few key names made 3.7 million
+  sibling links: 24 s, 5 GB and a 2.8 GB JSON. Now 0.8 s and 65 MB; 10,000
+  tables take 1.5 s and 112 MB (were 75 s and 6.5 GB). Output for inputs
+  under the bound is unchanged.
+- `graph.json` is written one node and one link at a time, and read back
+  in two passes that skip what they don't need, instead of through one
+  value tree. Same bytes; a 1,000,000-link graph takes 1.0 GB to build
+  (was 1.65 GB) and a question about its 317 MB file 0.5 GB (was 1.35 GB).
 - A Delta Lake or Iceberg table inside a directory is one table in
   directory mode, `--combine` and `graph`, instead of a pile of its data
   files.
 
 ### Fixed
+- `sniff-rs communities` could print a different modularity in the last
+  digits on each run (a hash-order sum); communities are summed in order.
 - A short source file with commas (`.js`, `.py`, `.rs`, ...) was read as a CSV table and lost its text; files with a source extension are never sniffed as tables.
 - Two runs of `sniff-rs graph` on one input could write different
   `shares_key` evidence (a hash-order walk named an arbitrary owner); the
